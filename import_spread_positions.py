@@ -1,0 +1,191 @@
+"""Import spread leg claims from CSV (instrument, signed volume)."""
+
+import argparse
+import csv
+import os
+import sys
+from typing import Dict
+
+from merged_config import load_merged_config
+
+_CSV_HEADERS = frozenset({
+    'instrument', 'volume',
+    '合约', '持仓', '期权代码', '持仓手数',
+})
+
+
+def _project_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _default_csv() -> str:
+    return os.path.join(_project_dir(), 'data', 'spread_positions.csv')
+
+
+def _looks_like_header(cols: list) -> bool:
+    if len(cols) < 2:
+        return False
+    left = str(cols[0]).strip().lower()
+    right = str(cols[1]).strip().lower()
+    if left in _CSV_HEADERS or right in _CSV_HEADERS:
+        return True
+    try:
+        int(right)
+        return False
+    except ValueError:
+        return True
+
+
+def spread_positions_csv_path(config: dict = None) -> str:
+    config = config or {}
+    dual = config.get('dual_strategy') or {}
+    path = dual.get(
+        'spread_positions_csv',
+        os.path.join(_project_dir(), 'data', 'spread_positions.csv'),
+    )
+    if not os.path.isabs(path):
+        path = os.path.join(_project_dir(), path)
+    return path
+
+
+def load_spread_positions_csv(path: str) -> Dict[str, int]:
+    """Empty file or header-only -> {}."""
+    claims: Dict[str, int] = {}
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        reader = csv.reader(f)
+        for line_no, row in enumerate(reader, start=1):
+            if not row or all(not str(c).strip() for c in row):
+                continue
+            if len(row) < 2:
+                raise ValueError(f"{path} line {line_no}: expected 2 columns (instrument, volume)")
+            if line_no == 1 and _looks_like_header(row):
+                continue
+            inst = str(row[0]).strip()
+            vol = int(str(row[1]).strip())
+            if not inst:
+                raise ValueError(f"{path} line {line_no}: instrument is empty")
+            if vol == 0:
+                raise ValueError(f"{path} line {line_no}: volume must be non-zero")
+            claims[inst] = claims.get(inst, 0) + vol
+    return claims
+
+
+def save_spread_positions_csv(path: str, claims: Dict[str, int]) -> None:
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    rows = sorted(
+        ((inst, int(vol)) for inst, vol in (claims or {}).items() if int(vol) != 0),
+        key=lambda x: x[0],
+    )
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['instrument', 'volume'])
+        for inst, vol in rows:
+            writer.writerow([inst, vol])
+
+
+def spread_fill_delta(direction: str, offset: str, traded: int) -> int:
+    """Signed net-position delta for spread leg claims."""
+    from pairtrade.constants import DIRECTION_BUY, DIRECTION_SELL, OFFSET_CLOSE, OFFSET_OPEN
+
+    if traded <= 0:
+        return 0
+    if direction == DIRECTION_BUY and offset == OFFSET_OPEN:
+        return int(traded)
+    if direction == DIRECTION_SELL and offset == OFFSET_OPEN:
+        return -int(traded)
+    if direction == DIRECTION_SELL and offset == OFFSET_CLOSE:
+        return -int(traded)
+    if direction == DIRECTION_BUY and offset == OFFSET_CLOSE:
+        return int(traded)
+    return 0
+
+
+def apply_fill_to_spread_csv(
+    config: dict,
+    instrument: str,
+    direction: str,
+    offset: str,
+    traded: int,
+    logger=None,
+) -> Dict[str, int]:
+    delta = spread_fill_delta(direction, offset, traded)
+    if delta == 0 or not instrument:
+        path = spread_positions_csv_path(config)
+        return load_spread_positions_csv(path) if os.path.isfile(path) else {}
+
+    path = spread_positions_csv_path(config)
+    claims: Dict[str, int] = {}
+    if os.path.isfile(path):
+        try:
+            claims = load_spread_positions_csv(path)
+        except Exception as e:
+            if logger:
+                logger.warning(f"[价差持仓] 读取 CSV 失败，将重建: {e}")
+    inst = str(instrument).strip()
+    new_vol = int(claims.get(inst, 0)) + delta
+    if new_vol == 0:
+        claims.pop(inst, None)
+    else:
+        claims[inst] = new_vol
+    save_spread_positions_csv(path, claims)
+    if logger:
+        logger.info(
+            f"[价差持仓] CSV 更新 {inst}: {'+' if delta > 0 else ''}{delta} "
+            f"→ {new_vol} ({path})"
+        )
+    return claims
+
+
+def sync_spread_leg_claims(
+    store,
+    config: dict = None,
+    csv_path: str = None,
+    logger=None,
+) -> int:
+    csv_path = csv_path or spread_positions_csv_path(config)
+    if not os.path.isfile(csv_path):
+        claims = {}
+        if logger:
+            logger.info(f"[价差持仓] 未找到 {csv_path}，视为无持仓")
+    else:
+        claims = load_spread_positions_csv(csv_path)
+        if logger:
+            if claims:
+                logger.info(f"[价差持仓] 已从 {csv_path} 同步 {len(claims)} 个合约")
+            else:
+                logger.info(f"[价差持仓] {csv_path} 为空，无持仓")
+    store.set_leg_claims(claims)
+    return len(claims)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description='Import spread_positions.csv (instrument, signed volume)',
+    )
+    parser.add_argument(
+        '-c', '--csv',
+        default=_default_csv(),
+        help='positions CSV (default: data/spread_positions.csv)',
+    )
+    args = parser.parse_args(argv)
+
+    config = load_merged_config()
+    from spread_ledger import SpreadLegStore
+
+    if os.path.isfile(args.csv):
+        claims = load_spread_positions_csv(args.csv)
+    else:
+        claims = {}
+
+    store = SpreadLegStore()
+    store.set_leg_claims(claims)
+    save_spread_positions_csv(spread_positions_csv_path(config), store.list_leg_claims())
+    if not claims:
+        print(f"no positions -> {spread_positions_csv_path(config)}")
+    else:
+        print(f"imported {len(claims)} contracts -> {spread_positions_csv_path(config)}")
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

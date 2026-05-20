@@ -1,0 +1,47 @@
+# AutoCTP 本地配置模板 — 复制为 merged_config.yaml 后按环境修改
+# CTP 账号、飞书等从 D:\autotrade\auto_config.yaml 加载
+
+merged:
+  autotrade_root: D:\autotrade
+  autostraggle_root: D:\autostraggle
+
+dual_strategy:
+  strategy_order: [spread, strangle]
+  spread_order_ref_max: 499999
+  strangle_trade_journal: data/strangle_trade_journal.jsonl
+  fill_ledger_csv: data/fill_ledger.csv
+  fill_ledger_journal: data/fill_ledger_journal.jsonl
+  unified_fill_feishu: true
+  fill_feishu_enabled: true
+  exclude_spread_from_strangle_reconcile: true
+  exclude_strangle_from_spread_positions: true
+  use_spread_leg_claims: true
+  spread_execution_from_ledger: true
+  spread_close_from_ledger: true
+  pause_spread_open_on_reconcile_mismatch: true
+  auto_sync_spread_positions_csv: true
+  spread_positions_csv: data/spread_positions.csv
+  spread_trade_journal: data/spread_trade_journal.jsonl
+  spread_reconcile_fallback_heuristic: false
+  tradeinfo_path: tradeinfo
+  spread_sheet: spread
+  strangle_sheet: strangle
+  spread_csv: tradeinfo/spread.csv
+  strangle_csv: tradeinfo/strangle.csv
+  require_startup_ack: true
+  startup_ack_each_run: true
+  startup_ack_interactive: true
+  startup_ack_use_gui: true
+  startup_ack_prefer_gui: true
+  startup_ack_force_terminal: false
+  startup_ack_persist: false
+  startup_ack_file: data/position_startup_ack.txt
+
+log_level: INFO
+loop_interval: 10
+
+strangle:
+  daily_buy_limit_yuan: 300000
+  ledger_path: data/ledger_strangle.json
+  order_ref_min: 500000
+  auto_sync_positions_csv: true

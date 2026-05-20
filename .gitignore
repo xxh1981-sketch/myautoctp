@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets
+.env
+.env.*
+*.local.yaml
+merged_config.local.yaml
+
+# Logs
+*.log
+logs/
+
+# ---------------------------------------------------------------------------
+# 个性化文件（仅保留 *.example.* 模板进仓库）
+# ---------------------------------------------------------------------------
+
+# 本地配置 — 复制 merged_config.example.yaml → merged_config.yaml
+merged_config.yaml
+
+# 品种表 — 复制 tradeinfo/*example* → tradeinfo/*.csv
+tradeinfo/*
+!tradeinfo/.gitkeep
+!tradeinfo/*example*
+
+# 运行时数据 — 复制 data/*example* 为实际文件后维护
+data/*
+!data/.gitkeep
+!data/*example*
