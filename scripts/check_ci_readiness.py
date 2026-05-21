@@ -33,8 +33,25 @@ def main() -> int:
             if not os.environ.get(name, '').strip():
                 print(f'缺少 GitHub secret 对应变量: {name}')
                 ok = False
+        for url_name in ('AUTOTRADE_REPO_URL', 'AUTOSTRAGGLE_REPO_URL'):
+            url = os.environ.get(url_name, '').strip()
+            if not url:
+                continue
+            if (
+                url.startswith('https://github.com/')
+                and '@' not in url
+                and not os.environ.get('DEPENDENCY_REPO_PAT', '').strip()
+            ):
+                print(
+                    f'{url_name} 为 GitHub HTTPS 且无嵌入 token；'
+                    '私有库还需 DEPENDENCY_REPO_PAT（见 docs/CI.md）'
+                )
+                ok = False
     else:
-        print('提示: GitHub Actions 全量 CI 需配置 AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL（见 docs/CI.md）')
+        print(
+            '提示: GitHub Actions 全量 CI 需 AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL；'
+            '私有库另需 DEPENDENCY_REPO_PAT（见 docs/CI.md）'
+        )
 
     if ok:
         print('检查通过。')

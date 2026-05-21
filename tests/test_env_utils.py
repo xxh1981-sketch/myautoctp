@@ -7,7 +7,20 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from env_utils import resolve_manual_start
+from env_utils import is_config_abs_path, resolve_manual_start
+
+
+class TestIsConfigAbsPath(unittest.TestCase):
+
+    def test_windows_drive_path_on_any_platform(self):
+        self.assertTrue(is_config_abs_path('C:/tmp/pos.csv'))
+        self.assertTrue(is_config_abs_path(r'D:\data\x.csv'))
+
+    def test_relative_path(self):
+        self.assertFalse(is_config_abs_path('data/custom.csv'))
+
+    def test_native_absolute(self):
+        self.assertTrue(is_config_abs_path(os.path.abspath('x.csv')))
 
 
 class TestResolveManualStart(unittest.TestCase):

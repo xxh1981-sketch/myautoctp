@@ -17,12 +17,19 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 1. 打开 GitHub 仓库 **Settings → Secrets and variables → Actions**
 2. 添加 Repository secrets：
 
-| Secret | 值示例 |
-|--------|--------|
-| `AUTOTRADE_REPO_URL` | `https://github.com/your-org/autotrade.git` |
-| `AUTOSTRAGGLE_REPO_URL` | `https://github.com/your-org/autostraggle.git` |
+| Secret | 值示例 | 说明 |
+|--------|--------|------|
+| `AUTOTRADE_REPO_URL` | `https://github.com/your-org/autotrade.git` | 不含 token 的普通 HTTPS URL 即可 |
+| `AUTOSTRAGGLE_REPO_URL` | `https://github.com/your-org/autostraggle.git` | 同上 |
+| `DEPENDENCY_REPO_PAT` | `ghp_xxxx` 或 fine-grained PAT | **私有库必填**；workflow 会自动注入 clone 认证 |
 
-私有仓库需在 URL 中嵌入 PAT，或使用 `https://x-access-token:TOKEN@github.com/...` 形式。
+**私有库推荐做法**（三选一，优先第 1 种）：
+
+1. URL secrets 保持 `https://github.com/...`，另加 **`DEPENDENCY_REPO_PAT`**（Classic PAT 勾选 `repo`，或 fine-grained 对两库只读）。
+2. 把 token 写进 URL：`https://x-access-token:TOKEN@github.com/org/autotrade.git`（可不再配 `DEPENDENCY_REPO_PAT`）。
+3. 依赖库为 **public** 时，仅 URL secrets 即可，无需 PAT。
+
+若 clone 报 `could not read Username for 'https://github.com'`，说明私有库未带认证——补 `DEPENDENCY_REPO_PAT` 后重新跑 workflow。
 
 3. 配置完成后，每次 push/PR 会自动 clone 两仓库并跑全量测试；**失败会阻塞 PR**（已移除 `continue-on-error`）。
 
@@ -87,11 +94,19 @@ secrets 配好后，日志里应能看到 **Clone autotrade & autostraggle** 与
 
 ### 5. 私有依赖仓库 clone 失败
 
-secrets 里的 URL 若指向私有库，需带 PAT，例如：
+典型日志：
 
-`https://x-access-token:ghp_xxxx@github.com/org/autotrade.git`
+```text
+fatal: could not read Username for 'https://github.com': No such device or address
+```
 
-此时 job 会**失败**（红），check 仍会出现，可设为 Required；若 clone 失败需先修 URL 再勾必选。
+**处理**：在 Actions secrets 新增 **`DEPENDENCY_REPO_PAT`**（PAT 需能读 autotrade / autostraggle），保留现有 URL 为普通 `https://github.com/...` 即可。
+
+或把 token 嵌入 URL：`https://x-access-token:ghp_xxxx@github.com/org/autotrade.git`
+
+PAT 创建：**GitHub → Settings → Developer settings → Personal access tokens**（Classic 勾 `repo`，或 Fine-grained 对两库 Read）。
+
+clone 失败时 job 为**红**，check 仍会出现；修 secrets 后重新跑，全绿再勾 Required。
 
 ### 6. 新旧 GitHub 界面
 

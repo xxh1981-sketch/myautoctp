@@ -7,6 +7,7 @@ import os
 from typing import Dict, Set
 
 from atomic_io import atomic_write_text
+from env_utils import is_config_abs_path
 from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
@@ -42,7 +43,7 @@ def positions_csv_path(config: dict = None) -> str:
         'strangle_positions_csv',
         os.path.join(_project_dir(), 'data', 'strangle_positions.csv'),
     )
-    if not os.path.isabs(path):
+    if not is_config_abs_path(path):
         path = os.path.join(_project_dir(), path)
     return path
 

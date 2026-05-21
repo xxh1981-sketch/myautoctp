@@ -110,9 +110,33 @@ jobs:
         env:
           AUTOTRADE_REPO_URL: ${{ secrets.AUTOTRADE_REPO_URL }}
           AUTOSTRAGGLE_REPO_URL: ${{ secrets.AUTOSTRAGGLE_REPO_URL }}
+          DEPENDENCY_REPO_PAT: ${{ secrets.DEPENDENCY_REPO_PAT }}
         run: |
-          git clone --depth 1 "$AUTOTRADE_REPO_URL" autotrade
-          git clone --depth 1 "$AUTOSTRAGGLE_REPO_URL" autostraggle
+          set -euo pipefail
+          auth_clone_url() {
+            local url="$1"
+            if [[ "$url" == *'@'* ]]; then
+              printf '%s' "$url"
+              return
+            fi
+            if [[ "$url" =~ ^https://github.com/ ]] && [ -n "${DEPENDENCY_REPO_PAT:-}" ]; then
+              printf 'https://x-access-token:%s@%s' "$DEPENDENCY_REPO_PAT" "${url#https://}"
+              return
+            fi
+            printf '%s' "$url"
+          }
+          clone_one() {
+            local url="$1" dest="$2"
+            local auth
+            auth="$(auth_clone_url "$url")"
+            if [[ "$auth" == "$url" ]] && [[ "$url" =~ ^https://github.com/ ]] && [[ "$url" != *'@'* ]]; then
+              echo "::error::无法 clone 私有库 ${dest}：请添加 secret DEPENDENCY_REPO_PAT（PAT，需 repo 读权限），或在 *_REPO_URL 中嵌入 token"
+              exit 1
+            fi
+            git clone --depth 1 "$auth" "$dest"
+          }
+          clone_one "$AUTOTRADE_REPO_URL" autotrade
+          clone_one "$AUTOSTRAGGLE_REPO_URL" autostraggle
 
       - name: Install dependencies
         if: steps.check_deps.outputs.configured == 'true'
@@ -122,6 +146,7 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
           if [ -f ../autotrade/requirements.txt ]; then pip install -r ../autotrade/requirements.txt; fi
+          if [ -f ../autostraggle/requirements.txt ]; then pip install -r ../autostraggle/requirements.txt; fi
 
       - name: Run full suite
         if: steps.check_deps.outputs.configured == 'true'
