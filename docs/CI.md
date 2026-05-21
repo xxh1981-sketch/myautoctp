@@ -57,6 +57,8 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 
 推送最新 `.github/workflows/test.yml` 后，**pytest-full 会在 lint 通过后执行**（不再等 unit 绿）。
 
+**pytest-full 不安装 `openctp_ctp`**（GitHub Actions 无 CTP 运行时，import 原生库会 `Aborted`）；测试通过 `tests/openctp_stubs.py` 注入 stub 模块。
+
 ## Branch protection 里找不到 pytest-full？
 
 常见原因与处理：

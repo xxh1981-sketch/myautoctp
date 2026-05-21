@@ -8,6 +8,10 @@ import sys
 
 import pytest
 
+from openctp_stubs import ensure_openctp_stub
+
+ensure_openctp_stub()
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)

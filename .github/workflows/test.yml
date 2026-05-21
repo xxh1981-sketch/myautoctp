@@ -169,10 +169,8 @@ jobs:
         working-directory: autoctp
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
-          if [ -f ../autotrade/requirements.txt ]; then pip install -r ../autotrade/requirements.txt; fi
-          if [ -f ../autostraggle/requirements.txt ]; then pip install -r ../autostraggle/requirements.txt; fi
 
       - name: Run full suite
         if: steps.check_deps.outputs.configured == 'true' && steps.check_deps.outputs.autostraggle_configured == 'true'
@@ -180,6 +178,7 @@ jobs:
         env:
           AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
           AUTOSTRAGGLE_ROOT: ${{ github.workspace }}/autostraggle
+          AUTOCTP_STUB_OPENCTP: '1'
         run: pytest tests/ -q --tb=long --strict-markers
 
       - name: Run autotrade-only integration suite
@@ -189,6 +188,7 @@ jobs:
           AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
           AUTOCTP_ALLOW_MISSING_DEPS: '1'
           CI_AUTOTRADE_ONLY: '1'
+          AUTOCTP_STUB_OPENCTP: '1'
         run: pytest tests/ -q --tb=long --strict-markers -m "integration and not autostraggle"
 
       - name: Full suite skipped hint
