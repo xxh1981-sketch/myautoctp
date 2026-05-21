@@ -1,15 +1,17 @@
 # 贡献指南
 
+> 本仓可公开；策略实现仓库（autotrade / autostraggle）请保持私有。见 [docs/PUBLIC_REPO.md](docs/PUBLIC_REPO.md)。
+
 ## 开发环境
 
 ```powershell
-cd D:\autoctp
-pip install -r requirements.txt
+cd C:\path\to\autoctp
+pip install -r requirements-ci.txt
 pip install -r requirements-dev.txt
 pre-commit install   # 可选，提交前自动 ruff + 敏感文件检查
 ```
 
-本地无 `D:\autotrade` 时，跑本仓独立单测：
+本地无 autotrade 源码时，跑本仓独立单测：
 
 ```powershell
 $env:AUTOCTP_ALLOW_MISSING_DEPS = '1'
@@ -24,7 +26,7 @@ python scripts/run_unit_tests.py --cov=. --cov-report=term-missing
 | unit | `@pytest.mark.unit` | `python scripts/run_unit_tests.py` |
 | integration | `@pytest.mark.integration` | 需 autotrade；`pytest -m integration` |
 
-`tests/autotrade_stubs.py` 为 CI 提供最小 autotrade 模块 stub，使 `margin_check`、`spread_reconcile` 等核心逻辑可在无 `D:\autotrade` 时测试。
+`tests/autotrade_stubs.py` 为 CI 提供最小 autotrade 模块 stub，使部分核心逻辑可在无 autotrade 源码时测试。
 
 ## 测试
 
@@ -41,7 +43,7 @@ ruff check .
 python scripts/check_sensitive_files.py
 ```
 
-CI 全量测试需在仓库 Settings → Secrets 配置 `AUTOTRADE_REPO_URL`、`AUTOSTRAGGLE_REPO_URL`（私有库用 PAT）。详见 [docs/CI.md](docs/CI.md)。
+CI 全量测试需在仓库 Settings → Secrets 配置私有库 URL 与 PAT（勿写入文档或代码）。详见 [docs/CI.md](docs/CI.md)。
 
 本地检查：
 
