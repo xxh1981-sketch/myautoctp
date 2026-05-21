@@ -34,8 +34,7 @@ python scripts/run_unit_tests.py --cov=. --cov-report=term-missing
 ```powershell
 $env:AUTOCTP_ALLOW_MISSING_DEPS = '1'
 python scripts/run_unit_tests.py
-pytest tests/ -m "not integration" -q        # 与 CI permissive 相同
-pytest tests/ -m integration -q              # 本地有 autotrade 时
+pytest tests/ -m integration -q              # 本地有 autotrade 时（勿用 -m "not integration" 扫全目录，会误 import integration 文件）
 pytest tests/ -q                             # 全量
 pytest tests/ --cov=. --cov-report=term-missing
 ruff check .

@@ -37,10 +37,23 @@ def _autostraggle_test_basenames() -> frozenset[str]:
     })
 
 
+def _autotrade_root_available() -> bool:
+    root = os.environ.get('AUTOTRADE_ROOT', '').strip()
+    if root and os.path.isdir(root):
+        return True
+    return os.path.isdir(r'D:\autotrade')
+
+
 def pytest_ignore_collect(collection_path, config):
-    if os.environ.get('CI_AUTOTRADE_ONLY', '').strip() != '1':
+    name = collection_path.name
+    if not (name.startswith('test_') and name.endswith('.py')):
         return False
-    return collection_path.name in _autostraggle_test_basenames()
+    if os.environ.get('CI_AUTOTRADE_ONLY', '').strip() == '1':
+        if name in _autostraggle_test_basenames():
+            return True
+    if not _autotrade_root_available() and name not in _unit_test_basenames():
+        return True
+    return False
 
 
 def pytest_collection_modifyitems(config, items) -> None:
