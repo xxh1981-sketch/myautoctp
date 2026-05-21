@@ -20,7 +20,7 @@ class TestMergedTradeinfo(unittest.TestCase):
         )
         items = _load_csv(path)
         self.assertGreater(len(items), 0)
-        self.assertEqual(items[0]['future'].lower(), 'ag')
+        self.assertEqual(items[0]['future'].lower(), 'demo')
 
     def test_rejects_duplicate_future_month(self):
         with tempfile.TemporaryDirectory() as tmp:
