@@ -281,10 +281,34 @@ def _register_stub_modules(builders: dict, modules: Iterable[str]) -> None:
         sys.modules[name] = mod
 
 
+def ensure_auto_feishu_stub() -> None:
+    """Ensure ``auto_feishu`` exists for ``@patch('auto_feishu....')`` in unit tests.
+
+    Prefer the real autotrade module when ``AUTOTRADE_ROOT`` is on ``sys.path``;
+    otherwise install a minimal in-memory stub (CI pytest-unit / Windows).
+    """
+    name = 'auto_feishu'
+    existing = sys.modules.get(name)
+    if existing is not None and getattr(existing, '__file__', None):
+        return
+    try:
+        import importlib
+        importlib.import_module(name)
+        mod = sys.modules.get(name)
+        if mod is not None and getattr(mod, '__file__', None):
+            return
+    except ImportError:
+        pass
+    mod = existing if existing is not None else types.ModuleType(name)
+    _install_auto_feishu(mod)
+    sys.modules[name] = mod
+
+
 def ensure_autotrade_stubs(modules: Iterable[str] | None = None) -> None:
     """Register stub modules only when not already imported (real autotrade wins)."""
     if not _should_use_stubs('AUTOTRADE_ROOT', r'D:\autotrade'):
         return
+    ensure_auto_feishu_stub()
     _register_stub_modules(_STUB_BUILDERS, modules or ALL_STUB_MODULES)
 
 

@@ -48,9 +48,12 @@ def _ensure_pairtrade_constants_stub() -> None:
     sys.modules['pairtrade.config'] = _pt_config
 
 
-if _use_autotrade_stubs():
-    import autotrade_stubs
+import autotrade_stubs
 
+# ``@patch('auto_feishu....')`` resolves at import time; register before collection.
+autotrade_stubs.ensure_auto_feishu_stub()
+
+if _use_autotrade_stubs():
     autotrade_stubs.ensure_autotrade_stubs(autotrade_stubs.ALL_STUB_MODULES)
     autotrade_stubs.ensure_autostraggle_stubs()
     _ensure_pairtrade_constants_stub()
