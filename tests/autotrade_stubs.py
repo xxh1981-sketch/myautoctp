@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import types
@@ -85,6 +86,9 @@ _STUB_BUILDERS = {
 
 def ensure_autotrade_stubs(modules: Iterable[str]) -> None:
     """Register stub modules only when not already imported (real autotrade wins)."""
+    root = os.environ.get('AUTOTRADE_ROOT', '').strip()
+    if root and os.path.isdir(root):
+        return
     for name in modules:
         if name in sys.modules:
             continue

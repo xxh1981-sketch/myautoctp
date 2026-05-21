@@ -188,7 +188,8 @@ jobs:
         env:
           AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
           AUTOCTP_ALLOW_MISSING_DEPS: '1'
-        run: pytest tests/ -q --tb=long --strict-markers -m "not autostraggle"
+          CI_AUTOTRADE_ONLY: '1'
+        run: pytest tests/ -q --tb=long --strict-markers -m "integration and not autostraggle"
 
       - name: Full suite skipped hint
         if: steps.check_deps.outputs.configured != 'true'

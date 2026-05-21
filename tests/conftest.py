@@ -33,6 +33,12 @@ def _autostraggle_test_basenames() -> frozenset[str]:
     })
 
 
+def pytest_ignore_collect(collection_path, config):
+    if os.environ.get('CI_AUTOTRADE_ONLY', '').strip() != '1':
+        return False
+    return collection_path.name in _autostraggle_test_basenames()
+
+
 def pytest_collection_modifyitems(config, items) -> None:
     unit_files = _unit_test_basenames()
     autostraggle_files = _autostraggle_test_basenames()
