@@ -6,6 +6,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import autotrade_stubs
+
+autotrade_stubs.ensure_merged_loop_stubs()
 import ctp_bootstrap  # noqa: F401
 
 
@@ -59,7 +63,7 @@ def _make_conn():
 class TestDailyLimitDoesNotSkipClose(unittest.TestCase):
 
     @patch('auto_processor.process_symbol', return_value=False)
-    @patch('margin_check.check_margin', return_value=True)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
     @patch('auto_feishu_command.stop_command_receiver')
     @patch('auto_feishu_command.start_command_receiver')
     @patch('auto_scheduled_pause.sync_connection_suspend_state')
@@ -74,7 +78,7 @@ class TestDailyLimitDoesNotSkipClose(unittest.TestCase):
         mock_sync,
         mock_start,
         mock_stop,
-        mock_margin,
+        mock_margin_status,
         mock_process,
     ):
         conn = _make_conn()
@@ -106,6 +110,68 @@ class TestDailyLimitDoesNotSkipClose(unittest.TestCase):
             )
 
         self.assertGreaterEqual(mock_process.call_count, 1)
+
+
+class TestFillCountExceptionStillScansClose(unittest.TestCase):
+    """成交笔数查询抛异常时与 fc=None 一致：保守禁新开，仍扫描平仓。"""
+
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_query_exception_still_scans_symbols(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_margin_status,
+        mock_process,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+
+        from merged_main_loop import run_merged_main_loop
+
+        def _raise_query(*args, **kwargs):
+            raise RuntimeError('CTP trade query timeout')
+
+        with patch(
+            'spread_fill_sync.count_spread_filled_open_orders',
+            side_effect=_raise_query,
+        ), patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertGreaterEqual(mock_process.call_count, 1)
+        self.assertTrue(
+            any('成交查询异常' in str(msg) for _, msg in logger.messages),
+        )
 
 
 class TestDailyLimitWarningOnlyOnRealLimit(unittest.TestCase):

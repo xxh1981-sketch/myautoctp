@@ -1,7 +1,7 @@
 # AutoCTP 本地配置模板 — 复制为 merged_config.yaml 后按环境修改
+# 设计目标：7×24 无人值守（fail-fast 启动自检 + 持久启动确认，改 CSV 后删 ack 重确认）
 # CTP 账号、飞书 webhook 等从 autotrade 的 auto_config.yaml 加载（勿提交实盘配置）
 # 路径优先用环境变量 AUTOTRADE_ROOT / AUTOSTRAGGLE_ROOT；留空则使用 ctp_bootstrap 内置默认
-
 merged:
   autotrade_root: ""
   autostraggle_root: ""
@@ -33,21 +33,24 @@ dual_strategy:
   spread_csv: tradeinfo/spread.csv
   strangle_csv: tradeinfo/strangle.csv
   require_startup_ack: true
-  # 7×24 无人值守：首次确认后写盘，冷启动/自动重启不再弹窗
+  # 7×24：人工冷启动仍弹确认；进程内异常重启可凭 ack 文件跳过；改 CSV 后删 ack 重确认
   startup_ack_each_run: false
   startup_ack_interactive: true
+  # true=弹窗三选一（确认 / 价差=CTP−宽跨并确认 / 取消）；无显示器服务器设 false，终端输入 derive
   startup_ack_use_gui: true
   startup_ack_prefer_gui: true
   startup_ack_force_terminal: false
   startup_ack_persist: true
-  # true=确认文件须为当日；false=跨日有效（改 CSV 后删文件重确认）
+  # false=确认文件跨日有效；改持仓 CSV 后请删 data/position_startup_ack.txt 再启
   startup_ack_require_today: false
   startup_ack_file: data/position_startup_ack.txt
-  allow_start_on_reconcile_mismatch: false  # true=有差异也自动启动（不弹窗，供脚本用）
+  allow_start_on_reconcile_mismatch: false
   reconcile_interval_sec: 60
   # derive 后给主循环对账一段豁免窗口，避免 OnRtnTrade 异步落账期间被
   # 立刻判 halt（差异仅记录，不强制 close-only）。0 表示禁用豁免。
   reconcile_grace_after_derive_sec: 90
+  # 对账 transient 失败（持仓查询失败等）连续 N 次后强制 halt；单次仍沿用上一轮
+  reconcile_transient_halt_after: 3
   journal_daily_shards: true
   journal_retain_days: 14
 
@@ -60,30 +63,37 @@ dual_strategy:
 # 健康检查发现的"僵尸订单"重复撤单冷却（同一 order_ref 内不再触发）
 # zombie_cancel_cooldown_sec: 300
 
+# 发单白名单拦截飞书冷却（同 conn + 拦截原因键，默认 300s；0=不冷却）
+# whitelist_feishu_cooldown_sec: 300
+
 # 价差日开仓笔数粗节流（非核心风控，可放大如 200～500）
 # daily_trade_limit: 200  # 继承 autotrade auto_config.yaml，此处可覆盖
 
 log_level: INFO
 loop_interval: 10
-# 未在 merged_config.yaml 显式设置时默认 10 万元；设为 0 可禁用
+# 未在 merged_config.yaml 显式设置时默认 10 万元；设为 0 且未 block 则警告（无人值守默认 block）
 global_margin_limit: 100000
 margin_recheck_interval_sec: 300
-# 主循环连续内层异常达此次数后触发进程级重启（0=仅打日志不重启）
+# 启动保证金 over_limit/unknown 飞书告警冷却（秒）
+# startup_margin_alert_cooldown_sec: 1800
 main_loop_max_consecutive_errors: 10
 
+# 无人值守 fail-fast：守卫/邻月/保证金未启用则拒绝启动（代码默认 true，此处显式写出便于核对）
+fail_fast_on_guard_install: true
+fail_fast_on_empty_target_months: true
+block_start_without_margin_limit: true
+
 # 残余风险飞书告警（不改变 halt/交易语义，仅通知）
-# risk_alert_cooldown_sec: 1800
-# feishu_pause_exposure_alert: true      # 飞书暂停时若有未配对/对账 halt 则告警
-# margin_unknown_alert_after: 3          # 保证金检查连续 unknown 次数后告警
-# quarantine_alert_after_sec: 600        # 重连隔离超时时长后告警
-# reconcile_halt_open_unmatched_alert: true
-# block_start_without_margin_limit: false  # true 且 global_margin_limit=0 则拒绝启动
-# allow_margin_limit_disabled: false       # true 时允许 limit=0 且不打印配置 warning
+risk_alert_cooldown_sec: 1800
+feishu_pause_exposure_alert: true
+margin_unknown_alert_after: 3
+quarantine_alert_after_sec: 600
+reconcile_halt_open_unmatched_alert: true
+# 0=进程异常后无限指数退避重启；>0 达上限 sys.exit(3) 并飞书（适合需人工介入停机的环境）
 max_restart_attempts: 0
 max_restart_delay: 600
 
-strangle:
-  # 以下数值为模板示例，实盘请按资金与风控自行设定
+strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设定
   daily_buy_limit_yuan: 300000
   ledger_path: data/ledger_strangle.json
   order_ref_min: 500000

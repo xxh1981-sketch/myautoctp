@@ -75,23 +75,25 @@ DUAL_STRATEGY_DEFAULTS = {
     'fill_feishu_enabled': True,
 
     'require_startup_ack': True,
-    # 生产 7×24：首次人工确认后写盘，冷启动/自动重启不再弹窗阻塞。
+    # 7×24：人工冷启动仍交互确认；进程内 _auto_restart 才凭 ack 文件跳过。
     'startup_ack_each_run': False,
     'startup_ack_interactive': True,
     'startup_ack_use_gui': True,
     'startup_ack_prefer_gui': True,
     'startup_ack_force_terminal': False,
     'startup_ack_persist': True,
-    # true=确认文件须为当日；false=持久确认跨日有效（改 CSV 后请删文件重确认）
     'startup_ack_require_today': False,
     'startup_ack_file': 'data/position_startup_ack.txt',
     'allow_start_on_reconcile_mismatch': False,
 }
 
-# 未在 merged_config.yaml 显式设置时采用的 AutoCTP 顶层默认值
+# 未在 merged_config.yaml 显式设置时采用的 AutoCTP 顶层默认值（面向 7×24 无人值守）
 MERGED_TOP_LEVEL_DEFAULTS = {
     'global_margin_limit': 100000,
     'main_loop_max_consecutive_errors': 10,
+    'fail_fast_on_guard_install': True,
+    'fail_fast_on_empty_target_months': True,
+    'block_start_without_margin_limit': True,
 }
 
 

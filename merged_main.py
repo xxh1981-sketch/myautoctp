@@ -13,69 +13,18 @@ from auto_vix import VIXEngine
 from auto_initializer import initialize_connection, prepare_trading_environment
 
 from env_utils import resolve_manual_start
-from margin_check import check_margin_status
 from merged_config import load_merged_config, setup_merged_logger, prepare_merged_connection
+from merged_startup_checks import apply_startup_margin, audit_target_months
 from merged_tradeinfo import load_dual_tradeinfo
 from merged_startup_ack import require_startup_position_ack
 from merged_main_loop import run_merged_main_loop
+from merged_banner import log_startup_banner
 from straggle_ledger import StrangleLedger
 
 
 def _log_banner(config, spread_info, strangle_info, logger):
-    logger.info("=" * 80)
-    logger.info("AutoCTP 单进程双策略")
-    logger.info(f"价差品种: {len(spread_info)}, 宽跨品种: {len(strangle_info)}")
-    spread_map = {it['future'].lower(): it['month'] for it in spread_info}
-    strangle_map = {it['future'].lower(): it['month'] for it in strangle_info}
-
-    overlap = sorted(set(spread_map.keys()) & set(strangle_map.keys()))
-    if overlap:
-        # 同时被两策略覆盖的品种：成交后只能靠 OrderRef 段位区分，CSV/账本
-        # 完全靠 OrderRef 分桶；提示操作员留意冲突风险。
-        logger.warning(
-            f"⚠ 同覆盖品种 {len(overlap)} 个 (依赖 OrderRef 段位区分): "
-            f"{', '.join(s.upper() for s in overlap)}"
-        )
-        for sym in overlap:
-            sm = spread_map[sym]
-            gm = strangle_map[sym]
-            if sm != gm:
-                logger.info(
-                    f"  {sym.upper()}: 价差 month={sm}, 宽跨 month={gm}"
-                )
-            else:
-                logger.info(f"  {sym.upper()}: 同 month={sm}")
-
-    logger.info(
-        f"价差: VIX > {config.get('VIX_TRIGGER_MULTIPLIER', 1)}×vol_basis×100, "
-        f"日笔数≤{config.get('daily_trade_limit', 100)}"
-    )
-    sc = config.get('strangle', {})
-    logger.info(
-        f"宽跨: VIX < vol_basis×{sc.get('benchmark_multiplier', 0.8)}×100, "
-        f"日买入≤{sc.get('daily_buy_limit_yuan', 300000):.0f} 元"
-    )
-    logger.info(f"循环间隔: {config.get('loop_interval', 10)} 秒")
-
-    # P8: 补全关键风控参数 banner
-    dual = config.get('dual_strategy') or {}
-    margin_limit = config.get('global_margin_limit', 100000)
-    margin_recheck = config.get('margin_recheck_interval_sec', 0)
-    reconcile_grace = dual.get('reconcile_grace_after_derive_sec', 0)
-    journal_shards = dual.get('journal_daily_shards', False)
-    logger.info(
-        f"风控: global_margin_limit={margin_limit} 元 (0=禁用), "
-        f"margin_recheck={margin_recheck}s, "
-        f"reconcile_grace_after_derive={reconcile_grace}s, "
-        f"journal_daily_shards={journal_shards}"
-    )
-
-    try:
-        from auto_runtime_profile import format_environment_banner
-        logger.info(format_environment_banner(config))
-    except Exception as e:
-        logger.warning('环境 banner 输出失败: %s', e, exc_info=True)
-    logger.info("=" * 80)
+    """向后兼容别名。"""
+    log_startup_banner(config, spread_info, strangle_info, logger)
 
 
 def _init_conn(config, logger, combined):
@@ -109,19 +58,6 @@ def _prepare_env(conn, combined, config, logger):
         time.sleep(retry)
 
 
-def _margin_ok(conn, config, logger) -> bool:
-    status, reason = check_margin_status(conn, config, logger, context='启动')
-    if status == 'ok':
-        return True
-    if status == 'over_limit':
-        return False
-    logger.warning(
-        f'启动保证金检查无法判定（{reason}），暂不拦截启动；'
-        '主循环将周期性复检'
-    )
-    return True
-
-
 def main():
     try:
         config = load_merged_config()
@@ -153,12 +89,38 @@ def main():
             sys.exit(2)
 
     from strangle_ledger_atomic import install_atomic_save
-    from order_whitelist_guard import install_send_order_month_guard
+    from order_whitelist_guard import (
+        install_send_order_month_guard,
+        get_install_error as _whitelist_install_error,
+    )
     from ctp_heartbeat_guard import install_heartbeat_warning
     from ctp_recovery_patch import install_recovery_patch
     from health_check_patch import install_health_check_patch
     install_atomic_save()
-    install_send_order_month_guard()
+    # 发单月白名单守卫是核心邻月错单防护；安装失败必须显式告警，
+    # 不能像旧实现那样静默 return。
+    whitelist_ok = install_send_order_month_guard()
+    if not whitelist_ok:
+        reason = _whitelist_install_error() or '未知原因'
+        msg = (
+            f'发单月白名单守卫未安装：{reason}。'
+            '邻月错单将仅靠 autotrade 品种级检查；'
+            '建议检查 autotrade 版本与 sys.path 后再启动。'
+        )
+        logger.error('[启动自检] %s', msg)
+        try:
+            from auto_feishu import send_feishu_message
+            send_feishu_message(
+                f'⚠️ **AutoCTP 启动自检告警**\n\n{msg}',
+                config=config,
+            )
+        except Exception as notify_err:
+            logger.warning(
+                '守卫未安装飞书通知失败: %s', notify_err, exc_info=True,
+            )
+        if config.get('fail_fast_on_guard_install', False):
+            logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
+            sys.exit(4)
     install_heartbeat_warning()
     install_recovery_patch()
     install_health_check_patch()
@@ -188,6 +150,7 @@ def main():
             install_spread_ledger_execution(config)
 
             conn = _init_conn(config, logger, combined)
+            audit_target_months(conn, config, logger, spread_info, strangle_info)
             active = _prepare_env(conn, combined, config, logger)
             from auto_utils import log_startup_min_ticks
             log_startup_min_ticks(conn, combined, logger)
@@ -225,11 +188,18 @@ def main():
                 logger.info("已取消启动")
                 break
 
-            if not _margin_ok(conn, config, logger):
+            if not apply_startup_margin(conn, config, logger, ledger, str_cfg):
                 conn.release()
                 config['_auto_restart'] = True
                 time.sleep(60)
                 continue
+
+            if (
+                conn._runtime_state.get('_margin_halt_open')
+                and str_cfg.get('pause_open_on_reconcile_mismatch', True)
+            ):
+                from merged_main_loop import _sync_strangle_open_halt
+                _sync_strangle_open_halt(conn, ledger, str_cfg)
 
             config['_restart_failures'] = 0
             vix = VIXEngine(config)
@@ -271,6 +241,10 @@ def main():
                     logger.warning(
                         '连续异常退出飞书通知发送失败: %s', notify_err, exc_info=True,
                     )
+                # 旧实现只打日志后继续 while True；与日志/飞书宣称的"进程退出"
+                # 不一致，会无限重启。这里抛 SystemExit 让 finally 释放 conn
+                # 后真正退出（外层 KeyboardInterrupt/Exception 不捕获 SystemExit）。
+                sys.exit(3)
             time.sleep(delay)
         finally:
             if conn:

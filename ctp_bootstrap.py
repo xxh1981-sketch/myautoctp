@@ -4,12 +4,23 @@ import os
 import sys
 
 
-def _resolve_root(env_key: str, config_val: str, default: str) -> str:
+def _resolve_root(
+    env_key: str,
+    config_val: str,
+    default: str,
+    *,
+    allow_missing: bool = False,
+) -> str | None:
+    """Return repo root path, or None when allow_missing and no explicit root."""
     env = os.environ.get(env_key, '').strip()
-    if env and os.path.isdir(env):
+    if env:
         return os.path.abspath(env)
-    if config_val and os.path.isdir(config_val):
+    if config_val:
         return os.path.abspath(config_val)
+    if allow_missing:
+        # CI / 无源码测试：不回落到内置 D:\ 默认路径，避免本机有目录时
+        # 污染 sys.path、与 conftest stub 冲突。
+        return None
     if os.path.isdir(default):
         return os.path.abspath(default)
     return os.path.abspath(default)
@@ -28,20 +39,32 @@ def setup_paths(config: dict = None) -> tuple:
     """
     config = config or {}
     merged = config.get('merged') or {}
+    allow_missing = os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() in (
+        '1', 'true', 'True', 'yes',
+    )
     autotrade = _resolve_root(
         'AUTOTRADE_ROOT',
         merged.get('autotrade_root', ''),
         r'D:\autotrade',
+        allow_missing=allow_missing,
     )
     autostraggle = _resolve_root(
         'AUTOSTRAGGLE_ROOT',
         merged.get('autostraggle_root', ''),
         r'D:\autostraggle',
+        allow_missing=allow_missing,
     )
-    allow_missing = os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() in (
-        '1', 'true', 'True', 'yes',
-    )
-    for p in (autotrade, autostraggle):
+    resolved_autotrade = autotrade or ''
+    resolved_autostraggle = autostraggle or ''
+    for label, p in (('autotrade', autotrade), ('autostraggle', autostraggle)):
+        if not p:
+            if allow_missing:
+                sys.stderr.write(
+                    f'[ctp_bootstrap] WARNING: 未配置 {label} 路径 '
+                    '(AUTOCTP_ALLOW_MISSING_DEPS=1，已跳过)\n'
+                )
+                continue
+            raise RuntimeError(f'未配置 {label} 路径')
         if not os.path.isdir(p):
             if allow_missing:
                 sys.stderr.write(
@@ -49,10 +72,10 @@ def setup_paths(config: dict = None) -> tuple:
                     '(AUTOCTP_ALLOW_MISSING_DEPS=1，已跳过)\n'
                 )
                 continue
-            raise RuntimeError(f"目录不存在: {p}")
+            raise RuntimeError(f'目录不存在: {p}')
         if p not in sys.path:
             sys.path.insert(0, p)
-    return autotrade, autostraggle
+    return resolved_autotrade, resolved_autostraggle
 
 
 def _load_local_merged_config() -> dict:

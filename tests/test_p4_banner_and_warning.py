@@ -27,7 +27,7 @@ class TestBannerOverlap(unittest.TestCase):
         return cap
 
     def test_overlap_logged_as_warning(self):
-        from merged_main import _log_banner
+        from merged_banner import log_startup_banner as _log_banner
 
         logger = self._cap_logger()
         config = {
@@ -52,7 +52,7 @@ class TestBannerOverlap(unittest.TestCase):
         )
 
     def test_no_overlap_no_warning(self):
-        from merged_main import _log_banner
+        from merged_banner import log_startup_banner as _log_banner
 
         logger = self._cap_logger()
         config = {

@@ -383,10 +383,12 @@ def run_merged_main_loop(
                 if _margin_halt_open:
                     spread_open_ok = False
 
+                from spread_fill_sync import count_spread_filled_open_orders
+                from spread_daily_limit import resolve_spread_daily_limit
+
                 spread_filled = 0
                 spread_count_source = 'spread'
                 try:
-                    from spread_fill_sync import count_spread_filled_open_orders
                     fc = count_spread_filled_open_orders(conn, config, timeout=2)
                     if fc is None:
                         fc = conn.get_filled_open_order_count(timeout=2)
@@ -395,25 +397,28 @@ def run_merged_main_loop(
                             '价差日笔数查询降级为全账户口径（含宽跨开仓），'
                             '仅新开受日限约束，平仓不受影响'
                         )
-                    if fc is None:
-                        conn.cancel_all_pending_orders()
-                        time.sleep(loop_interval)
-                        continue
-                    spread_filled = fc
-                    # 日限达限单独判定，避免与 reconcile/margin halt 混淆日志。
-                    spread_limit_reached = fc >= spread_daily_limit
-                    if spread_limit_reached:
-                        spread_open_ok = False
+                    spread_filled, spread_open_ok = resolve_spread_daily_limit(
+                        fc,
+                        spread_daily_limit,
+                        spread_open_ok,
+                        log_warning=spread_logger.warning,
+                    )
+                    if fc is not None and spread_filled >= spread_daily_limit:
                         if not spread_limit_notified:
                             spread_limit_notified = True
                             spread_logger.warning(
-                                f"日笔数达限 {fc}/{spread_daily_limit}（{spread_count_source}），"
+                                f"日笔数达限 {spread_filled}/{spread_daily_limit}"
+                                f'（{spread_count_source}），'
                                 '仍扫描平仓/再平衡，仅禁止新开'
                             )
                 except Exception as e:
                     spread_logger.error(f"成交查询异常: {e}")
-                    time.sleep(loop_interval)
-                    continue
+                    spread_filled, spread_open_ok = resolve_spread_daily_limit(
+                        None,
+                        spread_daily_limit,
+                        spread_open_ok,
+                        log_warning=spread_logger.warning,
+                    )
 
                 strangle_buy_spent = ledger.get_daily_buy_amount()
                 strangle_open_ok = strangle_buy_spent < strangle_buy_limit

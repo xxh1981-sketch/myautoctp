@@ -15,6 +15,8 @@
 
 | 文档 | 内容 |
 |------|------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 双策略编排、halt 路径、认领模型（公开脱敏） |
+| [docs/COMPAT.md](docs/COMPAT.md) | 三仓版本配套与 CI 说明 |
 | **`docs/LOCAL完整说明.md`** | 完整使用说明（**仅本地**，已 `.gitignore`，含 halt 与执行路径约定） |
 | [docs/PUBLIC_REPO.md](docs/PUBLIC_REPO.md) | 公开本仓时的边界与自检 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发、测试与提交规范 |
@@ -43,11 +45,22 @@ $env:PASSWORD = "你的密码"
 
 # 复制模板：merged_config.example.yaml → merged_config.yaml
 # 维护 data\strangle_positions.csv（无仓可空表）
+# 开盘前：python scripts/preview_startup_data.py
 
 python merged_main.py
 ```
 
-启动后按提示 **确认持仓**（终端 `yes` 或弹窗）。完整流程见本地 `docs/LOCAL完整说明.md` §8。
+**7×24 无人值守（模板默认）**
+
+| 项 | 行为 |
+|----|------|
+| 启动确认 | **人工冷启动**弹窗三选一（含 **价差=CTP−宽跨并确认**）；**进程内自动重启**跳过 |
+| 改 CSV 后 | 删除 `position_startup_ack.txt` 再启动，或设 `startup_ack_require_today: true` |
+| 无显示器服务器 | `startup_ack_use_gui: false`（模板已设）；首次可用 `$env:AUTOCTP_CONFIRM='yes'` 一次性确认 |
+| fail-fast | 邻月守卫未安装、`target_months` 为空、`global_margin_limit=0` → **拒绝启动** |
+| 飞书「暂停」 | **全停含平仓**；无人值守勿用暂停代替 halt，敞口需恢复后再扫 |
+
+首次部署流程见本地 `docs/LOCAL完整说明.md` §8；模板见 [merged_config.example.yaml](merged_config.example.yaml)。
 
 ---
 
@@ -61,6 +74,7 @@ python merged_main.py
 | **宽跨日限** | `daily_buy_limit_yuan`；达限仍允许平仓 |
 | **宽跨持仓** | 开盘前维护 `data/strangle_positions.csv` |
 | **价差认领** | `data/spread_positions.csv` 或启动 derive；建仓/再平衡/平仓均认该账本 |
+| **7×24 默认** | 持久启动确认 + fail-fast 自检；改 CSV 删 ack 重确认 |
 
 ---
 
@@ -83,9 +97,18 @@ tests/                  # unit + integration（integration 需私有依赖库）
 ```powershell
 $env:AUTOCTP_ALLOW_MISSING_DEPS = '1'
 python scripts/run_unit_tests.py
+# 或一键: .\scripts\dev_check.ps1
 ```
 
-CI 与私有库 clone 见 [docs/CI.md](docs/CI.md)。
+CI 与私有库 clone 见 [docs/CI.md](docs/CI.md)。三仓版本见 [docs/COMPAT.md](docs/COMPAT.md)。
+
+## 运维脚本（本地）
+
+| 脚本 | 用途 |
+|------|------|
+| `scripts/dev_check.ps1` | ruff + 敏感文件检查 + unit 测试 |
+| `scripts/preview_startup_data.py` | 开盘前离线检查 CSV/账本（不连 CTP） |
+| `scripts/backup_data.ps1` | 备份 `data/` 运行时文件 |
 
 ---
 

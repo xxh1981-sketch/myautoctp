@@ -6,6 +6,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import autotrade_stubs
+
+autotrade_stubs.ensure_merged_loop_stubs()
 import ctp_bootstrap  # noqa: F401
 
 
@@ -89,7 +93,7 @@ class TestMergedMainLoopReconnect(unittest.TestCase):
                 run_merged_main_loop(**_minimal_args(conn, logger))
 
         mock_watchdog.assert_called_once_with(conn, conn.config, logger)
-        quarantine_logs = [m for lvl, m in logger.messages if '隔离期' in m]
+        quarantine_logs = [m for lvl, m in logger.messages if '隔离' in m]
         self.assertTrue(quarantine_logs)
 
     @patch('auto_reconnect_recovery.check_quarantine_watchdog')
@@ -159,7 +163,7 @@ class TestMergedMainLoopReconnect(unittest.TestCase):
                 run_merged_main_loop(**_minimal_args(conn, logger))
 
         mock_watchdog.assert_not_called()
-        login_logs = [m for lvl, m in logger.messages if '未全部登录' in m]
+        login_logs = [m for lvl, m in logger.messages if '未全部登录' in m or '未登录' in m]
         self.assertTrue(login_logs)
 
 

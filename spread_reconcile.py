@@ -134,6 +134,59 @@ def _previous_halt_state(conn) -> Tuple[bool, List[str]]:
     return prev_halt, prev_issues
 
 
+SPREAD_TRANSIENT_STREAK_KEY = '_spread_reconcile_transient_streak'
+STRANGLE_TRANSIENT_STREAK_KEY = '_strangle_reconcile_transient_streak'
+
+
+def _transient_halt_threshold(config: dict) -> int:
+    dual = config.get('dual_strategy') or {}
+    try:
+        n = int(dual.get('reconcile_transient_halt_after', 3) or 3)
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, n)
+
+
+def handle_transient_reconcile_failure(
+    conn,
+    prev_halt: bool,
+    new_issues: List[str],
+    prev_issues: List[str],
+    config: dict,
+    streak_key: str,
+    logger,
+    log_prefix: str,
+) -> Tuple[bool, List[str]]:
+    """Track consecutive transient reconcile failures; force halt after N."""
+    runtime = getattr(conn, '_runtime_state', None) or {}
+    threshold = _transient_halt_threshold(config)
+    streak = int(runtime.get(streak_key, 0) or 0) + 1
+    runtime[streak_key] = streak
+    combined = new_issues + prev_issues
+
+    if streak >= threshold:
+        if logger:
+            logger.warning(
+                f'{log_prefix} 连续 {streak} 次 transient 对账失败，强制 halt'
+            )
+        return True, combined + [
+            f'连续 {streak} 次 transient 对账失败，强制 halt',
+        ]
+
+    if logger:
+        logger.warning(
+            f'{log_prefix} transient 失败 ({streak}/{threshold})，'
+            f'沿用上一轮 halt 状态: prev_halt={prev_halt}'
+        )
+    return prev_halt, combined
+
+
+def clear_reconcile_transient_streak(conn, streak_key: str) -> None:
+    runtime = getattr(conn, '_runtime_state', None)
+    if runtime is not None:
+        runtime[streak_key] = 0
+
+
 def _in_grace_window(conn) -> bool:
     """True 表示当前处于 derive/启动后的对账豁免窗口（差异不强制 halt）。"""
     import time as _time
@@ -163,9 +216,9 @@ def reconcile_spread_positions(
     round-level CTP query between strangle and spread reconcile.
 
     Transient-vs-真不一致 区分：
-      * 查询失败 / CSV 同步异常 / SpreadLegStore 未挂载，被视为 transient，
-        沿用上一轮的 halt 状态而非强制 halt=True，避免网络抖动期间整个价差
-        被锁死成 close-only。
+      * 查询失败 / SpreadLegStore 未挂载，被视为 transient；
+        单次失败沿用上一轮 halt，连续 N 次（``reconcile_transient_halt_after``）
+        后强制 halt=True。
       * 仅当对账成功完成且实际比对出仓位差异时才返回 halt=True。
     """
     issues: List[str] = []
@@ -188,22 +241,20 @@ def reconcile_spread_positions(
         except Exception as e:
             issues.append(f'position query failed: {e}')
             prev_halt, prev_issues = _previous_halt_state(conn)
-            if logger:
-                logger.warning(
-                    '[spread-reconcile] 持仓查询失败，沿用上一轮 halt 状态: '
-                    f'prev_halt={prev_halt} (transient)'
-                )
-            return prev_halt, issues + prev_issues
+            return handle_transient_reconcile_failure(
+                conn, prev_halt, issues, prev_issues, config,
+                SPREAD_TRANSIENT_STREAK_KEY, logger,
+                '[spread-reconcile]',
+            )
 
     if store is None:
         issues.append('SpreadLegStore unavailable')
         prev_halt, prev_issues = _previous_halt_state(conn)
-        if logger:
-            logger.warning(
-                '[spread-reconcile] SpreadLegStore 未挂载，沿用上一轮 halt 状态: '
-                f'prev_halt={prev_halt} (transient)'
-            )
-        return prev_halt, issues + prev_issues
+        return handle_transient_reconcile_failure(
+            conn, prev_halt, issues, prev_issues, config,
+            SPREAD_TRANSIENT_STREAK_KEY, logger,
+            '[spread-reconcile]',
+        )
 
     book = ledger_spread_signed_claims(conn, store, spread_tradeinfo)
     strangle_long_calls = (
@@ -239,6 +290,8 @@ def reconcile_spread_positions(
                 '[spread-reconcile] 处于豁免窗口 (derive 后)，'
                 f'{len(issues)} 条差异仅记录不 halt（待 OnRtnTrade 拉齐）'
             )
+        clear_reconcile_transient_streak(conn, SPREAD_TRANSIENT_STREAK_KEY)
         return False, issues
 
+    clear_reconcile_transient_streak(conn, SPREAD_TRANSIENT_STREAK_KEY)
     return halt, issues

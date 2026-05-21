@@ -8,6 +8,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
+import autotrade_stubs
+
+autotrade_stubs.ensure_auto_feishu_stub()
+
 from trade_feishu_notify import (
     format_fill_feishu_message,
     install_unified_trade_feishu,
