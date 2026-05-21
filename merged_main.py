@@ -176,6 +176,11 @@ def main():
             dual = config.get('dual_strategy') or {}
             if dual.get('auto_sync_spread_positions_csv', True):
                 sync_csv_from_spread_trades(conn, spread_store, config, logger)
+            from spread_claims_guard import purge_invalid_spread_claims
+            purge_invalid_spread_claims(
+                config, conn, spread_info, store=spread_store, logger=logger,
+            )
+            sync_spread_leg_claims(spread_store, config, logger=logger)
             sync_fill_ledger_from_trades(conn, config, logger)
 
             if not require_startup_position_ack(config, logger, ledger, conn):

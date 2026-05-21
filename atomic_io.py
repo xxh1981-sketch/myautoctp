@@ -7,6 +7,8 @@ import tempfile
 
 
 def atomic_write_bytes(path: str, data: bytes) -> None:
+    from data_path_guard import guard_repo_data_write
+    guard_repo_data_write(path)
     directory = os.path.dirname(os.path.abspath(path)) or '.'
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', dir=directory)

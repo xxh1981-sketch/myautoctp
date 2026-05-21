@@ -68,6 +68,8 @@ DUAL_STRATEGY_DEFAULTS = {
     'exclude_strangle_from_spread_reconcile': True,
     'pause_spread_open_on_reconcile_mismatch': True,
     'spread_fill_require_tradeinfo_match': True,
+    'spread_derive_require_tradeinfo_match': True,
+    'spread_purge_invalid_claims_on_startup': True,
     'spread_reconcile_fallback_heuristic': False,
     'auto_sync_spread_positions_csv': True,
 

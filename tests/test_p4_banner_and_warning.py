@@ -88,7 +88,7 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
             ],
             'dual_strategy': {
                 'spread_trade_journal': os.path.join(self.tmp, 'spread_journal.jsonl'),
-                'spread_positions_csv_path': os.path.join(self.tmp, 'spread.csv'),
+                'spread_positions_csv': os.path.join(self.tmp, 'spread.csv'),
                 # P4 用例：OrderRef 在价差段但品种不在 spread_tradeinfo → 仍入账，每品种 warning 一次
                 'spread_fill_require_tradeinfo_match': False,
             },
@@ -107,10 +107,15 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
 
     def test_warns_when_spread_orderref_hits_strangle_symbol(self):
         from spread_fill_sync import apply_spread_trade_record
+        from import_spread_positions import load_spread_positions_csv
 
         logger = MagicMock()
         cfg = self._cfg()
         store = MagicMock()
+        prod_csv = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'data', 'spread_positions.csv',
+        )
 
         # OrderRef=100 命中 spread 段；instrument 是 RM（仅在 strangle 配置中）
         trade = {
@@ -127,6 +132,11 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
         applied = apply_spread_trade_record(cfg, store, trade, logger)
         self.assertFalse(cfg['dual_strategy']['spread_fill_require_tradeinfo_match'])
         self.assertTrue(applied)
+        tmp_claims = load_spread_positions_csv(cfg['dual_strategy']['spread_positions_csv'])
+        self.assertEqual(tmp_claims.get('RM509-C-9000'), 1)
+        if os.path.isfile(prod_csv):
+            prod_claims = load_spread_positions_csv(prod_csv)
+            self.assertNotIn('RM509-C-9000', prod_claims)
         warning_msgs = self._p4_warning_msgs(logger)
         self.assertTrue(
             any('RM' in m for m in warning_msgs),

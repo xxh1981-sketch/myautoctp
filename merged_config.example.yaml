@@ -23,6 +23,10 @@ dual_strategy:
   pause_spread_open_on_reconcile_mismatch: true
   # true：价差段 OrderRef 成交仅当合约属于 spread tradeinfo 才写入 CSV
   spread_fill_require_tradeinfo_match: true
+  # true：启动 derive 时跳过 spread tradeinfo 外合约（防 CTP−宽跨 污染 CSV）
+  spread_derive_require_tradeinfo_match: true
+  # true：启动回放成交后自动移除 tradeinfo 外 / CTP 无仓的孤儿认领
+  spread_purge_invalid_claims_on_startup: true
   auto_sync_spread_positions_csv: true
   spread_positions_csv: data/spread_positions.csv
   spread_trade_journal: data/spread_trade_journal.jsonl

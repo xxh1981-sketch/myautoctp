@@ -74,6 +74,21 @@ class TestSpreadDerive(unittest.TestCase):
         self.assertEqual(claims['MA609C2950'], -4)
         self.assertNotIn('SA609P900', claims)
 
+    def test_derive_filters_outside_tradeinfo(self):
+        conn = MagicMock()
+        conn.query_positions_sync.return_value = [
+            {'instrument': 'MA609C2900', 'direction': '2', 'position': 1},
+            {'instrument': 'RM509-C-9000', 'direction': '2', 'position': 180},
+        ]
+        cfg = {
+            'spread_tradeinfo': [{'future': 'MA', 'month': '609'}],
+            'dual_strategy': {'spread_derive_require_tradeinfo_match': True},
+        }
+        claims, _ = derive_spread_claims_from_ctp(
+            conn, FakeLedger(), config=cfg,
+        )
+        self.assertEqual(claims, {'MA609C2900': 1})
+
     def test_query_failure(self):
         conn = MagicMock()
         conn.query_positions_sync.return_value = None
