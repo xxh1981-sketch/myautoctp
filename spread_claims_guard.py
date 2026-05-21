@@ -63,6 +63,35 @@ def instrument_in_spread_tradeinfo(
     return False
 
 
+def invalid_spread_claim_keys(
+    claims: Dict[str, int],
+    spread_tradeinfo: list,
+    conn=None,
+    ctp_signed: Optional[Dict[str, int]] = None,
+) -> Set[str]:
+    """Instrument keys in claims that fail tradeinfo or CTP orphan checks."""
+    bad: Set[str] = set()
+    keys = _spread_keys(spread_tradeinfo)
+
+    for inst, vol in (claims or {}).items():
+        v = int(vol)
+        if v == 0:
+            continue
+        sym = _symbol_prefix(inst)
+        if keys and not any(s == sym for s, _m in keys):
+            bad.add(inst)
+            continue
+        if keys and conn is not None:
+            if not instrument_in_spread_tradeinfo(inst, conn, spread_tradeinfo):
+                bad.add(inst)
+                continue
+        if ctp_signed is not None:
+            ctp_vol = int(ctp_signed.get(inst, 0))
+            if ctp_vol == 0 and abs(v) > 0:
+                bad.add(inst)
+    return bad
+
+
 def audit_spread_claims(
     claims: Dict[str, int],
     spread_tradeinfo: list,
@@ -96,6 +125,79 @@ def audit_spread_claims(
                     f'{inst}: CSV={v} 但 CTP 无该合约净持仓（认领孤儿）'
                 )
     return issues
+
+
+def purge_invalid_spread_claims(
+    config: dict,
+    conn,
+    spread_tradeinfo: list,
+    store=None,
+    logger=None,
+) -> int:
+    """Drop CSV rows outside spread tradeinfo or with zero CTP net (orphans).
+
+    Only runs when CTP signed positions are available; returns removed count.
+    """
+    from import_spread_positions import (
+        load_spread_positions_csv,
+        save_spread_positions_csv,
+        spread_positions_csv_path,
+    )
+
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('spread_purge_invalid_claims_on_startup', True):
+        return 0
+
+    path = spread_positions_csv_path(config)
+    if not os.path.isfile(path):
+        return 0
+
+    try:
+        claims = load_spread_positions_csv(path)
+    except Exception as e:
+        if logger:
+            logger.warning(f'[价差持仓] 净化跳过：读取 CSV 失败: {e}')
+        return 0
+    if not claims:
+        return 0
+
+    try:
+        from spread_derive import query_ctp_signed_positions
+        ctp_signed = query_ctp_signed_positions(conn, logger)
+    except Exception as e:
+        if logger:
+            logger.warning(f'[价差持仓] 净化跳过：CTP 持仓查询失败: {e}')
+        return 0
+    if ctp_signed is None:
+        if logger:
+            logger.warning('[价差持仓] 净化跳过：CTP 持仓不可用')
+        return 0
+
+    bad = invalid_spread_claim_keys(
+        claims, spread_tradeinfo, conn=conn, ctp_signed=ctp_signed,
+    )
+    if not bad:
+        return 0
+
+    removed = 0
+    for inst in bad:
+        vol = claims.pop(inst, None)
+        if vol is not None:
+            removed += 1
+            if logger:
+                logger.warning(
+                    f'[价差持仓] 已移除无效认领 {inst} CSV={vol} '
+                    '(非 spread tradeinfo 或 CTP 无仓；非价差成交入账)'
+                )
+
+    save_spread_positions_csv(path, claims)
+    if store is not None:
+        store.set_leg_claims(claims)
+    if logger:
+        logger.info(
+            f'[价差持仓] CSV 已净化：移除 {removed} 条无效认领 -> {path}'
+        )
+    return removed
 
 
 def repair_spread_trade_journals(

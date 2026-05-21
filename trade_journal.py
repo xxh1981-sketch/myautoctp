@@ -102,7 +102,9 @@ def load_applied_keys(journal_base: str, config: dict = None) -> Set[str]:
 
 def append_journal(journal_base: str, row: dict, config: dict = None) -> str:
     """Append one JSON line; returns path written."""
+    from data_path_guard import guard_repo_data_write
     path = active_journal_path(journal_base, config)
+    guard_repo_data_write(path)
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(row, ensure_ascii=False) + '\n')

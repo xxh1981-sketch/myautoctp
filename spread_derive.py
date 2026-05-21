@@ -66,16 +66,30 @@ def query_ctp_signed_positions(conn, logger=None) -> Optional[Dict[str, int]]:
     return signed
 
 
-def derive_spread_claims_from_ctp(conn, ledger, logger=None) -> Tuple[Optional[Dict[str, int]], str]:
+def derive_spread_claims_from_ctp(
+    conn,
+    ledger,
+    logger=None,
+    config: dict = None,
+) -> Tuple[Optional[Dict[str, int]], str]:
     """
     spread_claims[inst] = CTP_signed[inst] - strangle_owned[inst]
 
     Only instruments present in CTP with non-zero net are considered.
     strangle_owned includes leg_claims and unmatched long legs.
+    When config/spread_tradeinfo is set, skip instruments outside it.
     """
     ctp_signed = query_ctp_signed_positions(conn, logger)
     if ctp_signed is None:
         return None, 'CTP 持仓查询失败'
+
+    cfg = config or getattr(conn, 'config', None) or {}
+    spread_info = cfg.get('spread_tradeinfo') or []
+    filter_tradeinfo = bool(
+        (cfg.get('dual_strategy') or {}).get(
+            'spread_derive_require_tradeinfo_match', True,
+        )
+    )
 
     strangle_owned = merge_strangle_owned_volumes(ledger)
     strangle_by_upper = {
@@ -87,6 +101,14 @@ def derive_spread_claims_from_ctp(conn, ledger, logger=None) -> Tuple[Optional[D
     spread: Dict[str, int] = {}
     warnings = []
     for inst, net in ctp_signed.items():
+        if filter_tradeinfo and spread_info:
+            from spread_claims_guard import instrument_in_spread_tradeinfo
+            if not instrument_in_spread_tradeinfo(inst, conn, spread_info):
+                if logger:
+                    logger.info(
+                        f'[价差推导] 跳过 {inst}：不在 spread tradeinfo'
+                    )
+                continue
         strangle_vol = strangle_by_upper.get(inst.upper(), 0)
         rem = int(net) - strangle_vol
         if rem != 0:
@@ -116,7 +138,9 @@ def apply_derived_spread_from_ctp(conn, ledger, store, config, logger=None) -> O
     """Persist spread claims derived from CTP minus strangle into CSV and runtime store."""
     import time as _time
 
-    claims, _note = derive_spread_claims_from_ctp(conn, ledger, logger)
+    claims, _note = derive_spread_claims_from_ctp(
+        conn, ledger, logger, config=config,
+    )
     if claims is None:
         return None
 

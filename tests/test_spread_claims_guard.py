@@ -3,14 +3,16 @@
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spread_claims_guard import (
     audit_spread_claims,
     instrument_in_spread_tradeinfo,
+    purge_invalid_spread_claims,
 )
+from spread_ledger import SpreadLegStore
 
 
 class TestSpreadClaimsGuard(unittest.TestCase):
@@ -81,6 +83,34 @@ class TestSpreadClaimsGuard(unittest.TestCase):
                 lines = [ln for ln in f if ln.strip()]
             self.assertEqual(len(lines), 1)
             self.assertIn('MA609C2900', lines[0])
+
+    def test_purge_orphan_and_wrong_month(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                'dual_strategy': {
+                    'spread_positions_csv': os.path.join(tmp, 'spread.csv'),
+                    'spread_purge_invalid_claims_on_startup': True,
+                },
+                'spread_tradeinfo': [{'future': 'MA', 'month': '609'}],
+            }
+            path = cfg['dual_strategy']['spread_positions_csv']
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('instrument,volume\n')
+                f.write('MA609C2900,1\n')
+                f.write('RM509-C-9000,180\n')
+                f.write('SA609C1000,30\n')
+
+            store = SpreadLegStore()
+            conn = self._conn()
+            ctp = {'MA609C2900': 1}
+            with patch('spread_derive.query_ctp_signed_positions', return_value=ctp):
+                n = purge_invalid_spread_claims(
+                    cfg, conn, cfg['spread_tradeinfo'], store=store, logger=None,
+                )
+            self.assertEqual(n, 2)
+            self.assertEqual(store.list_leg_claims(), {'MA609C2900': 1})
 
 
 if __name__ == '__main__':
