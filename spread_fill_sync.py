@@ -86,12 +86,16 @@ def apply_spread_trade_record(
             if not instrument_in_spread_tradeinfo(
                 instrument, conn, spread_info,
             ):
-                if logger:
-                    logger.warning(
-                        f'[价差持仓] 跳过入账 OrderRef={order_ref} {instrument} '
-                        f'x{volume}：合约不在 spread tradeinfo（品种/月份不匹配）。'
-                        '请核对 strategy_order_ref 是否把宽跨成交写进价差段。'
-                    )
+                sym = _symbol_prefix(instrument)
+                tag = f'skip_tradeinfo:{sym or instrument.lower()}'
+                if tag not in _UNEXPECTED_SPREAD_SYMBOL_WARNED:
+                    _UNEXPECTED_SPREAD_SYMBOL_WARNED.add(tag)
+                    if logger:
+                        logger.warning(
+                            f'[价差持仓] 跳过入账 OrderRef={order_ref} {instrument} '
+                            f'x{volume}：合约不在 spread tradeinfo（品种/月份不匹配）。'
+                            '请核对 strategy_order_ref 是否把宽跨成交写进价差段。'
+                        )
                 append_journal(journal_file, {
                     'dedupe_key': dedupe_key,
                     'trade_id': trade.get('trade_id', ''),

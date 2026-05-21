@@ -98,6 +98,13 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _p4_warning_msgs(logger) -> list:
+        return [
+            c.args[0] for c in logger.warning.call_args_list
+            if '落在价差段' in c.args[0]
+        ]
+
     def test_warns_when_spread_orderref_hits_strangle_symbol(self):
         from spread_fill_sync import apply_spread_trade_record
 
@@ -118,11 +125,12 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
             'trade_time': '10:00:00',
         }
         applied = apply_spread_trade_record(cfg, store, trade, logger)
+        self.assertFalse(cfg['dual_strategy']['spread_fill_require_tradeinfo_match'])
         self.assertTrue(applied)
-        warning_msgs = [c.args[0] for c in logger.warning.call_args_list]
+        warning_msgs = self._p4_warning_msgs(logger)
         self.assertTrue(
-            any('RM' in m and '价差段' in m for m in warning_msgs),
-            f'expected RM warning, got {warning_msgs}',
+            any('RM' in m for m in warning_msgs),
+            f'expected RM P4 warning, got {warning_msgs}',
         )
 
     def test_does_not_warn_for_configured_spread_symbol(self):
@@ -143,11 +151,7 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
             'trade_time': '10:00:00',
         }
         apply_spread_trade_record(cfg, store, trade, logger)
-        warning_msgs = [c.args[0] for c in logger.warning.call_args_list]
-        self.assertFalse(
-            any('价差段' in m for m in warning_msgs),
-            f'unexpected warning for configured SA: {warning_msgs}',
-        )
+        self.assertFalse(self._p4_warning_msgs(logger))
 
     def test_warns_only_once_per_symbol(self):
         from spread_fill_sync import apply_spread_trade_record
@@ -168,14 +172,38 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
                 'trade_time': '10:00:00',
             }
             apply_spread_trade_record(cfg, store, trade, logger)
-        warning_msgs = [
-            c.args[0] for c in logger.warning.call_args_list
-            if '价差段' in c.args[0]
-        ]
+        warning_msgs = self._p4_warning_msgs(logger)
         self.assertEqual(
             len(warning_msgs), 1,
-            f'expected exactly 1 warning per symbol, got {warning_msgs}',
+            f'expected exactly 1 P4 warning per symbol, got {warning_msgs}',
         )
+
+    def test_require_match_skips_unknown_symbol_with_warning_once(self):
+        from spread_fill_sync import apply_spread_trade_record
+
+        logger = MagicMock()
+        cfg = self._cfg()
+        cfg['dual_strategy']['spread_fill_require_tradeinfo_match'] = True
+        store = MagicMock()
+        for i in range(5):
+            trade = {
+                'order_ref': 400 + i,
+                'instrument': 'RM509-C-9000',
+                'direction': '0',
+                'offset': '0',
+                'volume': 1,
+                'price': 100.0,
+                'trade_id': f'T_skip_{i}',
+                'trade_date': '20260520',
+                'trade_time': '10:00:00',
+            }
+            applied = apply_spread_trade_record(cfg, store, trade, logger)
+            self.assertFalse(applied)
+        skip_msgs = [
+            c.args[0] for c in logger.warning.call_args_list
+            if '跳过入账' in c.args[0]
+        ]
+        self.assertEqual(len(skip_msgs), 1, skip_msgs)
 
 
 if __name__ == '__main__':
