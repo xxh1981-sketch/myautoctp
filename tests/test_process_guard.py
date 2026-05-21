@@ -51,39 +51,37 @@ class TestProcessGuard(unittest.TestCase):
         self.assertIsNone(process_guard._HELD_FD)
 
     def test_second_process_simulation(self):
-        """子进程尝试拿锁应失败（实测跨进程行为，依赖 OS 锁）。"""
+        """子进程尝试拿锁应失败（用 subprocess 避免 fork 继承 flock）。"""
         if os.name == 'nt':
-            self.skipTest('Windows msvcrt.locking 在子进程模拟不便测；'
-                          '在 CI/Linux 上验证 fcntl.flock 跨进程行为即可。')
+            self.skipTest('Windows 上跳过跨进程锁测试')
         process_guard.acquire_singleton(pid_path=self.pid_path)
-        import multiprocessing as mp
+        import subprocess
 
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-        def _try_acquire(path, root, q):
-            import sys
-            if root not in sys.path:
-                sys.path.insert(0, root)
-            import process_guard as g
-            g._HELD_FD = None
-            g._HELD_PATH = None
-            try:
-                g.acquire_singleton(pid_path=path)
-                q.put('OK')
-            except g.AlreadyRunningError as e:
-                q.put(f'BLOCKED:{e}')
-            except Exception as e:
-                q.put(f'ERR:{e}')
-
-        ctx = mp.get_context('fork' if os.name != 'nt' else 'spawn')
-        q = ctx.Queue()
-        p = ctx.Process(target=_try_acquire, args=(self.pid_path, repo_root, q))
-        p.start()
-        p.join(10)
-        result = q.get(timeout=2)
+        code = (
+            'import sys\n'
+            f'sys.path.insert(0, {repo_root!r})\n'
+            'import process_guard as g\n'
+            'g._HELD_FD = None\n'
+            'g._HELD_PATH = None\n'
+            'try:\n'
+            f'    g.acquire_singleton(pid_path={self.pid_path!r})\n'
+            '    print("OK")\n'
+            'except g.AlreadyRunningError as e:\n'
+            '    print("BLOCKED:" + str(e))\n'
+            'except Exception as e:\n'
+            '    print("ERR:" + str(e))\n'
+        )
+        r = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        out = (r.stdout or '') + (r.stderr or '')
         self.assertTrue(
-            result.startswith('BLOCKED'),
-            f'second process should be blocked, got: {result}',
+            'BLOCKED' in out,
+            f'second process should be blocked, got: {out!r}',
         )
 
 

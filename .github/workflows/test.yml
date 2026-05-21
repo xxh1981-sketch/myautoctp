@@ -40,7 +40,7 @@ jobs:
           pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
       - name: Run unit tests (no autotrade required)
-        run: python scripts/run_unit_tests.py --cov=. --cov-report=term-missing
+        run: python scripts/run_unit_tests.py --cov=. --cov-report=term-missing --tb=long
 
   pytest-unit-windows:
     runs-on: windows-latest

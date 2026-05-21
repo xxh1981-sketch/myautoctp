@@ -30,20 +30,24 @@ class TestCtpBootstrapSoftFail(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # 恢复默认 bootstrap（允许 CI 缺 autotrade）
+        os.environ['AUTOCTP_ALLOW_MISSING_DEPS'] = '1'
+        try:
+            _reimport_bootstrap()
+        except RuntimeError:
+            pass
 
     def test_strict_mode_raises_when_dir_missing(self):
         os.environ.pop('AUTOCTP_ALLOW_MISSING_DEPS', None)
-        boot = _reimport_bootstrap()
-        # patch os.path.isdir 让 ctp_bootstrap 看到 "什么目录都不存在"，
-        # 模拟 CI 环境（无 D:\autotrade fallback）。
+        # 必须在 import 前 patch：ctp_bootstrap 模块加载时会立刻执行 setup_paths()
         with patch('ctp_bootstrap.os.path.isdir', return_value=False):
             with self.assertRaises(RuntimeError):
-                boot.setup_paths({})
+                _reimport_bootstrap()
 
     def test_allow_missing_returns_paths_without_raise(self):
         os.environ['AUTOCTP_ALLOW_MISSING_DEPS'] = '1'
-        boot = _reimport_bootstrap()
         with patch('ctp_bootstrap.os.path.isdir', return_value=False):
+            boot = _reimport_bootstrap()
             rt, rg = boot.setup_paths({})
         self.assertTrue(isinstance(rt, str))
         self.assertTrue(isinstance(rg, str))
