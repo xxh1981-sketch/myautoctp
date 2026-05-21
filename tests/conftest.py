@@ -23,10 +23,23 @@ def _unit_test_basenames() -> set[str]:
     return {os.path.basename(p) for p in mod.UNIT_TESTS}
 
 
+def _autostraggle_test_basenames() -> frozenset[str]:
+    return frozenset({
+        'test_strangle_ledger_atomic.py',
+        'test_strangle_rebalance_close_only.py',
+        'test_spread_reconcile.py',
+        'test_merged_main_loop.py',
+        'test_merged_main_loop_limits.py',
+    })
+
+
 def pytest_collection_modifyitems(config, items) -> None:
     unit_files = _unit_test_basenames()
+    autostraggle_files = _autostraggle_test_basenames()
     for item in items:
         if item.path.name in unit_files:
             item.add_marker(pytest.mark.unit)
         else:
             item.add_marker(pytest.mark.integration)
+        if item.path.name in autostraggle_files:
+            item.add_marker(pytest.mark.autostraggle)

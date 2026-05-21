@@ -10,18 +10,20 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 | `pytest-unit` | push / PR | 无 autotrade | `python scripts/run_unit_tests.py` |
 | `pytest-unit-windows` | push / PR | 无 autotrade | Windows 上跑同一 unit 套件 |
 | `pytest-permissive` | push / PR | 无 autotrade | `pytest -m "not integration"` |
-| `pytest-full` | push / PR / 手动 | autotrade + autostraggle | 全量 `pytest tests/` |
+| `pytest-full` | push / PR / 手动 | autotrade（必选）；autostraggle（可选） | 全量或 autotrade-only integration |
 
 ## 启用全量 CI（pytest-full）
 
 1. 打开 GitHub 仓库 **Settings → Secrets and variables → Actions**
 2. 添加 Repository secrets：
 
-| Secret | 值示例 | 说明 |
-|--------|--------|------|
-| `AUTOTRADE_REPO_URL` | `https://github.com/your-org/autotrade.git` | 不含 token 的普通 HTTPS URL 即可 |
-| `AUTOSTRAGGLE_REPO_URL` | `https://github.com/your-org/autostraggle.git` | 同上 |
-| `DEPENDENCY_REPO_PAT` | `ghp_xxxx` 或 fine-grained PAT | **私有库必填**；workflow 会自动注入 clone 认证 |
+| Secret | 必填 | 值示例 | 说明 |
+|--------|------|--------|------|
+| `AUTOTRADE_REPO_URL` | **是** | `https://github.com/your-org/autotrade.git` | 不含 token 的普通 HTTPS URL 即可 |
+| `DEPENDENCY_REPO_PAT` | 私有 autotrade 时 | `ghp_xxxx` | workflow 自动注入 clone 认证 |
+| `AUTOSTRAGGLE_REPO_URL` | **否** | `https://github.com/your-org/autostraggle.git` | 未建库时可不配；CI 只跑 autotrade integration |
+
+**尚未创建 autostraggle 仓库时**：只配 `AUTOTRADE_REPO_URL` + `DEPENDENCY_REPO_PAT` 即可。`pytest-full` 会 clone autotrade，跑 `pytest -m "not autostraggle"`（跳过宽跨主循环 / `StrangleLedger` 等 5 个文件的用例）。autostraggle 建好后补上 `AUTOSTRAGGLE_REPO_URL`，即切换为全量 `pytest tests/`。
 
 **私有库推荐做法**（三选一，优先第 1 种）：
 
@@ -33,11 +35,15 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 
 3. 配置完成后，每次 push/PR 会自动 clone 两仓库并跑全量测试；**失败会阻塞 PR**（已移除 `continue-on-error`）。
 
-4. 建议在 **Settings → Branches → Branch protection**（或 **Settings → Rules → Rulesets**）中将以下 checks 设为 Required：
+4. 建议在 **Settings → Branches → Branch protection** 中将以下 checks 设为 Required：
+
+   **现在（无 autostraggle 仓库）：**
    - `Tests / lint`
    - `Tests / pytest-unit`
    - `Tests / pytest-unit-windows`
-   - `Tests / pytest-full`（secrets 配好且全量跑通后）
+   - `Tests / pytest-full`（配好 autotrade secrets 后）
+
+   **autostraggle 建库并配 `AUTOSTRAGGLE_REPO_URL` 后**：同一批 checks 即覆盖全量双策略测试。
 
    > GitHub 显示格式为 **`Tests / {job 名}`**。若某 job 显示 **Skipped**，常见原因是上游 job 失败（旧版 workflow 中 pytest-full 依赖 pytest-unit，unit 红则 full 整 job 被跳过；现已改为仅依赖 lint）。
 
@@ -46,7 +52,8 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 | 现象 | 原因 |
 |------|------|
 | 整 job 灰色 Skipped | 旧 workflow：`needs: [pytest-unit]` 且 unit 失败；或 lint 失败 |
-| job 跑了但只剩 notice | secrets 未配置，或 clone 步骤被 `if:` 跳过 |
+| job 跑了但只剩 notice | 未配 `AUTOTRADE_REPO_URL`，clone/测试步骤被跳过 |
+| job 绿但日志有 autostraggle notice | 正常：未配 `AUTOSTRAGGLE_REPO_URL`，跑 autotrade-only 子集 |
 
 推送最新 `.github/workflows/test.yml` 后，**pytest-full 会在 lint 通过后执行**（不再等 unit 绿）。
 

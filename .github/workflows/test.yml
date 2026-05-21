@@ -98,17 +98,49 @@ jobs:
           AUTOTRADE_REPO_URL: ${{ secrets.AUTOTRADE_REPO_URL }}
           AUTOSTRAGGLE_REPO_URL: ${{ secrets.AUTOSTRAGGLE_REPO_URL }}
         run: |
-          if [ -z "$AUTOTRADE_REPO_URL" ] || [ -z "$AUTOSTRAGGLE_REPO_URL" ]; then
+          if [ -z "$AUTOTRADE_REPO_URL" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping full suite: secrets AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL not set"
+            echo "autostraggle_configured=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping full suite: secret AUTOTRADE_REPO_URL not set"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
+            if [ -n "$AUTOSTRAGGLE_REPO_URL" ]; then
+              echo "autostraggle_configured=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "autostraggle_configured=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::AUTOSTRAGGLE_REPO_URL 未配置，pytest-full 仅 clone autotrade 并跳过 autostraggle 用例"
+            fi
           fi
 
-      - name: Clone autotrade & autostraggle
+      - name: Clone autotrade
         if: steps.check_deps.outputs.configured == 'true'
         env:
           AUTOTRADE_REPO_URL: ${{ secrets.AUTOTRADE_REPO_URL }}
+          DEPENDENCY_REPO_PAT: ${{ secrets.DEPENDENCY_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          auth_clone_url() {
+            local url="$1"
+            if [[ "$url" == *'@'* ]]; then
+              printf '%s' "$url"
+              return
+            fi
+            if [[ "$url" =~ ^https://github.com/ ]] && [ -n "${DEPENDENCY_REPO_PAT:-}" ]; then
+              printf 'https://x-access-token:%s@%s' "$DEPENDENCY_REPO_PAT" "${url#https://}"
+              return
+            fi
+            printf '%s' "$url"
+          }
+          auth="$(auth_clone_url "$AUTOTRADE_REPO_URL")"
+          if [[ "$auth" == "$AUTOTRADE_REPO_URL" ]] && [[ "$AUTOTRADE_REPO_URL" =~ ^https://github.com/ ]] && [[ "$AUTOTRADE_REPO_URL" != *'@'* ]]; then
+            echo "::error::无法 clone autotrade：请添加 secret DEPENDENCY_REPO_PAT（PAT，需 repo 读权限），或在 AUTOTRADE_REPO_URL 中嵌入 token"
+            exit 1
+          fi
+          git clone --depth 1 "$auth" autotrade
+
+      - name: Clone autostraggle
+        if: steps.check_deps.outputs.autostraggle_configured == 'true'
+        env:
           AUTOSTRAGGLE_REPO_URL: ${{ secrets.AUTOSTRAGGLE_REPO_URL }}
           DEPENDENCY_REPO_PAT: ${{ secrets.DEPENDENCY_REPO_PAT }}
         run: |
@@ -125,18 +157,12 @@ jobs:
             fi
             printf '%s' "$url"
           }
-          clone_one() {
-            local url="$1" dest="$2"
-            local auth
-            auth="$(auth_clone_url "$url")"
-            if [[ "$auth" == "$url" ]] && [[ "$url" =~ ^https://github.com/ ]] && [[ "$url" != *'@'* ]]; then
-              echo "::error::无法 clone 私有库 ${dest}：请添加 secret DEPENDENCY_REPO_PAT（PAT，需 repo 读权限），或在 *_REPO_URL 中嵌入 token"
-              exit 1
-            fi
-            git clone --depth 1 "$auth" "$dest"
-          }
-          clone_one "$AUTOTRADE_REPO_URL" autotrade
-          clone_one "$AUTOSTRAGGLE_REPO_URL" autostraggle
+          auth="$(auth_clone_url "$AUTOSTRAGGLE_REPO_URL")"
+          if [[ "$auth" == "$AUTOSTRAGGLE_REPO_URL" ]] && [[ "$AUTOSTRAGGLE_REPO_URL" =~ ^https://github.com/ ]] && [[ "$AUTOSTRAGGLE_REPO_URL" != *'@'* ]]; then
+            echo "::error::无法 clone autostraggle：请添加 secret DEPENDENCY_REPO_PAT，或在 AUTOSTRAGGLE_REPO_URL 中嵌入 token"
+            exit 1
+          fi
+          git clone --depth 1 "$auth" autostraggle
 
       - name: Install dependencies
         if: steps.check_deps.outputs.configured == 'true'
@@ -149,13 +175,21 @@ jobs:
           if [ -f ../autostraggle/requirements.txt ]; then pip install -r ../autostraggle/requirements.txt; fi
 
       - name: Run full suite
-        if: steps.check_deps.outputs.configured == 'true'
+        if: steps.check_deps.outputs.configured == 'true' && steps.check_deps.outputs.autostraggle_configured == 'true'
         working-directory: autoctp
         env:
           AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
           AUTOSTRAGGLE_ROOT: ${{ github.workspace }}/autostraggle
         run: pytest tests/ -q --tb=long --strict-markers
 
+      - name: Run autotrade-only integration suite
+        if: steps.check_deps.outputs.configured == 'true' && steps.check_deps.outputs.autostraggle_configured != 'true'
+        working-directory: autoctp
+        env:
+          AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
+          AUTOCTP_ALLOW_MISSING_DEPS: '1'
+        run: pytest tests/ -q --tb=long --strict-markers -m "not autostraggle"
+
       - name: Full suite skipped hint
         if: steps.check_deps.outputs.configured != 'true'
-        run: echo "::notice::pytest-full skipped — see docs/CI.md for AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL"
+        run: echo "::notice::pytest-full skipped — 至少配置 AUTOTRADE_REPO_URL（见 docs/CI.md）"

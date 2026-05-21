@@ -29,28 +29,26 @@ def main() -> int:
         ok = False
 
     if args.strict_ci:
-        for name in ('AUTOTRADE_REPO_URL', 'AUTOSTRAGGLE_REPO_URL'):
-            if not os.environ.get(name, '').strip():
-                print(f'缺少 GitHub secret 对应变量: {name}')
-                ok = False
-        for url_name in ('AUTOTRADE_REPO_URL', 'AUTOSTRAGGLE_REPO_URL'):
-            url = os.environ.get(url_name, '').strip()
-            if not url:
-                continue
-            if (
-                url.startswith('https://github.com/')
-                and '@' not in url
-                and not os.environ.get('DEPENDENCY_REPO_PAT', '').strip()
-            ):
-                print(
-                    f'{url_name} 为 GitHub HTTPS 且无嵌入 token；'
-                    '私有库还需 DEPENDENCY_REPO_PAT（见 docs/CI.md）'
-                )
-                ok = False
+        if not os.environ.get('AUTOTRADE_REPO_URL', '').strip():
+            print('缺少 GitHub secret 对应变量: AUTOTRADE_REPO_URL')
+            ok = False
+        url = os.environ.get('AUTOTRADE_REPO_URL', '').strip()
+        if url and (
+            url.startswith('https://github.com/')
+            and '@' not in url
+            and not os.environ.get('DEPENDENCY_REPO_PAT', '').strip()
+        ):
+            print(
+                'AUTOTRADE_REPO_URL 为 GitHub HTTPS 且无嵌入 token；'
+                '私有库还需 DEPENDENCY_REPO_PAT（见 docs/CI.md）'
+            )
+            ok = False
+        if not os.environ.get('AUTOSTRAGGLE_REPO_URL', '').strip():
+            print('提示: 未设 AUTOSTRAGGLE_REPO_URL，CI 将只跑 autotrade integration（见 docs/CI.md）')
     else:
         print(
-            '提示: GitHub Actions 全量 CI 需 AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL；'
-            '私有库另需 DEPENDENCY_REPO_PAT（见 docs/CI.md）'
+            '提示: pytest-full 至少需要 AUTOTRADE_REPO_URL；'
+            '私有库另需 DEPENDENCY_REPO_PAT；autostraggle 可选（见 docs/CI.md）'
         )
 
     if ok:

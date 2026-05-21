@@ -9,6 +9,7 @@ addopts = "-ra --strict-markers"
 markers = [
     "unit: 不依赖 autotrade / autostraggle，CI unit job 必跑",
     "integration: 需要 autotrade / autostraggle 源码（本地或 CI full job）",
+    "autostraggle: 需要 autostraggle 源码仓库（CI 未配 AUTOSTRAGGLE_REPO_URL 时跳过）",
 ]
 
 [tool.coverage.run]
