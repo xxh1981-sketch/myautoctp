@@ -125,6 +125,31 @@ def _install_auto_initializer(mod):
     mod.manage_future_price_readiness = lambda *a, **kw: None
 
 
+def _install_auto_feishu(mod):
+    def send_feishu_message(message, config=None):
+        return True
+
+    def notify_order_filled(*args, **kwargs):
+        return True
+
+    class FeishuNotifier:
+        @staticmethod
+        def notify_order_filled(*args, **kwargs):
+            return True
+
+    def get_notifier(config=None):
+        return FeishuNotifier()
+
+    def safe_notify(name, *args, **kwargs):
+        return None
+
+    mod.send_feishu_message = send_feishu_message
+    mod.notify_order_filled = notify_order_filled
+    mod.FeishuNotifier = FeishuNotifier
+    mod.get_notifier = get_notifier
+    mod.safe_notify = safe_notify
+
+
 def _install_auto_feishu_command(mod):
     mod.start_command_receiver = lambda *a, **kw: None
     mod.stop_command_receiver = lambda *a, **kw: None
@@ -214,6 +239,7 @@ _STUB_BUILDERS = {
     'auto_strategy_order_ref': _install_strategy_order_ref,
     'auto_processor': _install_auto_processor,
     'auto_initializer': _install_auto_initializer,
+    'auto_feishu': _install_auto_feishu,
     'auto_feishu_command': _install_auto_feishu_command,
     'auto_scheduled_pause': _install_auto_scheduled_pause,
     'auto_scheduled_reconnect': _install_auto_scheduled_reconnect,
