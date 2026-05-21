@@ -29,6 +29,7 @@ git status   # 勿提交 merged_config.yaml、data/* 运行时文件、.cursor/
 **不要提交：**
 
 - `merged_config.yaml`、`.env`
+- `docs/GUIDE.md`、`docs/LOCAL完整说明.md`（本地完整说明）
 - `tradeinfo/*.csv`（非 example）
 - `data/` 下运行时 CSV、jsonl、pid、ledger
 
@@ -36,8 +37,9 @@ git status   # 勿提交 merged_config.yaml、data/* 运行时文件、.cursor/
 
 ## 公开后仍会可见的内容
 
-- 双策略 **编排** 与 **对账/halt** 设计（见 `docs/GUIDE.md`）
+- 双策略 **编排** 与 **对账/halt** 设计（概要见 `README.md`、`.cursor/rules/`）
 - OrderRef 分段、CSV 认领模型等 **架构约定**
 - **不会** 直接暴露私有库内的完整 alpha 实现
+- **不会** 包含 `docs/LOCAL完整说明.md` / `docs/GUIDE.md`（本地专用，已 `.gitignore`）
 
 具体参数请以本地 `merged_config.yaml` 为准，勿把实盘数值写进文档或 example 模板。

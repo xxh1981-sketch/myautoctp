@@ -60,7 +60,7 @@ python scripts/check_ci_readiness.py
 
 ## 修改交易逻辑时
 
-请先阅读 `docs/GUIDE.md` §15.4 与 `.cursor/rules/dual-strategy-halt-semantics.mdc`：
+请先阅读本地 `docs/LOCAL完整说明.md` §15.4 与 `.cursor/rules/dual-strategy-halt-semantics.mdc`：
 
 - 对账 halt → 价差 close-only
 - 日限 / 保证金 halt → 完整 `process_symbol` 路径

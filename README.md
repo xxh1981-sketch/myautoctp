@@ -15,12 +15,14 @@
 
 | 文档 | 内容 |
 |------|------|
-| **[docs/GUIDE.md](docs/GUIDE.md)** | 完整使用说明（含 halt 与执行路径约定） |
+| **`docs/LOCAL完整说明.md`** | 完整使用说明（**仅本地**，已 `.gitignore`，含 halt 与执行路径约定） |
 | [docs/PUBLIC_REPO.md](docs/PUBLIC_REPO.md) | 公开本仓时的边界与自检 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发、测试与提交规范 |
 | [docs/CI.md](docs/CI.md) | GitHub Actions 与私有依赖 clone |
 | [merged_config.example.yaml](merged_config.example.yaml) | 本地配置模板 |
 | [data/strangle_positions.example.csv](data/strangle_positions.example.csv) | 宽跨启动前持仓 CSV 示例 |
+
+> clone 公开仓库后无 `LOCAL完整说明.md`；请在本机 `docs/` 下自行维护，勿提交。
 
 ---
 
@@ -45,7 +47,7 @@ $env:PASSWORD = "你的密码"
 python merged_main.py
 ```
 
-启动后按提示 **确认持仓**（终端 `yes` 或弹窗）。详见 [docs/GUIDE.md §8](docs/GUIDE.md#8-启动流程)。
+启动后按提示 **确认持仓**（终端 `yes` 或弹窗）。完整流程见本地 `docs/LOCAL完整说明.md` §8。
 
 ---
 
@@ -70,7 +72,7 @@ merged_main_loop.py     # 主循环
 merged_config.yaml      # 本地配置（勿提交）
 tradeinfo/              # 品种表（复制 *example* 后维护）
 data/                   # 持仓 CSV、账本、确认文件
-docs/GUIDE.md           # 完整说明
+docs/LOCAL完整说明.md   # 本地完整说明（勿提交）
 tests/                  # unit + integration（integration 需私有依赖库）
 ```
 
