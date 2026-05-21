@@ -30,10 +30,32 @@ class TestCtpBootstrapSoftFail(unittest.TestCase):
 
     def test_allow_missing_returns_paths_without_raise(self):
         os.environ['AUTOCTP_ALLOW_MISSING_DEPS'] = '1'
+        os.environ.pop('AUTOTRADE_ROOT', None)
+        os.environ.pop('AUTOSTRAGGLE_ROOT', None)
         with patch.object(boot.os.path, 'isdir', return_value=False):
             rt, rg = boot.setup_paths({})
-        self.assertTrue(isinstance(rt, str))
-        self.assertTrue(isinstance(rg, str))
+        self.assertEqual(rt, '')
+        self.assertEqual(rg, '')
+
+
+    def test_allow_missing_does_not_append_default_roots(self):
+        """allow_missing 且未显式配置时，setup_paths 不应把内置 D:\\ 默认路径入 path。"""
+        os.environ['AUTOCTP_ALLOW_MISSING_DEPS'] = '1'
+        os.environ.pop('AUTOTRADE_ROOT', None)
+        os.environ.pop('AUTOSTRAGGLE_ROOT', None)
+        before = set(boot.sys.path)
+        with patch.object(boot.os.path, 'isdir', return_value=True):
+            rt, rg = boot.setup_paths({})
+        after = set(boot.sys.path)
+        self.assertEqual(rt, '')
+        self.assertEqual(rg, '')
+        for default in (r'D:\autotrade', r'D:\autostraggle'):
+            abspath = boot.os.path.abspath(default)
+            self.assertNotIn(
+                abspath,
+                after - before,
+                f'allow_missing 时不应新加入默认路径 {abspath}',
+            )
 
 
 if __name__ == '__main__':

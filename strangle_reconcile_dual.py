@@ -8,6 +8,11 @@ from auto_connection import extract_symbol_prefix
 from auto_connection_utils import months_match
 from auto_position import extract_strike_from_instrument
 from spread_ledger import store_from_conn
+from spread_reconcile import (
+    STRANGLE_TRANSIENT_STREAK_KEY,
+    clear_reconcile_transient_streak,
+    handle_transient_reconcile_failure,
+)
 
 
 def _is_long_option_position(pos: dict) -> bool:
@@ -146,12 +151,11 @@ def reconcile_strangle_positions_dual(
             runtime = getattr(conn, '_runtime_state', None) or {}
             prev_halt = bool(runtime.get('_strangle_reconcile_halt', False))
             prev_issues = list(runtime.get('_strangle_reconcile_issues') or [])
-            if logger:
-                logger.warning(
-                    '[reconcile] strangle 持仓查询失败，沿用上一轮 halt 状态: '
-                    f'prev_halt={prev_halt} (transient)'
-                )
-            return prev_halt, issues + prev_issues
+            return handle_transient_reconcile_failure(
+                conn, prev_halt, issues, prev_issues, config,
+                STRANGLE_TRANSIENT_STREAK_KEY, logger,
+                '[reconcile]',
+            )
 
     claimed = {k: int(v) for k, v in ledger.list_leg_claims().items()}
     ctp_long = _build_ctp_long(trade_symbols, positions)
@@ -201,6 +205,8 @@ def reconcile_strangle_positions_dual(
                     '[reconcile] 处于豁免窗口 (derive 后)，'
                     f'{len(issues)} 条 strangle 差异仅记录不 halt'
                 )
+            clear_reconcile_transient_streak(conn, STRANGLE_TRANSIENT_STREAK_KEY)
             return False, issues
 
+    clear_reconcile_transient_streak(conn, STRANGLE_TRANSIENT_STREAK_KEY)
     return halt, issues

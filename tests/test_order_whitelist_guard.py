@@ -14,7 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
 import order_whitelist_guard
-from order_whitelist_guard import install_send_order_month_guard
+from order_whitelist_guard import (
+    audit_target_months_coverage,
+    install_send_order_month_guard,
+)
 
 
 class FakeLogger:
@@ -130,6 +133,30 @@ class TestOrderWhitelistGuard(unittest.TestCase):
         mgr.send_order('SA2608C2400', '0', 1, 1.0)
         self.assertEqual(len(self._delegated_calls), 1)
 
+    def test_install_returns_true_when_active(self):
+        """成功安装时返回 True，且 get_install_error 返回 None。"""
+        # setUp 已经 install 过，再调一次应得 True（幂等分支）
+        self.assertTrue(install_send_order_month_guard())
+        self.assertIsNone(order_whitelist_guard.get_install_error())
+        self.assertTrue(order_whitelist_guard.is_installed())
+
+    def test_audit_target_months_coverage(self):
+        conn = FakeConn(['sa', 'io'], {'sa': ['2608']})
+        missing = audit_target_months_coverage(
+            conn,
+            [{'future': 'SA', 'month': '2608'}],
+            [{'future': 'IO', 'month': '2604'}],
+        )
+        self.assertEqual(missing, ['io'])
+        self.assertEqual(
+            audit_target_months_coverage(
+                conn,
+                [{'future': 'SA', 'month': '2608'}],
+                [],
+            ),
+            [],
+        )
+
     def test_alert_passes_conn_config(self):
         """拦截发单时飞书告警须带 conn.config，与项目其他飞书调用一致。"""
         from unittest.mock import patch
@@ -156,6 +183,90 @@ class TestOrderWhitelistGuard(unittest.TestCase):
 
         self.assertIn('非目标月份', captured.get('message', ''))
         self.assertIs(captured.get('config'), conn.config)
+
+    def test_feishu_alert_cooldown_same_wrong_month(self):
+        """同品种同错月重复拦截：日志每次打，飞书冷却期内只发一次。"""
+        from unittest.mock import patch
+
+        conn = FakeConn(['sa'], {'sa': ['2608']})
+        conn.config = {'whitelist_feishu_cooldown_sec': 300}
+        conn._runtime_state = {}
+        mgr = self._make_mgr(conn)
+        sent = []
+
+        def fake_send(message, config=None):
+            sent.append(message)
+
+        with patch.dict(
+            sys.modules,
+            {
+                'auto_feishu': type(
+                    'M', (), {'send_feishu_message': staticmethod(fake_send)}
+                )(),
+            },
+        ):
+            mgr.send_order('SA2609C2400', '0', 1, 1.0)
+            mgr.send_order('SA2609C2500', '0', 1, 1.0)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(mgr.logger.errors), 2)
+
+
+class TestInstallFailureSignals(unittest.TestCase):
+    """守卫安装失败必须返回 False 并暴露原因，调用方据此决定是否拒绝启动。
+
+    覆盖之前 silent return 的两个分支：
+      - import auto_order_manager 失败
+      - 模块缺少 OrderManager 类
+    """
+
+    def setUp(self):
+        self._saved_aom = sys.modules.get('auto_order_manager')
+        order_whitelist_guard._INSTALLED = False
+        order_whitelist_guard._INSTALL_ERROR = None
+
+    def tearDown(self):
+        if self._saved_aom is not None:
+            sys.modules['auto_order_manager'] = self._saved_aom
+        else:
+            sys.modules.pop('auto_order_manager', None)
+        order_whitelist_guard._INSTALLED = False
+        order_whitelist_guard._INSTALL_ERROR = None
+
+    def test_returns_false_when_module_missing(self):
+        sys.modules.pop('auto_order_manager', None)
+
+        # 拦截 import：让 finder 找不到 auto_order_manager
+        import builtins
+        real_import = builtins.__import__
+
+        def blocking_import(name, *a, **k):
+            if name == 'auto_order_manager':
+                raise ImportError('blocked for test')
+            return real_import(name, *a, **k)
+
+        builtins.__import__ = blocking_import
+        try:
+            ok = install_send_order_month_guard()
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertFalse(ok)
+        self.assertFalse(order_whitelist_guard.is_installed())
+        err = order_whitelist_guard.get_install_error()
+        self.assertIsNotNone(err)
+        self.assertIn('auto_order_manager', err)
+
+    def test_returns_false_when_class_missing(self):
+        import types as _types
+        sys.modules['auto_order_manager'] = _types.SimpleNamespace()
+
+        ok = install_send_order_month_guard()
+        self.assertFalse(ok)
+        self.assertFalse(order_whitelist_guard.is_installed())
+        err = order_whitelist_guard.get_install_error()
+        self.assertIsNotNone(err)
+        self.assertIn('OrderManager', err)
 
 
 if __name__ == '__main__':

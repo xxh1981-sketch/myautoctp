@@ -606,7 +606,13 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
     ack_file = _ack_path(config)
     each_run = dual.get('startup_ack_each_run', False)
     require_today = dual.get('startup_ack_require_today', False)
-    if not each_run and _file_ack_ok(config, require_today=require_today):
+    manual_start = config.get('_manual_start', True)
+    # 持久 ack 文件仅用于跳过「进程内自动重启」的确认；人工冷启动仍须交互核对账本。
+    if (
+        not each_run
+        and not manual_start
+        and _file_ack_ok(config, require_today=require_today)
+    ):
         ack_day = _ack_date(_read_ack_text(ack_file))
         if ack_day and ack_day != date.today() and not require_today:
             logger.info(

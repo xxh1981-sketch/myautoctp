@@ -6,8 +6,11 @@ import unittest
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import ctp_bootstrap  # noqa: F401
 
+import autotrade_stubs
+
+autotrade_stubs.ensure_merged_loop_stubs()
+import ctp_bootstrap  # noqa: F401
 from spread_dual_config import spread_execution_from_ledger
 
 

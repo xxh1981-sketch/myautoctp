@@ -9,7 +9,7 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 | Job | 触发 | 依赖 | 说明 |
 |-----|------|------|------|
 | `lint` | push / PR | 无 | ruff + 敏感文件检查 |
-| `pytest-unit` | push / PR | 无 autotrade | `python scripts/run_unit_tests.py` |
+| `pytest-unit` | push / PR | 无 autotrade | `python scripts/run_unit_tests.py`（38 个文件；`AUTOCTP_ALLOW_MISSING_DEPS=1` 注入 stub） |
 | `pytest-unit-windows` | push / PR | 无 autotrade | Windows 上跑同一 unit 套件 |
 | `pytest-full` | push / PR / 手动 | autotrade（必选）；autostraggle（可选） | 全量或 autotrade-only integration |
 

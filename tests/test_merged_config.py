@@ -22,10 +22,15 @@ class TestMergedConfigValidation(unittest.TestCase):
         self.assertFalse(DUAL_STRATEGY_DEFAULTS.get('startup_ack_each_run'))
         self.assertTrue(DUAL_STRATEGY_DEFAULTS.get('startup_ack_persist'))
         self.assertFalse(DUAL_STRATEGY_DEFAULTS.get('startup_ack_require_today'))
+        self.assertTrue(DUAL_STRATEGY_DEFAULTS.get('startup_ack_use_gui'))
+        self.assertTrue(DUAL_STRATEGY_DEFAULTS.get('startup_ack_prefer_gui'))
 
     def test_merged_top_level_defaults(self):
         self.assertEqual(MERGED_TOP_LEVEL_DEFAULTS['global_margin_limit'], 100000)
         self.assertEqual(MERGED_TOP_LEVEL_DEFAULTS['main_loop_max_consecutive_errors'], 10)
+        self.assertTrue(MERGED_TOP_LEVEL_DEFAULTS['fail_fast_on_guard_install'])
+        self.assertTrue(MERGED_TOP_LEVEL_DEFAULTS['fail_fast_on_empty_target_months'])
+        self.assertTrue(MERGED_TOP_LEVEL_DEFAULTS['block_start_without_margin_limit'])
 
     def test_invalid_strategy_order(self):
         cfg = {
@@ -57,6 +62,7 @@ class TestMergedConfigValidation(unittest.TestCase):
             'dual_strategy': {'strategy_order': ['spread']},
             'strangle': {'order_ref_min': 500000},
             'global_margin_limit': 0,
+            'block_start_without_margin_limit': False,
         }
         errors, warnings = _validate_merged_config(cfg)
         self.assertEqual(errors, [])

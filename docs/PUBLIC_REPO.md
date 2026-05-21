@@ -37,7 +37,7 @@ git status   # 勿提交 merged_config.yaml、data/* 运行时文件、.cursor/
 
 ## 公开后仍会可见的内容
 
-- 双策略 **编排** 与 **对账/halt** 设计（概要见 `README.md`、`.cursor/rules/`）
+- 双策略 **编排** 与 **对账/halt** 设计（见 [ARCHITECTURE.md](ARCHITECTURE.md)、`README.md`）
 - OrderRef 分段、CSV 认领模型等 **架构约定**
 - **不会** 直接暴露私有库内的完整 alpha 实现
 - **不会** 包含 `docs/LOCAL完整说明.md` / `docs/GUIDE.md`（本地专用，已 `.gitignore`）

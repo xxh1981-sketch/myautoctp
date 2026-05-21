@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import types
 
 import pytest
 
@@ -15,6 +16,44 @@ ensure_openctp_stub()
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+def _use_autotrade_stubs() -> bool:
+    if os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() == '1':
+        root = os.environ.get('AUTOTRADE_ROOT', '').strip()
+        return not (root and os.path.isdir(root))
+    root = os.environ.get('AUTOTRADE_ROOT', '').strip()
+    if root and os.path.isdir(root):
+        return False
+    return not os.path.isdir(r'D:\autotrade')
+
+
+def _ensure_pairtrade_constants_stub() -> None:
+    if 'pairtrade.constants' in sys.modules:
+        return
+    _pt = types.ModuleType('pairtrade')
+    _pt_const = types.ModuleType('pairtrade.constants')
+    _pt_const.DIRECTION_BUY = '0'
+    _pt_const.DIRECTION_SELL = '1'
+    _pt_const.OFFSET_OPEN = '0'
+    _pt_const.OFFSET_CLOSE = '1'
+    _pt_const.OFFSET_CLOSE_TODAY = '3'
+    _pt_const.OFFSET_CLOSE_YESTERDAY = '4'
+    _pt_config = types.ModuleType('pairtrade.config')
+    _pt_config.adjust_price = lambda price, tick: float(price)
+    _pt.constants = _pt_const
+    _pt.config = _pt_config
+    sys.modules['pairtrade'] = _pt
+    sys.modules['pairtrade.constants'] = _pt_const
+    sys.modules['pairtrade.config'] = _pt_config
+
+
+if _use_autotrade_stubs():
+    import autotrade_stubs
+
+    autotrade_stubs.ensure_autotrade_stubs(autotrade_stubs.ALL_STUB_MODULES)
+    autotrade_stubs.ensure_autostraggle_stubs()
+    _ensure_pairtrade_constants_stub()
 
 
 def _unit_test_basenames() -> set[str]:
@@ -38,6 +77,9 @@ def _autostraggle_test_basenames() -> frozenset[str]:
 
 
 def _autotrade_root_available() -> bool:
+    if os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() == '1':
+        root = os.environ.get('AUTOTRADE_ROOT', '').strip()
+        return bool(root and os.path.isdir(root))
     root = os.environ.get('AUTOTRADE_ROOT', '').strip()
     if root and os.path.isdir(root):
         return True

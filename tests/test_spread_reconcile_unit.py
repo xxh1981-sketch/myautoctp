@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import unittest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,7 @@ from spread_reconcile import (
     _spread_symbol_months,
     ctp_spread_signed_claims,
     reconcile_spread_positions,
+    SPREAD_TRANSIENT_STREAK_KEY,
 )
 from spread_ledger import SpreadLegStore
 
@@ -133,6 +135,39 @@ class TestSpreadReconcilePure(unittest.TestCase):
         )
         self.assertFalse(halt)
         self.assertTrue(issues)
+
+    def test_transient_query_failure_uses_prev_halt_once(self):
+        conn = FakeConn()
+        store = SpreadLegStore()
+        conn._runtime_state['_spread_leg_store'] = store
+        conn.query_positions_sync = MagicMock(side_effect=RuntimeError('timeout'))
+        tradeinfo = [{'future': 'SA', 'month': '609'}]
+        cfg = {
+            'dual_strategy': {
+                'auto_sync_spread_positions_csv': False,
+                'reconcile_transient_halt_after': 3,
+            },
+        }
+        halt, _ = reconcile_spread_positions(conn, tradeinfo, None, config=cfg)
+        self.assertFalse(halt)
+        self.assertEqual(conn._runtime_state.get(SPREAD_TRANSIENT_STREAK_KEY), 1)
+
+    def test_transient_query_failure_forces_halt_after_threshold(self):
+        conn = FakeConn()
+        store = SpreadLegStore()
+        conn._runtime_state['_spread_leg_store'] = store
+        conn.query_positions_sync = MagicMock(side_effect=RuntimeError('timeout'))
+        tradeinfo = [{'future': 'SA', 'month': '609'}]
+        cfg = {
+            'dual_strategy': {
+                'auto_sync_spread_positions_csv': False,
+                'reconcile_transient_halt_after': 2,
+            },
+        }
+        reconcile_spread_positions(conn, tradeinfo, None, config=cfg)
+        halt, issues = reconcile_spread_positions(conn, tradeinfo, None, config=cfg)
+        self.assertTrue(halt)
+        self.assertTrue(any('连续 2 次 transient' in i for i in issues))
 
 
 if __name__ == '__main__':
