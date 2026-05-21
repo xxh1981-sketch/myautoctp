@@ -132,6 +132,9 @@ def _install_auto_feishu(mod):
     def notify_order_filled(*args, **kwargs):
         return True
 
+    def notify_daily_limit(*args, **kwargs):
+        return None
+
     class FeishuNotifier:
         @staticmethod
         def notify_order_filled(*args, **kwargs):
@@ -143,11 +146,22 @@ def _install_auto_feishu(mod):
     def safe_notify(name, *args, **kwargs):
         return None
 
+    def _notify_noop(*args, **kwargs):
+        return None
+
     mod.send_feishu_message = send_feishu_message
     mod.notify_order_filled = notify_order_filled
+    mod.notify_daily_limit = notify_daily_limit
     mod.FeishuNotifier = FeishuNotifier
     mod.get_notifier = get_notifier
     mod.safe_notify = safe_notify
+
+    def __getattr__(name):
+        if name.startswith('notify_'):
+            return _notify_noop
+        raise AttributeError(f"module 'auto_feishu' has no attribute {name!r}")
+
+    mod.__getattr__ = __getattr__
 
 
 def _install_auto_feishu_command(mod):
@@ -284,10 +298,17 @@ def _register_stub_modules(builders: dict, modules: Iterable[str]) -> None:
 def ensure_auto_feishu_stub() -> None:
     """Ensure ``auto_feishu`` exists for ``@patch('auto_feishu....')`` in unit tests.
 
-    Prefer the real autotrade module when ``AUTOTRADE_ROOT`` is on ``sys.path``;
-    otherwise install a minimal in-memory stub (CI pytest-unit / Windows).
+    When a real autotrade checkout is configured (``AUTOTRADE_ROOT`` / ``D:\\autotrade``),
+    do **not** install an in-memory stub — that would shadow ``notify_daily_limit`` etc.
+    and break pytest-full imports of ``auto_closer`` / ``merged_main_loop``.
     """
     name = 'auto_feishu'
+    if not _should_use_stubs('AUTOTRADE_ROOT', r'D:\autotrade'):
+        existing = sys.modules.get(name)
+        if existing is not None and not getattr(existing, '__file__', None):
+            del sys.modules[name]
+        return
+
     existing = sys.modules.get(name)
     if existing is not None and getattr(existing, '__file__', None):
         return

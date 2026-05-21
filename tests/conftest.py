@@ -50,13 +50,15 @@ def _ensure_pairtrade_constants_stub() -> None:
 
 import autotrade_stubs
 
-# ``@patch('auto_feishu....')`` resolves at import time; register before collection.
-autotrade_stubs.ensure_auto_feishu_stub()
-
 if _use_autotrade_stubs():
+    # Only for pytest-unit (no autotrade checkout): stub before @patch resolves.
+    autotrade_stubs.ensure_auto_feishu_stub()
     autotrade_stubs.ensure_autotrade_stubs(autotrade_stubs.ALL_STUB_MODULES)
     autotrade_stubs.ensure_autostraggle_stubs()
     _ensure_pairtrade_constants_stub()
+else:
+    # pytest-full: drop any in-memory auto_feishu left from a prior import order.
+    autotrade_stubs.ensure_auto_feishu_stub()
 
 
 def _unit_test_basenames() -> set[str]:
