@@ -6,15 +6,27 @@ from __future__ import annotations
 import subprocess
 import sys
 
-BLOCKED_PREFIXES = (
-    "data/",
-    "data\\",
-)
 BLOCKED_EXACT = {
     "merged_config.yaml",
     "merged_config.local.yaml",
     ".env",
 }
+
+
+def _is_allowed_data_path(path: str) -> bool:
+    """与 .gitignore 一致：允许 data/.gitkeep 与 *example* 模板。"""
+    if path == "data/.gitkeep":
+        return True
+    name = path.rsplit("/", 1)[-1].lower()
+    return "example" in name
+
+
+def _is_blocked_path(path: str) -> bool:
+    if path in BLOCKED_EXACT:
+        return True
+    if path.startswith("data/") and not _is_allowed_data_path(path):
+        return True
+    return False
 
 
 def main() -> int:
@@ -29,13 +41,7 @@ def main() -> int:
         print(f"check_sensitive_files: 无法读取 git 索引: {e}")
         return 0
 
-    violations = []
-    for line in out.splitlines():
-        path = line.strip().replace("\\", "/")
-        if not path:
-            continue
-        if path in BLOCKED_EXACT or any(path.startswith(p) for p in BLOCKED_PREFIXES):
-            violations.append(path)
+    violations = [p for p in (ln.strip().replace("\\", "/") for ln in out.splitlines()) if p and _is_blocked_path(p)]
 
     if violations:
         print("以下敏感/运行时文件不应被 git 跟踪：")

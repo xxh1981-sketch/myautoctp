@@ -56,10 +56,14 @@ class TestProcessGuard(unittest.TestCase):
             self.skipTest('Windows msvcrt.locking 在子进程模拟不便测；'
                           '在 CI/Linux 上验证 fcntl.flock 跨进程行为即可。')
         process_guard.acquire_singleton(pid_path=self.pid_path)
-        # 用 multiprocessing 模拟另一进程
         import multiprocessing as mp
 
-        def _try_acquire(path, q):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def _try_acquire(path, root, q):
+            import sys
+            if root not in sys.path:
+                sys.path.insert(0, root)
             import process_guard as g
             g._HELD_FD = None
             g._HELD_PATH = None
@@ -71,8 +75,9 @@ class TestProcessGuard(unittest.TestCase):
             except Exception as e:
                 q.put(f'ERR:{e}')
 
-        q = mp.Queue()
-        p = mp.Process(target=_try_acquire, args=(self.pid_path, q))
+        ctx = mp.get_context('fork' if os.name != 'nt' else 'spawn')
+        q = ctx.Queue()
+        p = ctx.Process(target=_try_acquire, args=(self.pid_path, repo_root, q))
         p.start()
         p.join(10)
         result = q.get(timeout=2)

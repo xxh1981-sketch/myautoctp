@@ -1,0 +1,4 @@
+# CI unit / lint jobs — 不连 CTP，无需 openctp_ctp
+pyyaml>=6.0
+requests>=2.28.0
+openpyxl>=3.1.0

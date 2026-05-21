@@ -18,6 +18,7 @@ jobs:
       - name: Install dev dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
@@ -36,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
       - name: Run unit tests (no autotrade required)
         run: python scripts/run_unit_tests.py --cov=. --cov-report=term-missing
@@ -53,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
       - name: Run unit tests on Windows
         run: python scripts/run_unit_tests.py
@@ -71,7 +72,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
       - name: Run tests that do not require autotrade
         run: pytest tests/ -m "not integration" -q --tb=short
@@ -119,6 +120,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+          if [ -f ../autotrade/requirements.txt ]; then pip install -r ../autotrade/requirements.txt; fi
 
       - name: Run full suite
         if: steps.check_deps.outputs.configured == 'true'
