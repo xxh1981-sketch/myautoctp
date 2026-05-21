@@ -29,9 +29,19 @@ AutoCTP 的 GitHub Actions 分为 **unit**（必过）与 **full**（需 secrets
 4. 建议在 **Settings → Branches → Branch protection**（或 **Settings → Rules → Rulesets**）中将以下 checks 设为 Required：
    - `Tests / lint`
    - `Tests / pytest-unit`
-   - `Tests / pytest-full`（全量跑通后）
+   - `Tests / pytest-unit-windows`
+   - `Tests / pytest-full`（secrets 配好且全量跑通后）
 
-   > GitHub 显示格式为 **`{workflow 名} / {job 名}`**。本仓库 workflow 名为 `Tests`（见 `test.yml` 首行 `name: Tests`），因此不是单独的 `pytest-full`，而是 **`Tests / pytest-full`**。
+   > GitHub 显示格式为 **`Tests / {job 名}`**。若某 job 显示 **Skipped**，常见原因是上游 job 失败（旧版 workflow 中 pytest-full 依赖 pytest-unit，unit 红则 full 整 job 被跳过；现已改为仅依赖 lint）。
+
+## pytest-full 显示 Skipped 的两种情况
+
+| 现象 | 原因 |
+|------|------|
+| 整 job 灰色 Skipped | 旧 workflow：`needs: [pytest-unit]` 且 unit 失败；或 lint 失败 |
+| job 跑了但只剩 notice | secrets 未配置，或 clone 步骤被 `if:` 跳过 |
+
+推送最新 `.github/workflows/test.yml` 后，**pytest-full 会在 lint 通过后执行**（不再等 unit 绿）。
 
 ## Branch protection 里找不到 pytest-full？
 
