@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import queue
 import threading
-from typing import Dict
+from typing import Dict, Optional
 
 FILL_SIDE_LABELS = {
     'buy_open': 'Buy Open / 买开',
@@ -17,6 +18,10 @@ STRATEGY_LABELS = {
     'strangle': 'Strangle / 宽跨',
     'other': 'Other / 其他',
 }
+
+_NOTIFY_QUEUE: Optional[queue.Queue] = None
+_NOTIFY_THREAD: Optional[threading.Thread] = None
+_NOTIFY_GUARD = threading.Lock()
 
 
 def _format_time(trade: dict) -> str:
@@ -109,6 +114,32 @@ def notify_fill_trade(
         return False
 
 
+def _notify_worker() -> None:
+    while True:
+        item = _NOTIFY_QUEUE.get()
+        if item is None:
+            break
+        conn, trade, row, config, logger = item
+        try:
+            notify_fill_trade(conn, trade, row, config, logger)
+        finally:
+            _NOTIFY_QUEUE.task_done()
+
+
+def _ensure_notify_worker() -> None:
+    global _NOTIFY_QUEUE, _NOTIFY_THREAD
+    with _NOTIFY_GUARD:
+        if _NOTIFY_THREAD is not None and _NOTIFY_THREAD.is_alive():
+            return
+        _NOTIFY_QUEUE = queue.Queue(maxsize=256)
+        _NOTIFY_THREAD = threading.Thread(
+            target=_notify_worker,
+            name='FillFeishuNotifyWorker',
+            daemon=True,
+        )
+        _NOTIFY_THREAD.start()
+
+
 def notify_fill_trade_async(
     conn,
     trade: dict,
@@ -116,13 +147,13 @@ def notify_fill_trade_async(
     config: dict,
     logger=None,
 ) -> None:
-    """Send in background so CTP SPI callback is not blocked."""
-    threading.Thread(
-        target=notify_fill_trade,
-        args=(conn, trade, row, config, logger),
-        daemon=True,
-        name='FillFeishuNotify',
-    ).start()
+    """Enqueue fill notification so CTP SPI callback is not blocked."""
+    _ensure_notify_worker()
+    try:
+        _NOTIFY_QUEUE.put_nowait((conn, trade, row, config, logger))
+    except queue.Full:
+        if logger:
+            logger.warning('[FillFeishu] notify queue full, dropping message')
 
 
 def install_unified_trade_feishu(config: dict = None) -> None:
@@ -130,6 +161,8 @@ def install_unified_trade_feishu(config: dict = None) -> None:
     Route all fill Feishu alerts through fill_ledger + trade_feishu_notify.
     Suppresses legacy spread A/B leg messages to avoid duplicates.
     """
+    import logging
+
     import auto_feishu
 
     def _suppress(*_a, **_k) -> bool:
@@ -138,12 +171,6 @@ def install_unified_trade_feishu(config: dict = None) -> None:
     auto_feishu.notify_order_filled = _suppress
     auto_feishu.FeishuNotifier.notify_order_filled = _suppress
 
-    if config and logger_is_debug(config):
-        import logging
-        logging.getLogger(__name__).debug(
-            'Unified fill Feishu installed (legacy notify_order_filled suppressed)'
-        )
-
-
-def logger_is_debug(config: dict) -> bool:
-    return str(config.get('log_level', '')).upper() == 'DEBUG'
+    logging.getLogger(__name__).debug(
+        'Unified fill Feishu installed (legacy notify_order_filled suppressed)'
+    )

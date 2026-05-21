@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 _ORIG_ANALYZE = None
 _ORIG_CHECK_LIMITS = None

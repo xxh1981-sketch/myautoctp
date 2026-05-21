@@ -6,11 +6,9 @@ import time
 from datetime import date
 from typing import Optional
 
+from atomic_io import atomic_write_text_with_newline
+from env_utils import argv_has, env_truthy
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, '').strip().lower() in ('1', 'yes', 'true', 'y', 'ok')
-
-from import_strangle_positions import sync_strangle_leg_claims
 
 
 def _ack_path(config: dict) -> str:
@@ -38,17 +36,22 @@ def _ack_date(text: str):
 
 
 def _save_ack_file(ack_file: str) -> None:
-    os.makedirs(os.path.dirname(ack_file) or '.', exist_ok=True)
-    with open(ack_file, 'w', encoding='utf-8') as f:
-        f.write(f'confirmed {date.today().isoformat()}\n')
+    atomic_write_text_with_newline(ack_file, f'confirmed {date.today().isoformat()}')
+
+
+def _read_ack_text(ack_file: str) -> str:
+    try:
+        with open(ack_file, 'r', encoding='utf-8') as f:
+            return f.read()
+    except OSError:
+        return ''
 
 
 def _file_ack_ok(config: dict, require_today: bool = False) -> bool:
     ack_file = _ack_path(config)
     if not os.path.isfile(ack_file):
         return False
-    with open(ack_file, 'r', encoding='utf-8') as f:
-        text = f.read()
+    text = _read_ack_text(ack_file)
     if not _ack_valid(text):
         return False
     if require_today:
@@ -208,13 +211,32 @@ def _preview_reconcile(conn, ledger, config: dict, logger) -> tuple:
         return False, [str(e)], [msg]
 
 
-def _build_startup_summary(ledger, conn) -> str:
+def _build_startup_summary(ledger, conn, config=None) -> tuple:
     ledger_summary = format_ledger_summary(ledger)
     spread_summary = ''
+    audit_summary = ''
     if conn:
         from spread_ledger import store_from_conn
-        spread_summary = format_spread_claims_summary(store_from_conn(conn))
-    return ledger_summary, spread_summary
+        from spread_claims_guard import audit_spread_claims, format_spread_claims_audit
+
+        store = store_from_conn(conn)
+        spread_summary = format_spread_claims_summary(store)
+        cfg = config or getattr(conn, 'config', None) or {}
+        claims = store.list_leg_claims() if store else {}
+        ctp_signed = None
+        try:
+            from spread_derive import query_ctp_signed_positions
+            ctp_signed = query_ctp_signed_positions(conn, logger=None)
+        except Exception:
+            pass
+        issues = audit_spread_claims(
+            claims,
+            cfg.get('spread_tradeinfo') or [],
+            conn=conn,
+            ctp_signed=ctp_signed,
+        )
+        audit_summary = format_spread_claims_audit(issues)
+    return ledger_summary, spread_summary, audit_summary
 
 
 def _should_prefer_gui(dual: dict) -> bool:
@@ -225,6 +247,178 @@ def _should_prefer_gui(dual: dict) -> bool:
     if dual.get('startup_ack_prefer_gui', True):
         return True
     return not sys.stdin.isatty()
+
+
+def _confirm_via_gui_yes_no(
+    title: str,
+    message: str,
+    yes_text: str = '仍要启动',
+    no_text: str = '取消',
+    logger=None,
+) -> Optional[bool]:
+    """GUI 二选一。Returns True/False, or None if GUI unavailable."""
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext
+
+        choice = {'ok': False}
+
+        root = tk.Tk()
+        root.title(title)
+        root.minsize(760, 520)
+        try:
+            root.attributes('-topmost', True)
+        except Exception:
+            pass
+
+        txt = scrolledtext.ScrolledText(root, width=88, height=22, wrap=tk.WORD)
+        txt.pack(padx=12, pady=(12, 8), fill=tk.BOTH, expand=True)
+        txt.insert('1.0', message)
+        txt.config(state=tk.DISABLED)
+
+        btn_row = tk.Frame(root)
+        btn_row.pack(pady=(0, 14))
+
+        def _done(ok: bool) -> None:
+            choice['ok'] = ok
+            try:
+                root.quit()
+            except Exception:
+                pass
+            root.destroy()
+
+        tk.Button(btn_row, text=yes_text, width=12, command=lambda: _done(True)).pack(
+            side=tk.LEFT, padx=6,
+        )
+        tk.Button(btn_row, text=no_text, width=10, command=lambda: _done(False)).pack(
+            side=tk.LEFT, padx=6,
+        )
+
+        root.protocol('WM_DELETE_WINDOW', lambda: _done(False))
+        root.lift()
+        root.focus_force()
+        root.update_idletasks()
+        root.mainloop()
+        return choice['ok']
+    except Exception as e:
+        if logger:
+            logger.warning(f'[启动] GUI 确认框失败: {e}', exc_info=True)
+        return None
+
+
+def _format_reconcile_issues(issues: list) -> str:
+    if not issues:
+        return '  (无明细)'
+    lines = []
+    for msg in issues[:15]:
+        lines.append(f'  • {msg}')
+    if len(issues) > 15:
+        lines.append(f'  ... 共 {len(issues)} 条')
+    return '\n'.join(lines)
+
+
+def _reconcile_mismatch_auto_ok(config: dict, logger) -> bool:
+    """自动化场景跳过对账差异确认。"""
+    dual = config.get('dual_strategy') or {}
+    if dual.get('allow_start_on_reconcile_mismatch', False):
+        return True
+    if _skip_interactive_ack(config, logger):
+        return True
+    return False
+
+
+def _prompt_reconcile_mismatch_ack(
+    config: dict,
+    logger,
+    summary: str,
+    issues: list,
+    context: str = '启动前对账',
+    allow_derive: bool = True,
+) -> str:
+    """
+    对账有差异时弹出确认（GUI 优先）。
+    返回 yes | derive | no。
+    """
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('startup_ack_interactive', True):
+        logger.error(f'[启动] {context}不一致且非交互模式，拒绝启动')
+        return 'no'
+    if _reconcile_mismatch_auto_ok(config, logger):
+        return 'yes'
+
+    issue_block = _format_reconcile_issues(issues)
+    prompt = (
+        f'⚠ 【{context}差异】\n\n'
+        f'{issue_block}\n\n'
+        '继续启动后宽跨可能 open_halted 禁止新开（平仓仍允许）。\n'
+    )
+    if allow_derive:
+        prompt += (
+            '  确认启动 → 仍要开始交易\n'
+            f'  derive   → {_DERIVE_SPREAD_LABEL}\n'
+            '  取消     → 不启动\n'
+        )
+    else:
+        prompt += '  yes → 仍要启动    no → 取消\n'
+
+    message = summary.strip() + '\n\n' + prompt
+    title = f'AutoCTP {context}差异确认'
+
+    use_gui = dual.get('startup_ack_use_gui', True)
+    if use_gui and (_should_prefer_gui(dual) or allow_derive):
+        logger.info(f'[启动] 对账有差异，弹出确认对话框 ({context})…')
+        if allow_derive:
+            action = _confirm_via_gui_choice(title, message, logger=logger)
+            if action is not None:
+                if action == 'no':
+                    config['_startup_ack_retry'] = False
+                return action
+        else:
+            ok = _confirm_via_gui_yes_no(title, message, logger=logger)
+            if ok is True:
+                return 'yes'
+            if ok is False:
+                config['_startup_ack_retry'] = False
+                return 'no'
+
+    if sys.stdin.isatty():
+        logger.warning(f'[启动] {context}存在差异，请终端确认')
+        logger.info(message)
+        try:
+            if allow_derive:
+                ans = input('对账有差异，仍要启动? [yes/derive/no]: ').strip().lower()
+                if ans in ('yes', 'y', 'ok', 'confirmed'):
+                    return 'yes'
+                if ans in ('derive', 'spread', 'ctp', 'auto', 'd'):
+                    return 'derive'
+            else:
+                ans = input('对账有差异，仍要启动? [yes/no]: ').strip().lower()
+                if ans in ('yes', 'y', 'ok', 'confirmed'):
+                    return 'yes'
+            config['_startup_ack_retry'] = False
+            return 'no'
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    if use_gui:
+        logger.info(f'[启动] 对账有差异，弹出确认对话框 ({context})…')
+        if allow_derive:
+            action = _confirm_via_gui_choice(title, message, logger=logger)
+            if action is not None:
+                if action == 'no':
+                    config['_startup_ack_retry'] = False
+                return action
+        else:
+            ok = _confirm_via_gui_yes_no(title, message, logger=logger)
+            if ok is True:
+                return 'yes'
+            if ok is False:
+                config['_startup_ack_retry'] = False
+                return 'no'
+
+    logger.error('[启动] 对账有差异且无法交互确认，拒绝启动')
+    config['_startup_ack_retry'] = False
+    return 'no'
 
 
 def _confirm_via_gui_choice(title: str, message: str, logger=None) -> Optional[str]:
@@ -369,8 +563,8 @@ def _prompt_interactive_ack(
 
 
 def _persist_ack(dual: dict, ack_file: str, logger, config: dict = None) -> bool:
-    persist = dual.get('startup_ack_persist', False)
-    if dual.get('startup_ack_each_run', True):
+    persist = dual.get('startup_ack_persist', True)
+    if dual.get('startup_ack_each_run', False):
         persist = False
     if persist:
         _save_ack_file(ack_file)
@@ -386,7 +580,7 @@ def _is_auto_restart(config: dict) -> bool:
     """进程内异常/自动重试外层循环，或显式 AUTOCTP_AUTO_RESTART / --auto-restart。"""
     if config.get('_auto_restart'):
         return True
-    if _env_truthy('AUTOCTP_AUTO_RESTART') or '--auto-restart' in sys.argv:
+    if env_truthy('AUTOCTP_AUTO_RESTART') or argv_has('--auto-restart'):
         return True
     return False
 
@@ -410,9 +604,17 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
         return True
 
     ack_file = _ack_path(config)
-    each_run = dual.get('startup_ack_each_run', True)
-    if not each_run and _file_ack_ok(config, require_today=True):
-        logger.info(f"[启动] 持仓已确认: {ack_file}")
+    each_run = dual.get('startup_ack_each_run', False)
+    require_today = dual.get('startup_ack_require_today', False)
+    if not each_run and _file_ack_ok(config, require_today=require_today):
+        ack_day = _ack_date(_read_ack_text(ack_file))
+        if ack_day and ack_day != date.today() and not require_today:
+            logger.info(
+                f"[启动] 使用持久确认文件 {ack_file} "
+                f"(确认日 {ack_day.isoformat()}，非今日；改 CSV 后请删文件重确认)"
+            )
+        else:
+            logger.info(f"[启动] 持仓已确认: {ack_file}")
         config['_startup_ack_done'] = True
         return True
 
@@ -429,21 +631,43 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
     logger.info("启动前请核对持仓")
     logger.info("宽跨: data/strangle_positions.csv（程序运行中自动维护，启动时人工核对）")
     logger.info("价差: data/spread_positions.csv（signed volume：正=多，负=空）")
-    ledger_summary, spread_summary = _build_startup_summary(ledger, conn)
+    ledger_summary, spread_summary, audit_summary = _build_startup_summary(
+        ledger, conn, config,
+    )
     logger.info(ledger_summary)
     if spread_summary:
         logger.info(spread_summary)
+    if audit_summary:
+        logger.warning(audit_summary)
 
     ctp_summary = ''
+    reconcile_halt = False
+    reconcile_issues: list = []
+    reconcile_lines: list = []
     if conn:
         ctp_summary = _format_ctp_positions_preview(conn, config, logger)
         logger.info(ctp_summary)
-        _preview_reconcile(conn, ledger, config, logger)
+        reconcile_halt, reconcile_issues, reconcile_lines = _preview_reconcile(
+            conn, ledger, config, logger,
+        )
 
-    summary = ledger_summary + '\n' + spread_summary + '\n' + ctp_summary
-    action = _prompt_interactive_ack(
-        config, logger, ack_file, summary, conn=conn, ledger=ledger,
-    )
+    summary = ledger_summary + '\n' + spread_summary
+    if audit_summary:
+        summary += '\n' + audit_summary
+    summary += '\n' + ctp_summary
+    if reconcile_lines:
+        summary += '\n' + '\n'.join(reconcile_lines)
+
+    has_mismatch = bool(reconcile_issues) or reconcile_halt
+    if has_mismatch:
+        action = _prompt_reconcile_mismatch_ack(
+            config, logger, summary, reconcile_issues,
+            context='启动前对账', allow_derive=True,
+        )
+    else:
+        action = _prompt_interactive_ack(
+            config, logger, ack_file, summary, conn=conn, ledger=ledger,
+        )
     if action == 'derive':
         if conn is None or ledger is None:
             logger.error('[启动] 无法推导价差认领：缺少 CTP 连接或宽跨账本')
@@ -461,11 +685,23 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
 
         logger.info('=' * 60)
         logger.info('[启动] 推导后再次对账预览')
-        halt, issues, _ = _preview_reconcile(conn, ledger, config, logger)
-        if halt:
+        halt, issues, recon_lines = _preview_reconcile(conn, ledger, config, logger)
+        if recon_lines:
+            logger.info('\n'.join(recon_lines))
+        if issues or halt:
+            post_summary = (
+                format_ledger_summary(ledger) + '\n'
+                + format_spread_claims_summary(store_from_conn(conn))
+            )
+            action = _prompt_reconcile_mismatch_ack(
+                config, logger, post_summary, issues,
+                context='推导后对账', allow_derive=False,
+            )
+            if action != 'yes':
+                logger.info('[启动] 用户取消（推导后对账仍有差异）')
+                return False
             logger.warning(
-                '[启动] 推导后宽跨对账仍有差异（可能为手工/external 仓），'
-                '宽跨新开可能 open_halted；价差认领已更新'
+                '[启动] 用户已确认在对账差异下启动；宽跨新开可能 open_halted'
             )
         elif not issues:
             logger.info('[启动] 推导后宽跨对账通过')

@@ -19,6 +19,12 @@ def setup_paths(config: dict = None) -> tuple:
     """
     将 autotrade、autostraggle 加入 sys.path。
     顺序：先 autotrade（pairtrade / auto_*），再 autostraggle（straggle_*）。
+
+    生产环境（默认）若目录不存在则立即抛错——线上启动绝不能跑空依赖。
+    若设置环境变量 ``AUTOCTP_ALLOW_MISSING_DEPS=1``（CI / 本地无 autotrade
+    源码环境用），则缺失目录时仅打印一行 warning 并继续；后续依赖 autotrade
+    的 import 会自然 ImportError，由 pytest 用
+    ``--continue-on-collection-errors`` 统一跳过。
     """
     config = config or {}
     merged = config.get('merged') or {}
@@ -32,8 +38,17 @@ def setup_paths(config: dict = None) -> tuple:
         merged.get('autostraggle_root', ''),
         r'D:\autostraggle',
     )
+    allow_missing = os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() in (
+        '1', 'true', 'True', 'yes',
+    )
     for p in (autotrade, autostraggle):
         if not os.path.isdir(p):
+            if allow_missing:
+                sys.stderr.write(
+                    f'[ctp_bootstrap] WARNING: 目录不存在 {p} '
+                    '(AUTOCTP_ALLOW_MISSING_DEPS=1，已跳过)\n'
+                )
+                continue
             raise RuntimeError(f"目录不存在: {p}")
         if p not in sys.path:
             sys.path.insert(0, p)

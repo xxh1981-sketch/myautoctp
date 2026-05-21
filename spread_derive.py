@@ -114,6 +114,8 @@ def derive_spread_claims_from_ctp(conn, ledger, logger=None) -> Tuple[Optional[D
 
 def apply_derived_spread_from_ctp(conn, ledger, store, config, logger=None) -> Optional[Dict[str, int]]:
     """Persist spread claims derived from CTP minus strangle into CSV and runtime store."""
+    import time as _time
+
     claims, _note = derive_spread_claims_from_ctp(conn, ledger, logger)
     if claims is None:
         return None
@@ -135,4 +137,19 @@ def apply_derived_spread_from_ctp(conn, ledger, store, config, logger=None) -> O
             logger.info('  (无价差认领持仓)')
 
     config['_spread_derived_at_startup'] = True
+
+    # B12: derive 刚写入 CSV / store，OnRtnTrade 等异步路径还可能让账本和 CTP
+    # 短暂错开。给后续 reconcile 一段豁免窗口，把 halt 降级为仅记录 issues，
+    # 避免"刚 derive 又被立即锁成 close-only"的体感。
+    runtime = getattr(conn, '_runtime_state', None)
+    if runtime is not None:
+        dual = (config.get('dual_strategy') or {}) if config else {}
+        grace = float(dual.get('reconcile_grace_after_derive_sec', 90))
+        if grace > 0:
+            runtime['_reconcile_grace_until'] = _time.time() + grace
+            if logger:
+                logger.info(
+                    f'[启动] 已开启对账豁免窗口 {grace:.0f}s '
+                    '(期间差异仅记录，不强制 halt)'
+                )
     return claims

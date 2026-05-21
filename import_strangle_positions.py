@@ -2,10 +2,11 @@
 
 import argparse
 import csv
+import io
 import os
-import sys
-from typing import Dict, Optional, Set
+from typing import Dict, Set
 
+from atomic_io import atomic_write_text
 from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
@@ -69,16 +70,16 @@ def load_positions_csv(path: str) -> Dict[str, int]:
 
 
 def save_positions_csv(path: str, claims: Dict[str, int]) -> None:
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     rows = sorted(
         ((inst, int(vol)) for inst, vol in (claims or {}).items() if int(vol) > 0),
         key=lambda x: x[0],
     )
-    with open(path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['instrument', 'volume'])
-        for inst, vol in rows:
-            writer.writerow([inst, vol])
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['instrument', 'volume'])
+    for inst, vol in rows:
+        writer.writerow([inst, vol])
+    atomic_write_text(path, buf.getvalue())
 
 
 def _fill_volume_delta(direction: str, offset: str, traded: int) -> int:
@@ -199,9 +200,18 @@ def sync_csv_from_ctp(
     logger=None,
 ) -> bool:
     """
-    已废弃：请使用 strangle_fill_sync.sync_csv_from_strangle_trades（严格按 OrderRef）。
-    保留此函数仅为兼容旧调用，内部转发到成交回放。
+    Deprecated: use ``strangle_fill_sync.sync_csv_from_strangle_trades`` (strict
+    OrderRef filter). This shim forwards to the new path for backwards compat
+    and emits ``DeprecationWarning`` so external callers surface the migration.
     """
+    import warnings
+
+    warnings.warn(
+        'sync_csv_from_ctp is deprecated; '
+        'use strangle_fill_sync.sync_csv_from_strangle_trades instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
     del trade_symbols
     try:
         from strangle_fill_sync import sync_csv_from_strangle_trades

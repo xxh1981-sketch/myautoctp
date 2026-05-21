@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 from auto_connection import extract_symbol_prefix, months_match
 from spread_ledger import store_from_conn
@@ -87,7 +87,6 @@ def process_close_from_spread_ledger(
     month = item['month']
     vol_basis = item['vol_basis']
     min_tick = resolve_min_tick(conn, symbol, month, item['min_tick'], logger)
-    normalized_month = conn._normalize_month(symbol, month)
 
     store = store_from_conn(conn)
     if store is None:
@@ -152,10 +151,9 @@ def process_close_from_spread_ledger(
         conn, plan, symbol, month, min_tick, config, logger, urgency=urgency,
     )
     if isinstance(result, tuple):
-        success, total_actual_volume = result
+        success, _total_actual_volume = result
     else:
         success = result
-        total_actual_volume = 0
 
     if not success:
         logger.error(f'[{symbol}] 平仓执行失败（部分成交可能已发生），仍触发冷却期')
@@ -174,29 +172,73 @@ def process_close_from_spread_ledger(
                 logger.info(f'[{symbol}] 价差账本持仓已确认全部平仓')
                 return True
             if a_cur == 0 and b_cur > 0:
-                logger.warning(
-                    f'[{symbol}] 价差账本 A 已平完但 B 仍有 {b_cur} 手残留，需人工检查'
-                )
-                _notify_spread_close_residual(conn, config, logger, symbol, a_cur, b_cur)
-                return False
-            if a_cur > 0 and b_cur == 0:
-                logger.warning(
-                    f'[{symbol}] 价差账本 A 仍有 {a_cur} 手但 B 已清零，需关注'
-                )
-                try:
-                    from auto_feishu import safe_notify
-                    safe_notify(
-                        'send_feishu_message',
-                        f'⚠️ [{symbol}] 价差账本平仓后 A 残留 {a_cur} 手, B=0, 需人工检查',
-                        config=config,
+                if _ctp_still_has_residual(conn, symbol, month, logger):
+                    logger.warning(
+                        f'[{symbol}] 价差账本 A 已平完但 B 仍有 {b_cur} 手残留，需人工检查'
                     )
-                except Exception:
-                    pass
-                return False
+                    _notify_spread_close_residual(conn, config, logger, symbol, a_cur, b_cur)
+                    return False
+                logger.info(
+                    f'[{symbol}] 价差账本残留 B={b_cur} 但 CTP 已清零，'
+                    f'视为 OnRtnTrade 回报延迟，继续等待'
+                )
+                continue
+            if a_cur > 0 and b_cur == 0:
+                if _ctp_still_has_residual(conn, symbol, month, logger):
+                    logger.warning(
+                        f'[{symbol}] 价差账本 A 仍有 {a_cur} 手但 B 已清零，需关注'
+                    )
+                    try:
+                        from auto_feishu import safe_notify
+                        safe_notify(
+                            'send_feishu_message',
+                            f'⚠️ [{symbol}] 价差账本平仓后 A 残留 {a_cur} 手, B=0, 需人工检查',
+                            config=config,
+                        )
+                    except Exception:
+                        pass
+                    return False
+                logger.info(
+                    f'[{symbol}] 价差账本残留 A={a_cur} 但 CTP 已清零，'
+                    f'视为 OnRtnTrade 回报延迟，继续等待'
+                )
+                continue
         except Exception as e:
             logger.warning(f'[{symbol}] 价差账本平仓确认异常: {e}')
 
     logger.warning(f'[{symbol}] 价差账本平仓后仍有认领余量，请人工检查')
+    return False
+
+
+def _ctp_still_has_residual(conn, symbol: str, month: str, logger) -> bool:
+    """Cross-check CTP positions; True iff CTP still shows any spread leg."""
+    try:
+        positions = conn.query_positions_sync(timeout=5) or []
+    except Exception as e:
+        logger.debug(f'[{symbol}] CTP 持仓复查失败: {e}，按账本残留判断')
+        return True
+
+    sym = symbol.lower()
+    try:
+        normalized_month = conn._normalize_month(symbol, month)
+    except Exception:
+        normalized_month = month
+
+    for pos in positions:
+        inst = (pos.get('instrument') or pos.get('InstrumentID') or '').strip()
+        if not inst:
+            continue
+        if extract_symbol_prefix(inst) != sym:
+            continue
+        if not months_match(inst, month, normalized_month):
+            continue
+        vol = int(pos.get('volume') or pos.get('Position') or pos.get('position') or 0)
+        if vol <= 0:
+            continue
+        from spread_ledger import SpreadLegStore
+        if not SpreadLegStore._is_call_instrument(inst):
+            continue
+        return True
     return False
 
 

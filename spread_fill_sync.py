@@ -2,18 +2,42 @@
 
 from __future__ import annotations
 
-import json
 import os
+import re
 from datetime import date, datetime
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 
 from import_spread_positions import (
     apply_fill_to_spread_csv,
-    load_spread_positions_csv,
-    spread_positions_csv_path,
     sync_spread_leg_claims,
 )
+from trade_journal import (
+    append_journal,
+    load_applied_keys,
+    map_direction_offset,
+    trade_dedupe_key,
+)
 from trade_journal_lock import journal_lock
+
+
+_SYMBOL_PREFIX_RE = re.compile(r'^([A-Za-z]+)')
+
+
+def _symbol_prefix(instrument: str) -> str:
+    """从合约代码截取品种字母前缀（不区分大小写返回小写），
+    如 ``SA609C1000`` → ``sa``，``RM509-C-9000`` → ``rm``。"""
+    if not instrument:
+        return ''
+    m = _SYMBOL_PREFIX_RE.match(instrument.strip())
+    return m.group(1).lower() if m else ''
+
+
+def _config_symbols(config: dict, key: str) -> set:
+    items = config.get(key) or []
+    return {(it.get('future') or '').lower() for it in items if it.get('future')}
+
+
+_UNEXPECTED_SPREAD_SYMBOL_WARNED: set = set()
 
 
 def _journal_path(config: dict) -> str:
@@ -25,60 +49,6 @@ def _journal_path(config: dict) -> str:
     if not os.path.isabs(path):
         path = os.path.join(os.path.dirname(__file__), path)
     return path
-
-
-def _load_applied_keys(journal_file: str) -> Set[str]:
-    keys: Set[str] = set()
-    if not os.path.isfile(journal_file):
-        return keys
-    with open(journal_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            key = row.get('dedupe_key') or row.get('trade_id')
-            if key:
-                keys.add(str(key))
-    return keys
-
-
-def _append_journal(journal_file: str, row: dict) -> None:
-    os.makedirs(os.path.dirname(journal_file) or '.', exist_ok=True)
-    with open(journal_file, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(row, ensure_ascii=False) + '\n')
-
-
-def _trade_dedupe_key(trade: dict) -> str:
-    trade_id = (trade.get('trade_id') or '').strip()
-    if trade_id:
-        inst = (trade.get('instrument') or '').upper()
-        return f'{inst}:{trade_id}'
-    return '|'.join([
-        str(trade.get('order_ref', '')),
-        (trade.get('instrument') or '').upper(),
-        str(trade.get('direction', '')),
-        str(trade.get('offset', '')),
-        str(trade.get('volume', '')),
-        str(trade.get('price', '')),
-        str(trade.get('trade_date', '')),
-        str(trade.get('trade_time', '')),
-    ])
-
-
-def _map_direction_offset(direction: str, offset: str) -> tuple:
-    from pairtrade.constants import DIRECTION_BUY, DIRECTION_SELL, OFFSET_CLOSE, OFFSET_OPEN
-
-    d = str(direction or '').strip()
-    o = str(offset or '').strip()
-    if not o or o == '?':
-        o = OFFSET_OPEN
-    direction_out = DIRECTION_BUY if d in ('0', DIRECTION_BUY) else DIRECTION_SELL
-    offset_out = OFFSET_OPEN if o in ('0', OFFSET_OPEN) else OFFSET_CLOSE
-    return direction_out, offset_out
 
 
 def apply_spread_trade_record(
@@ -95,10 +65,10 @@ def apply_spread_trade_record(
         return False
 
     journal_file = journal_file or _journal_path(config)
-    dedupe_key = _trade_dedupe_key(trade)
+    dedupe_key = trade_dedupe_key(trade)
 
     with journal_lock(journal_file):
-        applied = _load_applied_keys(journal_file)
+        applied = load_applied_keys(journal_file, config)
         if dedupe_key in applied:
             return False
 
@@ -107,7 +77,54 @@ def apply_spread_trade_record(
         if not instrument or volume <= 0:
             return False
 
-        direction, offset = _map_direction_offset(
+        dual = config.get('dual_strategy') or {}
+        require_match = dual.get('spread_fill_require_tradeinfo_match', True)
+        spread_info = config.get('spread_tradeinfo') or []
+        conn = config.get('_spread_fill_conn')
+        if require_match and spread_info:
+            from spread_claims_guard import instrument_in_spread_tradeinfo
+            if not instrument_in_spread_tradeinfo(
+                instrument, conn, spread_info,
+            ):
+                if logger:
+                    logger.warning(
+                        f'[价差持仓] 跳过入账 OrderRef={order_ref} {instrument} '
+                        f'x{volume}：合约不在 spread tradeinfo（品种/月份不匹配）。'
+                        '请核对 strategy_order_ref 是否把宽跨成交写进价差段。'
+                    )
+                append_journal(journal_file, {
+                    'dedupe_key': dedupe_key,
+                    'trade_id': trade.get('trade_id', ''),
+                    'order_ref': order_ref,
+                    'instrument': instrument,
+                    'direction': trade.get('direction'),
+                    'offset': trade.get('offset'),
+                    'volume': volume,
+                    'skipped': 'not_in_spread_tradeinfo',
+                    'applied_on': date.today().isoformat(),
+                }, config)
+                return False
+
+        # P4: spread OrderRef 命中但合约品种不在 spread_tradeinfo 中 → 异常
+        # 配置 / 跨策略 OrderRef 串号；写入仍照旧（保持账本完整性），但每个
+        # 品种打一次 warning，便于排查。
+        sym = _symbol_prefix(instrument)
+        spread_syms = _config_symbols(config, 'spread_tradeinfo')
+        if sym and spread_syms and sym not in spread_syms:
+            tag = f'spread:{sym}'
+            if tag not in _UNEXPECTED_SPREAD_SYMBOL_WARNED:
+                _UNEXPECTED_SPREAD_SYMBOL_WARNED.add(tag)
+                if logger:
+                    strangle_syms = _config_symbols(config, 'strangle_tradeinfo')
+                    where = '宽跨配置' if sym in strangle_syms else '任何配置'
+                    logger.warning(
+                        f'[价差持仓] OrderRef={order_ref} 落在价差段，但合约 '
+                        f'{instrument} 品种 {sym.upper()} 不在 spread_tradeinfo '
+                        f'中（出现在 {where}）。可能是历史遗留或 OrderRef 段位'
+                        '配置错乱，请核对 strategy_order_ref。'
+                    )
+
+        direction, offset = map_direction_offset(
             trade.get('direction'), trade.get('offset'),
         )
         claims = apply_fill_to_spread_csv(
@@ -116,7 +133,7 @@ def apply_spread_trade_record(
         if store is not None:
             store.set_leg_claims(claims)
 
-        _append_journal(journal_file, {
+        append_journal(journal_file, {
             'dedupe_key': dedupe_key,
             'trade_id': trade.get('trade_id', ''),
             'order_ref': order_ref,
@@ -128,7 +145,7 @@ def apply_spread_trade_record(
             'trade_date': trade.get('trade_date', ''),
             'trade_time': trade.get('trade_time', ''),
             'applied_on': date.today().isoformat(),
-        })
+        }, config)
     if logger:
         logger.info(
             f'[价差持仓] 成交入账 OrderRef={order_ref} {instrument} '
@@ -137,17 +154,24 @@ def apply_spread_trade_record(
     return True
 
 
+_WIRE_KIND_SPREAD = 'spread_fill_sync'
+
+
 def wire_spread_trade_runtime(conn, store) -> None:
-    """Register spread fill handler (chains after any existing trade handler)."""
+    cfg = getattr(conn, 'config', None)
+    if isinstance(cfg, dict):
+        cfg['_spread_fill_conn'] = conn
+    """Register spread fill handler via the shared (kind→handler) dispatch
+    table. See :func:`strangle_fill_sync._install_wire_handler` for the
+    idempotency contract."""
+    from strangle_fill_sync import _install_wire_handler
+
     conn._runtime_state['_spread_leg_store'] = store
-    prev = conn._runtime_state.get('_strangle_trade_handler')
 
     def _handler(c, p_trade, logger):
         handle_spread_trade_rtn(c, p_trade, logger, store)
-        if prev:
-            prev(c, p_trade, logger)
 
-    conn._runtime_state['_strangle_trade_handler'] = _handler
+    _install_wire_handler(conn, _WIRE_KIND_SPREAD, _handler)
 
 
 def handle_spread_trade_rtn(conn, p_trade, logger, store=None) -> None:
@@ -163,6 +187,8 @@ def handle_spread_trade_rtn(conn, p_trade, logger, store=None) -> None:
         store = runtime.get('_spread_leg_store')
 
     config = getattr(conn, 'config', None) or {}
+    if isinstance(config, dict):
+        config['_spread_fill_conn'] = conn
     trade = {
         'order_ref': order_ref,
         'instrument': safe_decode(p_trade.InstrumentID),
@@ -188,9 +214,15 @@ def sync_csv_from_spread_trades(
     store,
     config: dict,
     logger=None,
+    trades: Optional[List[dict]] = None,
 ) -> int:
-    """Replay spread-segment trades not yet applied to CSV."""
-    trades = _trades_from_query(conn)
+    """Replay spread-segment trades not yet applied to CSV.
+
+    ``trades`` may be supplied by callers that have already issued a
+    ``query_trades_sync`` for the round, sparing the CTP another full query.
+    """
+    if trades is None:
+        trades = _trades_from_query(conn)
     if trades is None:
         if logger:
             logger.debug('[价差持仓] 成交查询不可用或失败，跳过回放')
@@ -199,15 +231,16 @@ def sync_csv_from_spread_trades(
     from auto_strategy_order_ref import is_spread_order_ref
 
     journal_file = _journal_path(config)
-    applied = _load_applied_keys(journal_file)
+    applied = load_applied_keys(journal_file, config)
     new_count = 0
     for trade in trades:
         if not is_spread_order_ref(trade.get('order_ref'), config):
             continue
-        if _trade_dedupe_key(trade) in applied:
+        key = trade_dedupe_key(trade)
+        if key in applied:
             continue
         if apply_spread_trade_record(config, store, trade, logger, journal_file):
-            applied.add(_trade_dedupe_key(trade))
+            applied.add(key)
             new_count += 1
 
     if new_count and logger:
@@ -220,7 +253,18 @@ def sync_csv_from_spread_trades(
 
 
 def count_spread_filled_open_orders(conn, config: dict, timeout: float = 2) -> Optional[int]:
-    """Today's filled open orders in the spread OrderRef segment only."""
+    """
+    Today's *fully filled* open orders restricted to the spread OrderRef segment.
+
+    Filter rules mirror ``auto_query_service.get_filled_open_order_count`` exactly
+    (``offset='0'``, ``status='0'``, ``insert_date == today``) and then add a
+    spread-only OrderRef gate. Partial fills cancelled afterwards therefore are
+    not counted; this matches the autotrade single-strategy semantics and is
+    treated as a *coarse* throttle by design (see ``docs/GUIDE.md`` §10.4).
+
+    Returns ``None`` when the order query is unavailable / fails, so callers can
+    fall back to ``conn.get_filled_open_order_count``.
+    """
     if not hasattr(conn, 'query_orders_sync'):
         return None
     try:

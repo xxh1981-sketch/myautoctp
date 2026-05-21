@@ -10,11 +10,11 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
-from pairtrade.constants import DIRECTION_BUY, DIRECTION_SELL, OFFSET_CLOSE, OFFSET_OPEN
+from pairtrade.constants import DIRECTION_BUY, OFFSET_OPEN
 from strangle_fill_sync import (
     apply_strangle_trade_record,
     sync_csv_from_strangle_trades,
-    _trade_dedupe_key,
+    wire_strangle_trade_runtime,
 )
 
 
@@ -27,6 +27,7 @@ def _cfg(tmp, journal_name='journal.jsonl'):
             'spread_order_ref_max': 499999,
             'strangle_positions_csv': csv_path,
             'strangle_trade_journal': journal,
+            'journal_daily_shards': False,
         },
     }
 
@@ -97,6 +98,53 @@ class TestStrangleFillSync(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             row = json.loads(lines[0])
             self.assertEqual(row['order_ref'], 500010)
+
+
+class TestWireStrangleTradeRuntime(unittest.TestCase):
+    """wire_strangle_trade_runtime must chain any pre-existing handler so a
+    later wire ordering change (or a third party hooking in) does not silently
+    drop spread/fill_ledger callbacks."""
+
+    def _stub_p_trade(self, order_ref='100'):
+        p = MagicMock()
+        p.OrderRef = order_ref
+        p.InstrumentID = b'SA609C1000'
+        p.Direction = b'0'
+        p.OffsetFlag = b'0'
+        p.Volume = 1
+        p.Price = 50.0
+        p.TradeID = b''
+        p.TradeDate = b''
+        p.TradeTime = b''
+        return p
+
+    def test_chains_existing_handler(self):
+        conn = MagicMock()
+        conn._runtime_state = {}
+        conn.config = {}
+
+        called = []
+
+        def prev(c, p, l):
+            called.append('prev')
+
+        conn._runtime_state['_unified_trade_handler'] = prev
+        conn._runtime_state['_strangle_trade_handler'] = prev
+
+        wire_strangle_trade_runtime(conn, MagicMock())
+
+        handler = conn._runtime_state['_strangle_trade_handler']
+        handler(conn, self._stub_p_trade(), None)
+
+        self.assertEqual(called, ['prev'])
+
+    def test_no_prev_handler_still_works(self):
+        conn = MagicMock()
+        conn._runtime_state = {}
+        conn.config = {}
+        wire_strangle_trade_runtime(conn, MagicMock())
+        handler = conn._runtime_state['_strangle_trade_handler']
+        handler(conn, self._stub_p_trade(), None)
 
 
 if __name__ == '__main__':

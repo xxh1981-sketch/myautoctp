@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import csv
-import json
+import io
 import os
 import threading
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
+from atomic_io import atomic_write_text
+from trade_journal import (
+    append_journal,
+    load_applied_keys,
+    trade_dedupe_key,
+)
 from trade_journal_lock import journal_lock
 
 FILL_LEDGER_COLUMNS = [
@@ -53,47 +59,6 @@ def fill_ledger_journal_path(config: dict) -> str:
         path = os.path.join(_project_dir(), path)
     return path
 
-
-def _load_applied_keys(journal_file: str) -> Set[str]:
-    keys: Set[str] = set()
-    if not os.path.isfile(journal_file):
-        return keys
-    with open(journal_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            key = row.get('dedupe_key')
-            if key:
-                keys.add(str(key))
-    return keys
-
-
-def _append_journal(journal_file: str, row: dict) -> None:
-    os.makedirs(os.path.dirname(journal_file) or '.', exist_ok=True)
-    with open(journal_file, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(row, ensure_ascii=True) + '\n')
-
-
-def trade_dedupe_key(trade: dict) -> str:
-    trade_id = (trade.get('trade_id') or '').strip()
-    if trade_id:
-        inst = (trade.get('instrument') or '').upper()
-        return f'{inst}:{trade_id}'
-    return '|'.join([
-        str(trade.get('order_ref', '')),
-        (trade.get('instrument') or '').upper(),
-        str(trade.get('direction', '')),
-        str(trade.get('offset', '')),
-        str(trade.get('volume', '')),
-        str(trade.get('price', '')),
-        str(trade.get('trade_date', '')),
-        str(trade.get('trade_time', '')),
-    ])
 
 
 def resolve_fill_side(direction: str, offset: str) -> str:
@@ -171,17 +136,29 @@ def slippage_vs_mid(fill_price: float, bid: float, ask: float, fill_side: str) -
 def _ensure_csv_header(csv_path: str) -> None:
     if os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0:
         return
-    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
-    with open(csv_path, 'w', encoding='utf-8', newline='') as f:
-        csv.writer(f).writerow(FILL_LEDGER_COLUMNS)
+    buf = io.StringIO()
+    csv.writer(buf).writerow(FILL_LEDGER_COLUMNS)
+    atomic_write_text(csv_path, buf.getvalue())
 
 
 def append_fill_row(csv_path: str, row: Dict[str, Any]) -> None:
     _ensure_csv_header(csv_path)
     values = [row.get(col, '') for col in FILL_LEDGER_COLUMNS]
+    # csv.writer.writerow 会对 file 对象做多次 .write（每字段 + 分隔符）；
+    # 进程在中途被杀可能产生半行（缺字段或缺末尾 \n）。先序列化到 StringIO，
+    # 再用单次 f.write 落盘，使整行写入对应一次系统调用，半行风险降到磁盘
+    # 块级原子性范围（小行通常 < 4KB，在常见文件系统上为原子追加）。
+    buf = io.StringIO()
+    csv.writer(buf).writerow(values)
+    line = buf.getvalue()
     with _write_lock:
         with open(csv_path, 'a', encoding='utf-8', newline='') as f:
-            csv.writer(f).writerow(values)
+            f.write(line)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
 
 
 def build_fill_row(conn, trade: dict, config: dict) -> Optional[Dict[str, Any]]:
@@ -219,22 +196,28 @@ def apply_fill_record(
     logger=None,
     journal_file: str = None,
 ) -> bool:
-    """Append one fill to CSV (idempotent). Returns True if newly written."""
+    """Append one fill to CSV (idempotent). Returns True if newly written.
+
+    The quote lookup happens outside ``journal_lock`` to keep the lock window
+    short; the dedupe set is re-checked inside the lock to remain race-safe
+    against concurrent OnRtnTrade replay.
+    """
     journal_file = journal_file or fill_ledger_journal_path(config)
     dedupe_key = trade_dedupe_key(trade)
 
+    if dedupe_key in load_applied_keys(journal_file, config):
+        return False
+
+    row = build_fill_row(conn, trade, config)
+    if row is None:
+        return False
+
     with journal_lock(journal_file):
-        applied = _load_applied_keys(journal_file)
-        if dedupe_key in applied:
+        if dedupe_key in load_applied_keys(journal_file, config):
             return False
-
-        row = build_fill_row(conn, trade, config)
-        if row is None:
-            return False
-
         csv_path = fill_ledger_csv_path(config)
         append_fill_row(csv_path, row)
-        _append_journal(journal_file, {
+        append_journal(journal_file, {
             'dedupe_key': dedupe_key,
             'trade_id': trade.get('trade_id', ''),
             'order_ref': trade.get('order_ref', 0),
@@ -243,7 +226,7 @@ def apply_fill_record(
             'strategy': row['strategy'],
             'trade_date': trade.get('trade_date', ''),
             'trade_time': trade.get('trade_time', ''),
-        })
+        }, config)
     if logger:
         logger.info(
             f'[FillLedger] {row["instrument_code"]} {row["fill_side"]} '
@@ -282,21 +265,19 @@ def handle_fill_rtn(conn, p_trade, logger=None) -> None:
     apply_fill_record(conn, config, trade, logger)
 
 
+_WIRE_KIND_FILL_LEDGER = 'fill_ledger'
+
+
 def wire_fill_ledger(conn) -> None:
-    """Chain fill ledger onto OnRtnTrade handler (call after wire_strangle_trade_runtime)."""
-    runtime = conn._runtime_state
-    prev = runtime.get('_strangle_trade_handler')
+    """Register fill-ledger handler via the shared (kind→handler) dispatch
+    table. See :func:`strangle_fill_sync._install_wire_handler` for the
+    idempotency contract."""
+    from strangle_fill_sync import _install_wire_handler
 
-    def _chained(c, p_trade, logger):
-        try:
-            handle_fill_rtn(c, p_trade, logger)
-        except Exception as e:
-            if logger:
-                logger.debug(f'[FillLedger] rtn handler error: {e}')
-        if prev:
-            prev(c, p_trade, logger)
+    def _handler(c, p_trade, logger):
+        handle_fill_rtn(c, p_trade, logger)
 
-    runtime['_strangle_trade_handler'] = _chained
+    _install_wire_handler(conn, _WIRE_KIND_FILL_LEDGER, _handler)
 
 
 def _trades_from_query(conn) -> Optional[List[dict]]:
@@ -305,16 +286,26 @@ def _trades_from_query(conn) -> Optional[List[dict]]:
     return conn.query_trades_sync(timeout=12, use_cache=False)
 
 
-def sync_fill_ledger_from_trades(conn, config: dict, logger=None) -> int:
-    """Replay today's CTP trades missing from the fill ledger."""
-    trades = _trades_from_query(conn)
+def sync_fill_ledger_from_trades(
+    conn,
+    config: dict,
+    logger=None,
+    trades: Optional[List[dict]] = None,
+) -> int:
+    """Replay today's CTP trades missing from the fill ledger.
+
+    ``trades`` may be reused from an earlier query in the same round to avoid
+    extra CTP RPC during reconcile.
+    """
+    if trades is None:
+        trades = _trades_from_query(conn)
     if trades is None:
         if logger:
             logger.debug('[FillLedger] trade query unavailable, skip replay')
         return 0
 
     journal_file = fill_ledger_journal_path(config)
-    applied = _load_applied_keys(journal_file)
+    applied = load_applied_keys(journal_file, config)
     new_count = 0
     for trade in trades:
         key = trade_dedupe_key(trade)

@@ -100,11 +100,16 @@ def reconcile_strangle_positions_dual(
     spread_tradeinfo: list,
     logger,
     config: dict = None,
+    positions: list = None,
+    trades: list = None,
 ) -> Tuple[bool, List[str]]:
     """
     Strangle leg_claims vs CTP, excluding spread-owned long calls (leg claims).
 
     When strangle CSV is empty and remaining long options belong to spread, do not halt.
+
+    ``positions`` / ``trades`` may be pre-fetched by the caller for the round
+    so we avoid duplicate CTP queries across strangle + spread reconcile.
     """
     issues: List[str] = []
     config = config or {}
@@ -115,7 +120,7 @@ def reconcile_strangle_positions_dual(
     if str_cfg.get('auto_sync_positions_csv', True):
         try:
             from strangle_fill_sync import sync_csv_from_strangle_trades
-            sync_csv_from_strangle_trades(conn, ledger, config, logger)
+            sync_csv_from_strangle_trades(conn, ledger, config, logger, trades=trades)
         except Exception as e:
             issues.append(f'CSV sync failed: {e}')
             if logger:
@@ -127,17 +132,26 @@ def reconcile_strangle_positions_dual(
             from spread_fill_sync import sync_csv_from_spread_trades
             store = store_from_conn(conn)
             if store is not None:
-                sync_csv_from_spread_trades(conn, store, config, logger)
+                sync_csv_from_spread_trades(conn, store, config, logger, trades=trades)
         except Exception as e:
             issues.append(f'spread CSV sync failed: {e}')
             if logger:
                 logger.warning(f'[reconcile] spread CSV sync failed: {e}')
 
-    try:
-        positions = conn.query_positions_sync(timeout=10) or []
-    except Exception as e:
-        issues.append(f'position query failed: {e}')
-        return True, issues
+    if positions is None:
+        try:
+            positions = conn.query_positions_sync(timeout=10) or []
+        except Exception as e:
+            issues.append(f'position query failed: {e}')
+            runtime = getattr(conn, '_runtime_state', None) or {}
+            prev_halt = bool(runtime.get('_strangle_reconcile_halt', False))
+            prev_issues = list(runtime.get('_strangle_reconcile_issues') or [])
+            if logger:
+                logger.warning(
+                    '[reconcile] strangle 持仓查询失败，沿用上一轮 halt 状态: '
+                    f'prev_halt={prev_halt} (transient)'
+                )
+            return prev_halt, issues + prev_issues
 
     claimed = {k: int(v) for k, v in ledger.list_leg_claims().items()}
     ctp_long = _build_ctp_long(trade_symbols, positions)
@@ -175,5 +189,18 @@ def reconcile_strangle_positions_dual(
             if logger:
                 logger.warning(f'[reconcile] {msg}')
             halt = True
+
+    if halt:
+        import time as _time
+
+        runtime = getattr(conn, '_runtime_state', None) or {}
+        until = float(runtime.get('_reconcile_grace_until') or 0.0)
+        if _time.time() < until:
+            if logger:
+                logger.warning(
+                    '[reconcile] 处于豁免窗口 (derive 后)，'
+                    f'{len(issues)} 条 strangle 差异仅记录不 halt'
+                )
+            return False, issues
 
     return halt, issues

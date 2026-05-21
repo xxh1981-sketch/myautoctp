@@ -15,10 +15,13 @@ dual_strategy:
   fill_feishu_enabled: true
   exclude_spread_from_strangle_reconcile: true
   exclude_strangle_from_spread_positions: true
+  exclude_strangle_from_spread_reconcile: true
   use_spread_leg_claims: true
   spread_execution_from_ledger: true
   spread_close_from_ledger: true
   pause_spread_open_on_reconcile_mismatch: true
+  # true：价差段 OrderRef 成交仅当合约属于 spread tradeinfo 才写入 CSV（防 RM509/SA609C1000 等误入）
+  spread_fill_require_tradeinfo_match: true
   auto_sync_spread_positions_csv: true
   spread_positions_csv: data/spread_positions.csv
   spread_trade_journal: data/spread_trade_journal.jsonl
@@ -29,16 +32,54 @@ dual_strategy:
   spread_csv: tradeinfo/spread.csv
   strangle_csv: tradeinfo/strangle.csv
   require_startup_ack: true
-  startup_ack_each_run: true
+  # 7×24 无人值守：首次确认后写盘，冷启动/自动重启不再弹窗
+  startup_ack_each_run: false
   startup_ack_interactive: true
   startup_ack_use_gui: true
   startup_ack_prefer_gui: true
   startup_ack_force_terminal: false
-  startup_ack_persist: false
+  startup_ack_persist: true
+  # true=确认文件须为当日；false=跨日有效（改 CSV 后删文件重确认）
+  startup_ack_require_today: false
   startup_ack_file: data/position_startup_ack.txt
+  allow_start_on_reconcile_mismatch: false  # true=有差异也自动启动（不弹窗，供脚本用）
+  reconcile_interval_sec: 60
+  # derive 后给主循环对账一段豁免窗口，避免 OnRtnTrade 异步落账期间被
+  # 立刻判 halt（差异仅记录，不强制 close-only）。0 表示禁用豁免。
+  reconcile_grace_after_derive_sec: 90
+  journal_daily_shards: true
+  journal_retain_days: 14
+
+# 心跳告警 / 死链检测（OnHeartBeatWarning 早于 OnFrontDisconnected 触发）
+# 单位: 秒。dead_threshold 超过即主动重连；log_cooldown / dead_cooldown 防刷
+# ctp_heartbeat_log_cooldown_sec: 60
+# ctp_heartbeat_dead_threshold_sec: 90
+# ctp_heartbeat_dead_cooldown_sec: 120
+
+# 健康检查发现的"僵尸订单"重复撤单冷却（同一 order_ref 内不再触发）
+# zombie_cancel_cooldown_sec: 300
+
+# 价差日开仓笔数粗节流（非核心风控，可放大如 200～500）
+# daily_trade_limit: 200  # 继承 autotrade auto_config.yaml，此处可覆盖
 
 log_level: INFO
 loop_interval: 10
+# 未在 merged_config.yaml 显式设置时默认 10 万元；设为 0 可禁用
+global_margin_limit: 100000
+margin_recheck_interval_sec: 300
+# 主循环连续内层异常达此次数后触发进程级重启（0=仅打日志不重启）
+main_loop_max_consecutive_errors: 10
+
+# 残余风险飞书告警（不改变 halt/交易语义，仅通知）
+# risk_alert_cooldown_sec: 1800
+# feishu_pause_exposure_alert: true      # 飞书暂停时若有未配对/对账 halt 则告警
+# margin_unknown_alert_after: 3          # 保证金检查连续 unknown 次数后告警
+# quarantine_alert_after_sec: 600        # 重连隔离超时时长后告警
+# reconcile_halt_open_unmatched_alert: true
+# block_start_without_margin_limit: false  # true 且 global_margin_limit=0 则拒绝启动
+# allow_margin_limit_disabled: false       # true 时允许 limit=0 且不打印配置 warning
+max_restart_attempts: 0
+max_restart_delay: 600
 
 strangle:
   daily_buy_limit_yuan: 300000

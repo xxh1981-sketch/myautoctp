@@ -1,8 +1,13 @@
-"""Unified spread execution from spread_positions.csv (open, rebalance, close)."""
+"""Unified spread execution from spread_positions.csv (open, rebalance, close).
+
+Halt paths (by design):
+  - Reconcile halt (_spread_open_halted): close-only — ledger untrusted for open/rebalance.
+  - Daily limit / margin halt: full process_symbol — ledger trusted; open blocked inside.
+"""
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 from spread_close_ledger import (
     build_positions_from_spread_claims,
@@ -21,6 +26,27 @@ from spread_position_adjust import (
 _ORIG_PROCESS_SYMBOL = None
 _ORIG_REBALANCE_ONE_LEG = None
 _INSTALLED = False
+
+# 任何 `from auto_processor import process_symbol` / `from auto_closer import process_close` 等
+# 已绑定的本地名字都不会被 `auto_processor.process_symbol = patched` 自动更新。把所有已知
+# 直接 from-import 关键函数的下游模块列在此处，install_* 时显式 rebind。
+_PROCESS_SYMBOL_CONSUMERS = ('merged_main_loop',)
+
+
+def _rebind_module_attr(module_name: str, attr: str, value) -> int:
+    """Reassign ``module_name.attr = value`` if the module has been imported.
+
+    Returns 1 when the rebind happened, 0 otherwise. Used to compensate for
+    Python's `from X import Y` semantics, which would otherwise leave a stale
+    function reference on downstream modules even after we patch ``X.Y``.
+    """
+    import sys
+
+    mod = sys.modules.get(module_name)
+    if mod is None or not hasattr(mod, attr):
+        return 0
+    setattr(mod, attr, value)
+    return 1
 
 
 def _rebind_analyze_consumers(patched_analyze, patched_check=None) -> None:
@@ -180,18 +206,16 @@ def install_spread_process_symbol_halt(config: dict) -> None:
     ):
         runtime = getattr(conn, '_runtime_state', None) or {}
         if runtime.get('_spread_open_halted'):
-            symbol = item.get('future', '?')
-            reason = runtime.get('_spread_open_halt_reason', '')
-            logger.info(
-                f'[{symbol}] 价差对账暂停新开/再平衡'
-                + (f': {reason}' if reason else '')
-            )
             return _spread_close_only(conn, item, vix_engine, config, logger)
         return _ORIG_PROCESS_SYMBOL(
             conn, item, vix_engine, config, logger, remaining_limit=remaining_limit,
         )
 
     auto_processor.process_symbol = patched_process_symbol
+    # 防御：即使 merged_main_loop 改成 `import auto_processor` 后已经能拿到 patch，
+    # 仍然 rebind 一次，覆盖任何遗留的 `from auto_processor import process_symbol` 用法。
+    for mod_name in _PROCESS_SYMBOL_CONSUMERS:
+        _rebind_module_attr(mod_name, 'process_symbol', patched_process_symbol)
 
 
 def install_spread_ledger_execution(config: dict) -> None:

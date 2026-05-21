@@ -13,7 +13,9 @@
 
 | 文档 | 内容 |
 |------|------|
-| **[docs/GUIDE.md](docs/GUIDE.md)** | **完整说明**（安装、配置、tradeinfo、持仓维护、启动/主循环、两策略逻辑、VIX、风控、排查、上线清单） |
+| **[docs/GUIDE.md](docs/GUIDE.md)** | **完整说明**（含 §15.4 三种 halt 与执行路径设计约定） |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发、测试与提交规范 |
+| [docs/CI.md](docs/CI.md) | GitHub Actions 与全量 CI secrets 配置 |
 | [data/strangle_positions.example.csv](data/strangle_positions.example.csv) | 宽跨启动前持仓 CSV 示例 |
 | [data/position_startup_ack.txt.example](data/position_startup_ack.txt.example) | 启动确认文件示例 |
 

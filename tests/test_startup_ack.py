@@ -2,13 +2,20 @@
 
 import os
 import sys
+import tempfile
 import unittest
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
-from merged_startup_ack import _preview_reconcile, _should_prefer_gui
+from merged_startup_ack import (
+    _file_ack_ok,
+    _preview_reconcile,
+    _should_prefer_gui,
+    require_startup_position_ack,
+)
 
 
 class TestStartupAckGui(unittest.TestCase):
@@ -47,6 +54,55 @@ class TestPreviewReconcile(unittest.TestCase):
             halt, issues, lines = _preview_reconcile(conn, ledger, config, None)
         self.assertFalse(halt)
         mock_fn.assert_called_once()
+
+
+class TestStartupAckFile(unittest.TestCase):
+
+    def test_file_ack_ok_without_require_today_accepts_yesterday(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = os.path.join(tmp, 'position_startup_ack.txt')
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            with open(ack_file, 'w', encoding='utf-8') as f:
+                f.write(f'confirmed {yesterday}\n')
+            config = {
+                'dual_strategy': {
+                    'startup_ack_file': ack_file,
+                    'startup_ack_require_today': False,
+                },
+            }
+            self.assertTrue(_file_ack_ok(config, require_today=False))
+
+    def test_file_ack_ok_with_require_today_rejects_yesterday(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = os.path.join(tmp, 'position_startup_ack.txt')
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            with open(ack_file, 'w', encoding='utf-8') as f:
+                f.write(f'confirmed {yesterday}\n')
+            config = {'dual_strategy': {'startup_ack_file': ack_file}}
+            self.assertFalse(_file_ack_ok(config, require_today=True))
+
+    def test_require_startup_ack_skips_interactive_when_file_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = os.path.join(tmp, 'position_startup_ack.txt')
+            with open(ack_file, 'w', encoding='utf-8') as f:
+                f.write(f'confirmed {date.today().isoformat()}\n')
+            config = {
+                'dual_strategy': {
+                    'require_startup_ack': True,
+                    'startup_ack_each_run': False,
+                    'startup_ack_require_today': False,
+                    'startup_ack_file': ack_file,
+                },
+            }
+            ledger = MagicMock()
+            ledger.list_positions.return_value = []
+            ledger.list_leg_claims.return_value = {}
+            ledger.list_unmatched_legs.return_value = []
+            ledger.get_daily_buy_amount.return_value = 0.0
+            logger = MagicMock()
+            ok = require_startup_position_ack(config, logger, ledger, conn=None)
+            self.assertTrue(ok)
+            logger.info.assert_any_call(f'[启动] 持仓已确认: {ack_file}')
 
 
 if __name__ == '__main__':

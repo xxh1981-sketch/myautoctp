@@ -1,0 +1,133 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+      - name: Block tracked runtime data
+        run: python scripts/check_sensitive_files.py
+
+  pytest-unit:
+    runs-on: ubuntu-latest
+    env:
+      AUTOCTP_ALLOW_MISSING_DEPS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run unit tests (no autotrade required)
+        run: python scripts/run_unit_tests.py --cov=. --cov-report=term-missing
+
+  pytest-unit-windows:
+    runs-on: windows-latest
+    env:
+      AUTOCTP_ALLOW_MISSING_DEPS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run unit tests on Windows
+        run: python scripts/run_unit_tests.py
+
+  pytest-permissive:
+    runs-on: ubuntu-latest
+    needs: [lint, pytest-unit]
+    env:
+      AUTOCTP_ALLOW_MISSING_DEPS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run tests that do not require autotrade
+        run: pytest tests/ -m "not integration" -q --tb=short
+
+  pytest-full:
+    # 配置 AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL secrets 后跑全量；
+    # 未配置时 job 仍通过（仅 checkout + 检测），不阻塞 PR。
+    runs-on: ubuntu-latest
+    needs: [lint, pytest-unit]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: autoctp
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check if dependency repos are configured
+        id: check_deps
+        env:
+          AUTOTRADE_REPO_URL: ${{ secrets.AUTOTRADE_REPO_URL }}
+          AUTOSTRAGGLE_REPO_URL: ${{ secrets.AUTOSTRAGGLE_REPO_URL }}
+        run: |
+          if [ -z "$AUTOTRADE_REPO_URL" ] || [ -z "$AUTOSTRAGGLE_REPO_URL" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping full suite: secrets AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL not set"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone autotrade & autostraggle
+        if: steps.check_deps.outputs.configured == 'true'
+        env:
+          AUTOTRADE_REPO_URL: ${{ secrets.AUTOTRADE_REPO_URL }}
+          AUTOSTRAGGLE_REPO_URL: ${{ secrets.AUTOSTRAGGLE_REPO_URL }}
+        run: |
+          git clone --depth 1 "$AUTOTRADE_REPO_URL" autotrade
+          git clone --depth 1 "$AUTOSTRAGGLE_REPO_URL" autostraggle
+
+      - name: Install dependencies
+        if: steps.check_deps.outputs.configured == 'true'
+        working-directory: autoctp
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run full suite
+        if: steps.check_deps.outputs.configured == 'true'
+        working-directory: autoctp
+        env:
+          AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
+          AUTOSTRAGGLE_ROOT: ${{ github.workspace }}/autostraggle
+        run: pytest tests/ -q --tb=short --strict-markers
+
+      - name: Full suite skipped hint
+        if: steps.check_deps.outputs.configured != 'true'
+        run: echo "::notice::pytest-full skipped — see docs/CI.md for AUTOTRADE_REPO_URL / AUTOSTRAGGLE_REPO_URL"

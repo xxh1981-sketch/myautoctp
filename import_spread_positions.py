@@ -2,10 +2,11 @@
 
 import argparse
 import csv
+import io
 import os
-import sys
 from typing import Dict
 
+from atomic_io import atomic_write_text
 from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
@@ -71,16 +72,16 @@ def load_spread_positions_csv(path: str) -> Dict[str, int]:
 
 
 def save_spread_positions_csv(path: str, claims: Dict[str, int]) -> None:
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     rows = sorted(
         ((inst, int(vol)) for inst, vol in (claims or {}).items() if int(vol) != 0),
         key=lambda x: x[0],
     )
-    with open(path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['instrument', 'volume'])
-        for inst, vol in rows:
-            writer.writerow([inst, vol])
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['instrument', 'volume'])
+    for inst, vol in rows:
+        writer.writerow([inst, vol])
+    atomic_write_text(path, buf.getvalue())
 
 
 def spread_fill_delta(direction: str, offset: str, traded: int) -> int:
@@ -158,6 +159,16 @@ def sync_spread_leg_claims(
     return len(claims)
 
 
+def _load_config_with_tradeinfo():
+    from merged_tradeinfo import load_dual_tradeinfo
+
+    config = load_merged_config()
+    spread_info, strangle_info, _combined = load_dual_tradeinfo(config)
+    config['spread_tradeinfo'] = spread_info
+    config['strangle_tradeinfo'] = strangle_info
+    return config
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description='Import spread_positions.csv (instrument, signed volume)',
@@ -167,9 +178,44 @@ def main(argv=None) -> int:
         default=_default_csv(),
         help='positions CSV (default: data/spread_positions.csv)',
     )
+    parser.add_argument(
+        '--audit',
+        action='store_true',
+        help='audit spread_positions.csv vs tradeinfo (no write)',
+    )
+    parser.add_argument(
+        '--repair-journal',
+        action='store_true',
+        help='remove spread journal lines outside spread tradeinfo',
+    )
     args = parser.parse_args(argv)
 
-    config = load_merged_config()
+    config = _load_config_with_tradeinfo()
+
+    if args.audit:
+        from spread_claims_guard import audit_spread_claims, format_spread_claims_audit
+
+        path = args.csv
+        claims = load_spread_positions_csv(path) if os.path.isfile(path) else {}
+        issues = audit_spread_claims(
+            claims, config.get('spread_tradeinfo') or [], conn=None, ctp_signed=None,
+        )
+        text = format_spread_claims_audit(issues)
+        if text:
+            print(text)
+        elif claims:
+            print(f'【价差认领审计】{path} 共 {len(claims)} 条，未发现 tradeinfo 层面问题')
+        else:
+            print(f'【价差认领审计】{path} 为空')
+        return 1 if issues else 0
+
+    if args.repair_journal:
+        from spread_claims_guard import repair_spread_trade_journals
+
+        removed, kept = repair_spread_trade_journals(config, conn=None, logger=None)
+        print(f'[价差 journal] 已清理：移除 {removed} 条，保留 {kept} 条')
+        return 0
+
     from spread_ledger import SpreadLegStore
 
     if os.path.isfile(args.csv):
@@ -179,11 +225,12 @@ def main(argv=None) -> int:
 
     store = SpreadLegStore()
     store.set_leg_claims(claims)
-    save_spread_positions_csv(spread_positions_csv_path(config), store.list_leg_claims())
+    out_path = spread_positions_csv_path(config)
+    save_spread_positions_csv(out_path, store.list_leg_claims())
     if not claims:
-        print(f"no positions -> {spread_positions_csv_path(config)}")
+        print(f"no positions -> {out_path}")
     else:
-        print(f"imported {len(claims)} contracts -> {spread_positions_csv_path(config)}")
+        print(f"imported {len(claims)} contracts -> {out_path}")
     return 0
 
 
