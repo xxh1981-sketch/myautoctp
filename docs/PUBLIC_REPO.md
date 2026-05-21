@@ -29,7 +29,7 @@ git status   # 勿提交 merged_config.yaml、data/* 运行时文件、.cursor/
 **不要提交：**
 
 - `merged_config.yaml`、`.env`
-- `docs/GUIDE.md`、`docs/LOCAL完整说明.md`（本地完整说明）
+- `docs/GUIDE.md`、`docs/LOCAL完整说明.md`、`docs/LOCAL-CL工作清单.md`（本地完整说明）
 - `tradeinfo/*.csv`（非 example）
 - `data/` 下运行时 CSV、jsonl、pid、ledger
 
