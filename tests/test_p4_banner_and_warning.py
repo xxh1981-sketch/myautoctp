@@ -89,6 +89,8 @@ class TestUnexpectedSpreadSymbolWarning(unittest.TestCase):
             'dual_strategy': {
                 'spread_trade_journal': os.path.join(self.tmp, 'spread_journal.jsonl'),
                 'spread_positions_csv_path': os.path.join(self.tmp, 'spread.csv'),
+                # P4 用例：OrderRef 在价差段但品种不在 spread_tradeinfo → 仍入账，每品种 warning 一次
+                'spread_fill_require_tradeinfo_match': False,
             },
             'strategy_order_ref': {
                 'spread_min': 1, 'spread_max': 499999,
