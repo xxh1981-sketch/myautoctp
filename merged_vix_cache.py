@@ -1,13 +1,14 @@
-"""Spread-only round VIX cache (does not affect strangle calculate_vix_for_month)."""
+"""Per-round regime VIX cache (spread + strangle share OI 近月算法)."""
 
 from typing import Any, Optional
 
-# Must differ from autostraggle straggle_vix.ROUND_VIX_CACHE_KEY ('_round_vix_cache').
+# 与 straggle_vix.MERGED_REGIME_VIX_CACHE_KEY 一致；宽跨独立运行可用 _round_vix_cache
 SPREAD_ROUND_VIX_CACHE_KEY = '_spread_round_vix_cache'
+REGIME_ROUND_VIX_CACHE_KEY = SPREAD_ROUND_VIX_CACHE_KEY
 
 
 def begin_round_vix_cache(conn) -> None:
-    """Clear spread-round cache only; wide跨仍按 tradeinfo month 独立计算 VIX。"""
+    """每轮主循环清空；价差/宽跨共用同一品种 VIX（engine.calculate_vix）。"""
     conn._runtime_state[SPREAD_ROUND_VIX_CACHE_KEY] = {}
 
 
@@ -30,7 +31,7 @@ def get_round_vix(engine, sym: str, conn, logger=None) -> Optional[float]:
 
 
 def wrap_vix_engine(engine, conn, logger):
-    """Wrap VIXEngine.calculate_vix for spread; strangle keeps raw engine."""
+    """Wrap VIXEngine.calculate_vix with per-round cache (spread + strangle)."""
 
     class _RoundVixEngineProxy:
         __slots__ = ('_engine', '_conn', '_logger')

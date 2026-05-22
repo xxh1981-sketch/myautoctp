@@ -48,6 +48,13 @@ dual_strategy:
   # false=确认文件跨日有效；改持仓 CSV 后请删 data/position_startup_ack.txt 再启
   startup_ack_require_today: false
   startup_ack_file: data/position_startup_ack.txt
+  # 人工步骤 2 确认外部仓后写入；无人值守重启时校验 JSON 与 live CTP 分解一致
+  external_positions_ack_file: data/external_positions_ack.json
+  external_ack_persist: true
+  # true=外部仓 JSON 仅当日有效（与 startup_ack_require_today 独立）
+  external_ack_require_today: false
+  # 无人值守恢复 JSON 时与 CTP 分解不一致则拒绝启动
+  external_ack_strict_on_restore: true
   allow_start_on_reconcile_mismatch: false
   reconcile_interval_sec: 60
   # derive 后给主循环对账一段豁免窗口，避免 OnRtnTrade 异步落账期间被
@@ -72,6 +79,14 @@ dual_strategy:
 
 # 价差日开仓笔数粗节流（非核心风控，可放大如 200～500）
 # daily_trade_limit: 200  # 继承 autotrade auto_config.yaml，此处可覆盖
+
+# 动态开仓 clip：单次 combo 组数（市值 + L1 参与率，不写进 tradeinfo）
+open_clip:
+  enabled: true
+  target_yuan: 20000
+  max_groups: 8
+  participation_base: 0.30
+  floor_to_one_after_precheck: true
 
 log_level: INFO
 loop_interval: 10
