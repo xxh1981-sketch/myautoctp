@@ -42,7 +42,10 @@ class TestPreviewReconcile(unittest.TestCase):
         config = {
             'strangle_tradeinfo': [{'future': 'ma', 'month': '2609'}],
             'spread_tradeinfo': [],
-            'dual_strategy': {'exclude_spread_from_strangle_reconcile': True},
+            'dual_strategy': {
+                'exclude_spread_from_strangle_reconcile': True,
+                'spread_execution_from_ledger': True,
+            },
             'strangle': {'auto_sync_positions_csv': False},
         }
         conn.query_positions_sync.return_value = []
@@ -50,10 +53,15 @@ class TestPreviewReconcile(unittest.TestCase):
         with unittest.mock.patch(
             'strangle_reconcile_dual.reconcile_strangle_positions_dual',
             return_value=(False, []),
-        ) as mock_fn:
-            halt, issues, lines = _preview_reconcile(conn, ledger, config, None)
+        ) as mock_str:
+            with unittest.mock.patch(
+                'spread_reconcile.reconcile_spread_positions',
+                return_value=(False, []),
+            ) as mock_sp:
+                halt, issues, lines = _preview_reconcile(conn, ledger, config, None)
         self.assertFalse(halt)
-        mock_fn.assert_called_once()
+        mock_str.assert_called_once()
+        mock_sp.assert_called_once()
 
 
 class TestStartupAckFile(unittest.TestCase):
@@ -128,10 +136,16 @@ class TestStartupAckFile(unittest.TestCase):
             ledger.get_daily_buy_amount.return_value = 0.0
             logger = MagicMock()
             with unittest.mock.patch(
-                'merged_startup_ack._prompt_interactive_ack',
+                'merged_startup_ack._prompt_ledger_reconcile_step',
                 return_value='yes',
             ) as mock_prompt:
-                ok = require_startup_position_ack(config, logger, ledger, conn=None)
+                with unittest.mock.patch(
+                    'merged_startup_ack._run_account_decomposition_step',
+                    return_value=True,
+                ):
+                    ok = require_startup_position_ack(
+                        config, logger, ledger, conn=MagicMock(_runtime_state={}),
+                    )
             self.assertTrue(ok)
             mock_prompt.assert_called_once()
             logged = ' '.join(str(c) for c in logger.info.call_args_list)

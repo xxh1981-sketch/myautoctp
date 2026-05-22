@@ -475,7 +475,8 @@ def run_merged_main_loop(
                             for item in strangle_tradeinfo:
                                 try:
                                     if process_strangle_symbol(
-                                        conn, item, vix_engine, config, s_logger,
+                                        conn, item, round_vix_engine, config,
+                                        s_logger,
                                         ledger, str_executor, circuit_breaker,
                                     ):
                                         strangle_acted += 1

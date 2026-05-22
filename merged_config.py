@@ -86,6 +86,10 @@ DUAL_STRATEGY_DEFAULTS = {
     'startup_ack_persist': True,
     'startup_ack_require_today': False,
     'startup_ack_file': 'data/position_startup_ack.txt',
+    'external_positions_ack_file': 'data/external_positions_ack.json',
+    'external_ack_persist': True,
+    'external_ack_require_today': False,
+    'external_ack_strict_on_restore': True,
     'allow_start_on_reconcile_mismatch': False,
 }
 

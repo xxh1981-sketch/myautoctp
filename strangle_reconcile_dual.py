@@ -178,6 +178,13 @@ def reconcile_strangle_positions_dual(
                 )
             else:
                 msg = f'{inst}: strangle_CTP={strangle_vol} CSV={book_vol} gap={gap}'
+            from account_decomposition import external_explains_strangle_gap
+            if external_explains_strangle_gap(inst, gap, config):
+                msg += ' [已确认外部仓，不 halt]'
+                issues.append(msg)
+                if logger:
+                    logger.info(f'[reconcile] {msg}')
+                continue
             issues.append(msg)
             if logger:
                 logger.warning(f'[reconcile] {msg}')

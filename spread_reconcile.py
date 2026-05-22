@@ -256,15 +256,21 @@ def reconcile_spread_positions(
             '[spread-reconcile]',
         )
 
-    book = ledger_spread_signed_claims(conn, store, spread_tradeinfo)
+    from account_decomposition import external_explains_ctp_ahead, normalize_inst_map
+
+    book = normalize_inst_map(
+        ledger_spread_signed_claims(conn, store, spread_tradeinfo),
+    )
     strangle_long_calls = (
         _strangle_long_calls_for_spread(conn)
         if dual.get('exclude_strangle_from_spread_reconcile', True)
         else None
     )
-    ctp = ctp_spread_signed_claims(
-        conn, spread_tradeinfo, positions,
-        strangle_long_calls=strangle_long_calls,
+    ctp = normalize_inst_map(
+        ctp_spread_signed_claims(
+            conn, spread_tradeinfo, positions,
+            strangle_long_calls=strangle_long_calls,
+        ),
     )
     instruments = set(book) | set(ctp)
 
@@ -276,6 +282,12 @@ def reconcile_spread_positions(
             continue
         if abs(ctp_vol) > abs(book_vol) or (ctp_vol != 0 and book_vol == 0):
             msg = f'{inst}: CTP={ctp_vol} CSV={book_vol} (CTP ahead)'
+            if external_explains_ctp_ahead(inst, ctp_vol, book_vol, config):
+                msg += ' [已确认外部仓，不 halt]'
+                if logger:
+                    logger.info(f'[spread-reconcile] {msg}')
+                issues.append(msg)
+                continue
             halt = True
         else:
             msg = f'{inst}: CSV={book_vol} CTP={ctp_vol} (CSV ahead)'

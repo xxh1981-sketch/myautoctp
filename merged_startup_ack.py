@@ -67,6 +67,21 @@ def _env_auto_confirm() -> bool:
     )
 
 
+def _finish_unattended_startup_ack(
+    config: dict, logger, ledger, conn=None,
+) -> bool:
+    """
+    After skipping interactive steps (ack file / AUTOCTP_CONFIRM / auto-restart):
+    restore external JSON with live CTP verification when possible.
+    """
+    from account_decomposition import restore_external_ack_from_file
+
+    if not restore_external_ack_from_file(config, conn, ledger, logger):
+        return False
+    config['_startup_ack_done'] = True
+    return True
+
+
 def format_spread_claims_summary(store) -> str:
     lines = ['【价差认领 CSV】']
     if store is None:
@@ -180,9 +195,17 @@ _DERIVE_SPREAD_HELP = (
 
 
 def _preview_reconcile(conn, ledger, config: dict, logger) -> tuple:
-    """Return (halt, issues, log_lines)."""
+    """Return (halt, issues, log_lines). Includes strangle + spread reconcile preview."""
     lines = []
+    all_issues: list = []
+    halt = False
     try:
+        positions = None
+        try:
+            positions = conn.query_positions_sync(timeout=10, use_cache=False)
+        except TypeError:
+            positions = conn.query_positions_sync(timeout=10)
+
         from strangle_reconcile_dual import reconcile_strangle_positions_dual
         from straggle_reconcile import reconcile_strangle_positions
 
@@ -190,20 +213,41 @@ def _preview_reconcile(conn, ledger, config: dict, logger) -> tuple:
         spread_info = config.get('spread_tradeinfo') or []
         dual = config.get('dual_strategy') or {}
         if dual.get('exclude_spread_from_strangle_reconcile', True):
-            halt, issues = reconcile_strangle_positions_dual(
+            str_halt, str_issues = reconcile_strangle_positions_dual(
                 conn, ledger, symbols, spread_info, logger, config=config,
+                positions=positions,
             )
         else:
-            halt, issues = reconcile_strangle_positions(
+            str_halt, str_issues = reconcile_strangle_positions(
                 conn, ledger, symbols, logger, config=config,
             )
-        for msg in issues[:10]:
-            lines.append(f'[对账预览] {msg}')
+        all_issues.extend(str_issues or [])
+        halt = halt or str_halt
+        for msg in (str_issues or [])[:10]:
+            lines.append(f'[对账预览·宽跨] {msg}')
             if logger:
-                logger.warning(f'[对账预览] {msg}')
+                logger.warning(f'[对账预览·宽跨] {msg}')
+
+        if dual.get('spread_execution_from_ledger', True):
+            from spread_reconcile import reconcile_spread_positions
+
+            sp_halt, sp_issues = reconcile_spread_positions(
+                conn, spread_info, logger, config=config, positions=positions,
+            )
+            all_issues.extend(sp_issues or [])
+            halt = halt or sp_halt
+            for msg in (sp_issues or [])[:10]:
+                lines.append(f'[对账预览·价差] {msg}')
+                if logger:
+                    logger.warning(f'[对账预览·价差] {msg}')
+
         if halt and logger:
-            logger.warning('对账预览不一致，宽跨可能 open_halted 禁止新开')
-        return halt, issues, lines
+            logger.warning(
+                '对账预览不一致：宽跨可能 open_halted；价差可能 reconcile halt'
+            )
+        elif not all_issues and logger:
+            logger.info('[对账预览] 宽跨与价差均无差异')
+        return halt, all_issues, lines
     except Exception as e:
         msg = f'[对账预览] {e}'
         if logger:
@@ -327,6 +371,168 @@ def _reconcile_mismatch_auto_ok(config: dict, logger) -> bool:
     return False
 
 
+def _prompt_ledger_reconcile_step(
+    config: dict,
+    logger,
+    summary: str,
+    issues: list,
+    reconcile_halt: bool = False,
+) -> str:
+    """
+    冷启动第一步：账本核对 / derive（无论对账预览有无差异均弹出）。
+    返回 yes | derive | no。
+    """
+    has_issues = bool(issues) or reconcile_halt
+    if has_issues:
+        header = (
+            '【步骤 1/2 账本核对】对账预览存在差异。\n'
+            '确认无误后进入账户分解；或使用 derive 从 CTP−宽跨 更新价差 CSV。\n'
+            '继续后宽跨可能 open_halted 禁止新开（平仓仍允许）。\n'
+        )
+    else:
+        header = (
+            '【步骤 1/2 账本核对】对账预览无差异。\n'
+            '请核对宽跨/价差账本；可直接确认进入下一步，或使用 derive 更新价差 CSV。\n'
+        )
+    return _prompt_reconcile_mismatch_ack(
+        config, logger, summary, issues,
+        context='账本核对',
+        allow_derive=True,
+        header=header,
+    )
+
+
+def _prompt_ctp_query_failed_ack(config: dict, logger, summary: str) -> str:
+    """步骤 2：CTP 查询失败时的确认。返回 yes | no。"""
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('startup_ack_interactive', True):
+        logger.error('[启动] CTP 查询失败且非交互模式，拒绝启动')
+        return 'no'
+    if _reconcile_mismatch_auto_ok(config, logger):
+        return 'yes'
+
+    prompt = (
+        '【步骤 2/2 账户分解】CTP 持仓查询失败，无法校验 CTP=价差+宽跨。\n\n'
+        '  yes → 仍要启动（不校验账户分解）\n'
+        '  no  → 取消，请检查连接后重试\n'
+    )
+    message = summary.strip() + '\n\n' + prompt
+    title = 'AutoCTP 账户分解（查询失败）'
+    use_gui = dual.get('startup_ack_use_gui', True)
+
+    if use_gui and _should_prefer_gui(dual):
+        ok = _confirm_via_gui_yes_no(
+            title, message,
+            yes_text='仍要启动',
+            no_text='取消',
+            logger=logger,
+        )
+        if ok is True:
+            return 'yes'
+        if ok is False:
+            config['_startup_ack_retry'] = False
+            return 'no'
+
+    if sys.stdin.isatty():
+        logger.warning('[启动] CTP 查询失败，请终端确认')
+        logger.info(message)
+        try:
+            ans = input('CTP 查询失败，仍要启动? [yes/no]: ').strip().lower()
+            if ans in ('yes', 'y', 'ok', 'confirmed'):
+                return 'yes'
+            config['_startup_ack_retry'] = False
+            return 'no'
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    if use_gui:
+        ok = _confirm_via_gui_yes_no(title, message, logger=logger)
+        if ok is True:
+            return 'yes'
+        if ok is False:
+            config['_startup_ack_retry'] = False
+            return 'no'
+
+    logger.error('[启动] CTP 查询失败且无法交互确认，拒绝启动')
+    config['_startup_ack_retry'] = False
+    return 'no'
+
+
+def _prompt_account_decomposition_ack(
+    config: dict,
+    logger,
+    summary: str,
+    decomp_issues: list,
+) -> str:
+    """
+    冷启动第二步：CTP = 价差 + 宽跨 存在外部差额时的确认。
+    返回 yes | no。
+    """
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('startup_ack_interactive', True):
+        logger.error('[启动] 账户分解不一致且非交互模式，拒绝启动')
+        return 'no'
+    if _reconcile_mismatch_auto_ok(config, logger):
+        return 'yes'
+
+    issue_block = _format_reconcile_issues(decomp_issues)
+    prompt = (
+        '【步骤 2/2 账户分解】CTP ≠ 价差 + 宽跨（存在外部差额）。\n\n'
+        f'{issue_block}\n\n'
+        '外部差额通常表示同一账户上还有其他策略/手工持仓。\n'
+        '确认启动后：本程序仅按价差/宽跨各自账本运行，不会管理外部仓；\n'
+        '周期对账对「与已确认外部差额一致」的 CTP 超前差异不再 halt。\n\n'
+        '  yes → 已知外部仓，进入交易\n'
+        '  no  → 取消\n'
+    )
+    message = summary.strip() + '\n\n' + prompt
+    title = 'AutoCTP 账户分解确认'
+
+    use_gui = dual.get('startup_ack_use_gui', True)
+    if use_gui and _should_prefer_gui(dual):
+        logger.info('[启动] 账户分解有外部差额，弹出确认对话框…')
+        ok = _confirm_via_gui_yes_no(
+            title, message,
+            yes_text='已知外部仓，启动',
+            no_text='取消',
+            logger=logger,
+        )
+        if ok is True:
+            return 'yes'
+        if ok is False:
+            config['_startup_ack_retry'] = False
+            return 'no'
+
+    if sys.stdin.isatty():
+        logger.warning('[启动] 账户分解存在外部差额，请终端确认')
+        logger.info(message)
+        try:
+            ans = input('存在外部仓差额，仍要启动? [yes/no]: ').strip().lower()
+            if ans in ('yes', 'y', 'ok', 'confirmed'):
+                return 'yes'
+            config['_startup_ack_retry'] = False
+            return 'no'
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    if use_gui:
+        ok = _confirm_via_gui_yes_no(
+            title, message,
+            yes_text='已知外部仓，启动',
+            no_text='取消',
+            logger=logger,
+        )
+        if ok is True:
+            return 'yes'
+        if ok is False:
+            config['_startup_ack_retry'] = False
+            return 'no'
+
+    logger.error('[启动] 账户分解不一致且无法交互确认，拒绝启动')
+    config['_startup_ack_retry'] = False
+    return 'no'
+
+
 def _prompt_reconcile_mismatch_ack(
     config: dict,
     logger,
@@ -334,6 +540,7 @@ def _prompt_reconcile_mismatch_ack(
     issues: list,
     context: str = '启动前对账',
     allow_derive: bool = True,
+    header: str = None,
 ) -> str:
     """
     对账有差异时弹出确认（GUI 优先）。
@@ -347,26 +554,38 @@ def _prompt_reconcile_mismatch_ack(
         return 'yes'
 
     issue_block = _format_reconcile_issues(issues)
-    prompt = (
-        f'⚠ 【{context}差异】\n\n'
-        f'{issue_block}\n\n'
-        '继续启动后宽跨可能 open_halted 禁止新开（平仓仍允许）。\n'
-    )
+    has_issues = bool(issues)
+    if header:
+        prompt = header
+        if issues:
+            prompt += f'\n{issue_block}\n'
+    elif issues:
+        prompt = (
+            f'⚠ 【{context}差异】\n\n'
+            f'{issue_block}\n\n'
+            '继续启动后宽跨可能 open_halted 禁止新开（平仓仍允许）。\n'
+        )
+    else:
+        prompt = f'【{context}】对账预览无差异。\n'
     if allow_derive:
         prompt += (
-            '  确认启动 → 仍要开始交易\n'
-            f'  derive   → {_DERIVE_SPREAD_LABEL}\n'
-            '  取消     → 不启动\n'
+            '  确认 → 进入下一步\n'
+            f'  derive → {_DERIVE_SPREAD_LABEL}\n'
+            '  取消 → 不启动\n'
         )
     else:
         prompt += '  yes → 仍要启动    no → 取消\n'
 
     message = summary.strip() + '\n\n' + prompt
-    title = f'AutoCTP {context}差异确认'
+    title = (
+        f'AutoCTP {context}差异确认'
+        if has_issues else f'AutoCTP {context}'
+    )
 
     use_gui = dual.get('startup_ack_use_gui', True)
     if use_gui and (_should_prefer_gui(dual) or allow_derive):
-        logger.info(f'[启动] 对账有差异，弹出确认对话框 ({context})…')
+        log_hint = '对账有差异' if has_issues else '账本核对'
+        logger.info(f'[启动] {log_hint}，弹出确认对话框 ({context})…')
         if allow_derive:
             action = _confirm_via_gui_choice(title, message, logger=logger)
             if action is not None:
@@ -382,11 +601,18 @@ def _prompt_reconcile_mismatch_ack(
                 return 'no'
 
     if sys.stdin.isatty():
-        logger.warning(f'[启动] {context}存在差异，请终端确认')
+        if has_issues:
+            logger.warning(f'[启动] {context}存在差异，请终端确认')
+        else:
+            logger.info(f'[启动] {context}，请终端确认')
         logger.info(message)
         try:
             if allow_derive:
-                ans = input('对账有差异，仍要启动? [yes/derive/no]: ').strip().lower()
+                q = (
+                    '对账有差异，仍要启动? [yes/derive/no]: '
+                    if has_issues else '确认进入下一步? [yes/derive/no]: '
+                )
+                ans = input(q).strip().lower()
                 if ans in ('yes', 'y', 'ok', 'confirmed'):
                     return 'yes'
                 if ans in ('derive', 'spread', 'ctp', 'auto', 'd'):
@@ -401,7 +627,8 @@ def _prompt_reconcile_mismatch_ack(
             pass
 
     if use_gui:
-        logger.info(f'[启动] 对账有差异，弹出确认对话框 ({context})…')
+        log_hint = '对账有差异' if has_issues else '账本核对'
+        logger.info(f'[启动] {log_hint}，弹出确认对话框 ({context})…')
         if allow_derive:
             action = _confirm_via_gui_choice(title, message, logger=logger)
             if action is not None:
@@ -416,7 +643,7 @@ def _prompt_reconcile_mismatch_ack(
                 config['_startup_ack_retry'] = False
                 return 'no'
 
-    logger.error('[启动] 对账有差异且无法交互确认，拒绝启动')
+    logger.error('[启动] 无法交互确认，拒绝启动')
     config['_startup_ack_retry'] = False
     return 'no'
 
@@ -597,6 +824,75 @@ def _skip_interactive_ack(config: dict, logger) -> bool:
     return True
 
 
+def _build_full_startup_summary(
+    ledger, conn, config, ctp_summary='', reconcile_lines=None,
+) -> str:
+    ledger_summary, spread_summary, audit_summary = _build_startup_summary(
+        ledger, conn, config,
+    )
+    parts = [ledger_summary, spread_summary]
+    if audit_summary:
+        parts.append(audit_summary)
+    if ctp_summary:
+        parts.append(ctp_summary)
+    if reconcile_lines:
+        parts.append('\n'.join(reconcile_lines))
+    return '\n'.join(parts)
+
+
+def _run_account_decomposition_step(
+    config: dict,
+    logger,
+    ledger,
+    conn,
+) -> bool:
+    """Step 2: CTP = spread + strangle (+ external). Returns True to proceed."""
+    from account_decomposition import (
+        compute_account_decomposition,
+        format_account_decomposition_summary,
+        register_acknowledged_external,
+    )
+    from spread_ledger import store_from_conn
+
+    store = store_from_conn(conn)
+    decomp = compute_account_decomposition(conn, ledger, store, config, logger)
+    decomp_text = format_account_decomposition_summary(decomp)
+    logger.info(decomp_text)
+
+    if decomp.get('query_failed'):
+        summary = _build_full_startup_summary(ledger, conn, config) + '\n' + decomp_text
+        action = _prompt_ctp_query_failed_ack(config, logger, summary)
+        if action == 'yes':
+            logger.warning('[启动] 用户选择在 CTP 查询失败后仍启动（未校验账户分解）')
+        return action == 'yes'
+
+    if decomp.get('balanced'):
+        register_acknowledged_external(config, {}, conn)
+        logger.info('[启动] 账户分解一致（CTP = 价差 + 宽跨），进入交易')
+        return True
+
+    summary = _build_full_startup_summary(ledger, conn, config) + '\n' + decomp_text
+    action = _prompt_account_decomposition_ack(
+        config, logger, summary, decomp.get('issues') or [],
+    )
+    if action == 'yes':
+        from account_decomposition import external_ack_path
+
+        ext = decomp.get('external') or {}
+        register_acknowledged_external(config, ext, conn)
+        logger.warning(
+            '[启动] 用户已确认外部仓差额；运行中各策略仅按自身账本执行，'
+            f'已登记 {len(ext)} 个外部合约'
+        )
+        if ext:
+            logger.info(
+                f'[启动] 外部仓已持久化到 {external_ack_path(config)} '
+                '(改 CSV/外部持仓后请删此文件与 position_startup_ack.txt 再冷启动)'
+            )
+        return True
+    return False
+
+
 def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> bool:
     dual = config.get('dual_strategy') or {}
     if not dual.get('require_startup_ack', True):
@@ -621,17 +917,15 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
             )
         else:
             logger.info(f"[启动] 持仓已确认: {ack_file}")
-        config['_startup_ack_done'] = True
-        return True
+        return _finish_unattended_startup_ack(config, logger, ledger, conn)
 
     if _env_auto_confirm():
         _save_ack_file(ack_file)
         logger.info('[启动] AUTOCTP_CONFIRM=yes，已自动确认')
-        config['_startup_ack_done'] = True
-        return True
+        return _finish_unattended_startup_ack(config, logger, ledger, conn)
 
     if _skip_interactive_ack(config, logger):
-        return True
+        return _finish_unattended_startup_ack(config, logger, ledger, conn)
 
     logger.info("=" * 60)
     logger.info("启动前请核对持仓")
@@ -657,67 +951,54 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
             conn, ledger, config, logger,
         )
 
-    summary = ledger_summary + '\n' + spread_summary
-    if audit_summary:
-        summary += '\n' + audit_summary
-    summary += '\n' + ctp_summary
-    if reconcile_lines:
-        summary += '\n' + '\n'.join(reconcile_lines)
+    summary = _build_full_startup_summary(
+        ledger, conn, config, ctp_summary, reconcile_lines,
+    )
 
-    has_mismatch = bool(reconcile_issues) or reconcile_halt
-    if has_mismatch:
-        action = _prompt_reconcile_mismatch_ack(
-            config, logger, summary, reconcile_issues,
-            context='启动前对账', allow_derive=True,
+    # ── 步骤 1/2：账本核对 / derive（无论有无对账预览差异均弹出）──
+    if conn is None:
+        logger.error('[启动] 缺少 CTP 连接，无法完成账本核对与账户分解')
+        return False
+
+    while True:
+        action = _prompt_ledger_reconcile_step(
+            config, logger, summary, reconcile_issues, reconcile_halt,
         )
-    else:
-        action = _prompt_interactive_ack(
-            config, logger, ack_file, summary, conn=conn, ledger=ledger,
-        )
-    if action == 'derive':
-        if conn is None or ledger is None:
-            logger.error('[启动] 无法推导价差认领：缺少 CTP 连接或宽跨账本')
+        if action == 'no':
+            logger.error('=' * 60)
+            logger.error('未完成账本核对，程序不进入交易。')
+            logger.error('=' * 60)
             return False
-        from spread_derive import apply_derived_spread_from_ctp
-        from spread_ledger import store_from_conn
+        if action == 'derive':
+            from spread_derive import apply_derived_spread_from_ctp
+            from spread_ledger import store_from_conn
 
-        store = store_from_conn(conn)
-        claims = apply_derived_spread_from_ctp(conn, ledger, store, config, logger)
-        if claims is None:
-            logger.error('[启动] 价差认领推导失败，未进入交易')
-            return False
-        logger.info('[启动] 已确认宽跨账本，并按 CTP−宽跨 更新价差认领')
-        logger.info(format_spread_claims_summary(store_from_conn(conn)))
-
-        logger.info('=' * 60)
-        logger.info('[启动] 推导后再次对账预览')
-        halt, issues, recon_lines = _preview_reconcile(conn, ledger, config, logger)
-        if recon_lines:
-            logger.info('\n'.join(recon_lines))
-        if issues or halt:
-            post_summary = (
-                format_ledger_summary(ledger) + '\n'
-                + format_spread_claims_summary(store_from_conn(conn))
+            store = store_from_conn(conn)
+            claims = apply_derived_spread_from_ctp(
+                conn, ledger, store, config, logger,
             )
-            action = _prompt_reconcile_mismatch_ack(
-                config, logger, post_summary, issues,
-                context='推导后对账', allow_derive=False,
+            if claims is None:
+                logger.error('[启动] 价差认领推导失败，可重试 derive 或取消')
+                continue
+            logger.info('[启动] 已按 CTP−宽跨 更新价差认领')
+            logger.info(format_spread_claims_summary(store_from_conn(conn)))
+            reconcile_halt, reconcile_issues, reconcile_lines = _preview_reconcile(
+                conn, ledger, config, logger,
             )
-            if action != 'yes':
-                logger.info('[启动] 用户取消（推导后对账仍有差异）')
-                return False
-            logger.warning(
-                '[启动] 用户已确认在对账差异下启动；宽跨新开可能 open_halted'
+            summary = _build_full_startup_summary(
+                ledger, conn, config,
+                _format_ctp_positions_preview(conn, config, logger),
+                reconcile_lines,
             )
-        elif not issues:
-            logger.info('[启动] 推导后宽跨对账通过')
-        return _persist_ack(dual, ack_file, logger, config)
+            continue
+        if action == 'yes':
+            break
 
-    if action == 'yes':
-        return _persist_ack(dual, ack_file, logger, config)
+    # ── 步骤 2/2：账户分解 CTP = 价差 + 宽跨 ──
+    if not _run_account_decomposition_step(config, logger, ledger, conn):
+        logger.error('=' * 60)
+        logger.error('未完成账户分解确认，程序不进入交易。')
+        logger.error('=' * 60)
+        return False
 
-    logger.error("=" * 60)
-    logger.error("未完成持仓确认，程序不进入交易。")
-    logger.error(f"也可创建 {ack_file}，内容: confirmed {date.today().isoformat()}")
-    logger.error("=" * 60)
-    return False
+    return _persist_ack(dual, ack_file, logger, config)
