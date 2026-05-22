@@ -1,6 +1,5 @@
 """External-position JSON persist / restore on unattended startup."""
 
-import json
 import os
 import sys
 import tempfile
@@ -13,10 +12,8 @@ import ctp_bootstrap  # noqa: F401
 
 from account_decomposition import (
     external_ack_path,
-    external_maps_match,
     load_external_ack_file,
     register_acknowledged_external,
-    remove_external_ack_file,
     restore_external_ack_from_file,
     save_external_ack_file,
 )
