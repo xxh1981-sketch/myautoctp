@@ -77,3 +77,6 @@ tradeinfo/*
 data/*
 !data/.gitkeep
 !data/*example*
+
+# autotrade 执行统计（本地/实盘产出，非本仓源码）
+futuretrade/

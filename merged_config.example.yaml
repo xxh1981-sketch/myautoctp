@@ -23,6 +23,8 @@ dual_strategy:
   pause_spread_open_on_reconcile_mismatch: true
   # true：价差段 OrderRef 成交仅当合约属于 spread tradeinfo 才写入 CSV
   spread_fill_require_tradeinfo_match: true
+  # 价差段成交但合约仅宽跨认领、价差认领为 0 时不写入 spread CSV（防 OrderRef 串段）
+  spread_fill_skip_strangle_owned_instruments: true
   # true：启动 derive 时跳过 spread tradeinfo 外合约（防 CTP−宽跨 污染 CSV）
   spread_derive_require_tradeinfo_match: true
   # true：启动回放成交后自动移除 tradeinfo 外 / CTP 无仓的孤儿认领
@@ -108,8 +110,12 @@ feishu_pause_exposure_alert: true
 margin_unknown_alert_after: 3
 quarantine_alert_after_sec: 600
 reconcile_halt_open_unmatched_alert: true
-# 0=进程异常后无限指数退避重启；>0 达上限 sys.exit(3) 并飞书（适合需人工介入停机的环境）
+# 进程级异常重启上限（与 main_loop_max_consecutive_errors 互补：后者管单轮内连续异常）
+#   0 — 7×24 默认：进程内异常后指数退避重启，不退出（适合无人值守）
+#   3~10 — 连续失败达上限后 sys.exit(3) 并飞书，避免无限重启掩盖配置/对账根因
+# 实盘若需「故障停机等人介入」，建议 5 左右；纯无人值守保持 0
 max_restart_attempts: 0
+# 单次重启等待上限（秒）；与 restart_delay 指数退避配合
 max_restart_delay: 600
 
 strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设定

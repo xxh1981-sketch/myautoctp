@@ -63,14 +63,46 @@ python scripts/check_ci_readiness.py --check-unit-manifest
 python scripts/preview_startup_data.py   # 开盘前 CSV/账本（需 merged_config.yaml）
 ```
 
-`scripts/run_unit_tests.py` 现含 **38** 个测试文件（主循环重连/ halt、启动确认、入账、OrderRef、飞书等）；依赖 autotrade 的用例仍在 `pytest-full`。
+`scripts/run_unit_tests.py` 的 `UNIT_TESTS` 清单为无私有库可跑的 unit 集合（主循环 halt、启动确认、入账、OrderRef、敏感路径等）；依赖 autotrade 的用例见 `@pytest.mark.integration`。
 
 ## 提交前检查
 
 **不要**提交以下内容：
 
 - `merged_config.yaml`、`.env`（账号密码）
-- `data/*.csv`、`data/*.jsonl`、`data/*.pid`（运行时账本/流水）
+- `tradeinfo/*.csv`（非 `*example*`）、`data/` 下运行时 csv/json/jsonl/pid/ack
+- `futuretrade/`（autotrade 执行统计，如 `execution_stats/*.jsonl`）
+- `docs/GUIDE.md`、`docs/LOCAL完整说明.md`、`docs/LOCAL-CL工作清单.md`、`.cursor/`
+
+```powershell
+python scripts/check_sensitive_files.py
+ruff check .
+$env:AUTOCTP_ALLOW_MISSING_DEPS = '1'
+python scripts/run_unit_tests.py
+```
+
+## 实盘 / 运维检查清单
+
+开盘前或改配置后，建议按序核对（细节见本地 `docs/LOCAL完整说明.md`）：
+
+| 步骤 | 动作 |
+|------|------|
+| 1 | 勿与 `auto_main.py` / `straggle_main.py` 同账户并行；确认仅一个 `merged_main.py` 进程（`data/autoctp.pid`） |
+| 2 | `merged_config.yaml`：`global_margin_limit > 0`、`fail_fast_on_guard_install: true`、OrderRef 分段与 example 一致 |
+| 3 | `tradeinfo/*.csv` 与 `data/spread_positions.csv`、`data/strangle_positions.csv` 已维护；**改 CSV 后删除** `data/position_startup_ack.txt` 再冷启动 |
+| 4 | `python scripts/preview_startup_data.py` 无阻断项 |
+| 5 | 冷启动完成持仓确认（GUI/终端/`AUTOCTP_CONFIRM`）；外部仓已写入 `data/external_positions_ack.json`（若适用） |
+| 6 | 飞书「暂停」= **全停含平仓**；无人值守勿用暂停代替 halt，敞口需恢复交易后再扫 |
+| 7 | 日志中无持续 `价差日笔数查询降级为全账户口径`、`对账 halt`、`保证金 unknown`（后者连续出现需查 CTP） |
+
+**`max_restart_attempts` 建议**
+
+| 场景 | 建议值 | 行为 |
+|------|--------|------|
+| 7×24 无人值守（模板默认） | `0` | 进程内异常后指数退避重启，不退出进程 |
+| 需故障停机、人工介入 | `3`～`10` | 连续失败达上限后 `sys.exit(3)` 并飞书，避免无限重启掩盖根因 |
+
+与 `main_loop_max_consecutive_errors`（单轮内连续异常）互补：前者管**进程级**重启次数，后者管**单轮**内是否触发进程级重启。
 
 ## 修改交易逻辑时
 

@@ -38,6 +38,68 @@ def _config_symbols(config: dict, key: str) -> set:
 
 
 _UNEXPECTED_SPREAD_SYMBOL_WARNED: set = set()
+_STRANGLE_OWNED_MISREF_WARNED: set = set()
+
+
+def _spread_claim_volume(store, instrument: str) -> int:
+    """Signed spread claim for one instrument (0 if store empty / unknown)."""
+    if store is None:
+        return 0
+    inst = (instrument or '').strip()
+    if not inst:
+        return 0
+    claims = store.list_leg_claims()
+    if inst in claims:
+        return int(claims[inst])
+    upper = inst.upper()
+    for k, v in claims.items():
+        if str(k).strip().upper() == upper:
+            return int(v)
+    return 0
+
+
+def _skip_spread_fill_on_strangle_owned_only(
+    config: dict,
+    conn,
+    store,
+    instrument: str,
+) -> tuple:
+    """
+    价差段成交但合约仅由宽跨认领、价差认领为 0 → 勿写入 spread CSV。
+
+    用于拦截宽跨平仓误用 spread OrderRef 时的入账（RB 类事故）。
+    若价差 store 对该合约已有非零认领（含空头 B 腿），仍允许入账。
+    """
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('spread_fill_skip_strangle_owned_instruments', True):
+        return False, ''
+
+    if conn is None:
+        conn = config.get('_spread_fill_conn')
+    if conn is None:
+        return False, ''
+
+    from spread_position_adjust import _ledger_from_conn, merge_strangle_owned_volumes
+
+    ledger = _ledger_from_conn(conn)
+    if ledger is None:
+        return False, ''
+
+    key = (instrument or '').strip().upper()
+    if not key:
+        return False, ''
+
+    strangle_vol = int(merge_strangle_owned_volumes(ledger).get(key, 0))
+    if strangle_vol <= 0:
+        return False, ''
+
+    if _spread_claim_volume(store, instrument) != 0:
+        return False, ''
+
+    return True, (
+        f'宽跨认领 {strangle_vol} 手、价差认领 0，'
+        '疑似宽跨平仓误用价差 OrderRef'
+    )
 
 
 def _journal_path(config: dict) -> str:
@@ -108,6 +170,34 @@ def apply_spread_trade_record(
                     'applied_on': date.today().isoformat(),
                 }, config)
                 return False
+
+        skip_owned, skip_reason = _skip_spread_fill_on_strangle_owned_only(
+            config, conn, store, instrument,
+        )
+        if skip_owned:
+            key = instrument.upper()
+            tag = f'strangle_owned:{key}'
+            if tag not in _STRANGLE_OWNED_MISREF_WARNED:
+                _STRANGLE_OWNED_MISREF_WARNED.add(tag)
+                if logger:
+                    logger.warning(
+                        f'[价差持仓] 跳过入账 OrderRef={order_ref} {instrument} '
+                        f'x{volume}：{skip_reason}。'
+                        '请确认 autostraggle 平仓已使用 strategy=strangle；'
+                        '本笔仅记入 journal 不入 spread_positions.csv。'
+                    )
+            append_journal(journal_file, {
+                'dedupe_key': dedupe_key,
+                'trade_id': trade.get('trade_id', ''),
+                'order_ref': order_ref,
+                'instrument': instrument,
+                'direction': trade.get('direction'),
+                'offset': trade.get('offset'),
+                'volume': volume,
+                'skipped': 'strangle_owned_only',
+                'applied_on': date.today().isoformat(),
+            }, config)
+            return False
 
         # P4: spread OrderRef 命中但合约品种不在 spread_tradeinfo 中 → 异常
         # 配置 / 跨策略 OrderRef 串号；写入仍照旧（保持账本完整性），但每个

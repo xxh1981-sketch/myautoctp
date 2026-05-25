@@ -462,8 +462,15 @@ def run_merged_main_loop(
                                                 spread_rem = max(
                                                     0, spread_daily_limit - spread_filled,
                                                 )
-                                        except Exception:
-                                            spread_filled += 1
+                                        except Exception as e:
+                                            # 与轮初 fc=None 一致：计数不可信时禁新开，
+                                            # 不用 +1 估计（避免与真实笔数漂移）。
+                                            s_logger.warning(
+                                                '价差日笔数刷新失败，本轮余量置 0 '
+                                                f'保守禁新开: {e}'
+                                            )
+                                            spread_rem = 0
+                                            spread_open_ok = False
                                 except Exception as e:
                                     s_logger.error(f"[{item['future']}] {e}", exc_info=True)
                     elif name == 'strangle':

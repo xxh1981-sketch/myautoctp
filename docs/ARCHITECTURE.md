@@ -60,6 +60,15 @@ flowchart LR
 - 价差成交写入 CSV：`spread_fill_sync` + OrderRef 分段过滤
 - derive 后可有豁免窗口：`reconcile_grace_after_derive_sec`
 
+## 运行时产物（勿提交 git）
+
+| 路径 | 说明 |
+|------|------|
+| `data/*` | 持仓 CSV、账本、启动 ack、fill_ledger（保留 `*example*` 模板） |
+| `futuretrade/` | autotrade 执行统计（如 `execution_stats/*.jsonl`），本仓编排不写此目录 |
+
+`.gitignore` 与 `scripts/check_sensitive_files.py` 会拦截误跟踪；改 CSV 后删 `data/position_startup_ack.txt` 再冷启动。
+
 ## 残余风险告警（可选）
 
 `runtime_risk_alerts` 在飞书暂停、保证金查询 `unknown`、重连隔离、对账 halt 等场景发飞书，**不改变** halt/交易语义。见 `merged_config.example.yaml` 注释项。

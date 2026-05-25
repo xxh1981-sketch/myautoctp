@@ -86,6 +86,7 @@ merged_main_loop.py     # 主循环
 merged_config.yaml      # 本地配置（勿提交）
 tradeinfo/              # 品种表（复制 *example* 后维护）
 data/                   # 持仓 CSV、账本、确认文件
+futuretrade/            # autotrade 执行统计（运行时，已 gitignore）
 docs/LOCAL完整说明.md   # 本地完整说明（勿提交）
 tests/                  # unit + integration（integration 需私有依赖库）
 ```

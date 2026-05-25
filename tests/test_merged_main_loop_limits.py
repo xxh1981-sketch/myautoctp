@@ -174,6 +174,74 @@ class TestFillCountExceptionStillScansClose(unittest.TestCase):
         )
 
 
+class TestSpreadFilledRefreshFailureConservative(unittest.TestCase):
+    """品种扫描后刷新日笔数失败时，不用 +1 估计，本轮禁新开。"""
+
+    @patch('merged_main_loop._run_reconcile', return_value=(False, [], False, []))
+    @patch('auto_processor.process_symbol', return_value=True)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_refresh_exception_disables_open_for_round(
+        self,
+        mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_margin, mock_process, mock_recon,
+    ):
+        conn = _make_conn()
+        conn.config['daily_trade_limit'] = 10
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+
+        call_n = {'n': 0}
+
+        def _count(*args, **kwargs):
+            call_n['n'] += 1
+            if call_n['n'] == 1:
+                return 0
+            raise RuntimeError('refresh failed')
+
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'spread_fill_sync.count_spread_filled_open_orders',
+            side_effect=_count,
+        ), patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[
+                    {'future': 'SA', 'month': '609'},
+                    {'future': 'FG', 'month': '609'},
+                ],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertTrue(
+            any('价差日笔数刷新失败' in str(msg) for _, msg in logger.messages),
+        )
+        # 第二个品种仍扫描，但 remaining_limit 应为 0（禁新开）
+        self.assertGreaterEqual(mock_process.call_count, 2)
+        second_call = mock_process.call_args_list[1]
+        self.assertEqual(second_call.kwargs.get('remaining_limit'), 0)
+
+
 class TestDailyLimitWarningOnlyOnRealLimit(unittest.TestCase):
     """`日笔数达限` warning 必须只在 fc >= daily_trade_limit 时打；
     reconcile / margin halt 导致的 spread_open_ok=False 不应被误报为日限达限。"""

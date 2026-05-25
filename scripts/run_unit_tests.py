@@ -11,6 +11,7 @@ from pathlib import Path
 # 无 AUTOTRADE_ROOT 时可收集；conftest 会注入 autotrade_stubs + pairtrade stub。
 UNIT_TESTS = [
     'tests/test_atomic_io.py',
+    'tests/test_check_sensitive_files.py',
     'tests/test_data_path_guard.py',
     'tests/test_merged_config.py',
     'tests/test_process_guard.py',
