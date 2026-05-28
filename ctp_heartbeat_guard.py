@@ -20,8 +20,20 @@ Behavior
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 _INSTALLED = False
+_INSTALL_ERROR: Optional[str] = None
+
+
+def is_installed() -> bool:
+    """Return True when the heartbeat handler is currently installed."""
+    return _INSTALLED
+
+
+def get_install_error() -> Optional[str]:
+    """Return last install failure reason, or None when guard is installed."""
+    return _INSTALL_ERROR
 
 
 def _now() -> float:
@@ -130,22 +142,31 @@ def _on_heartbeat_warning(self, nTimeLapse, *, channel: str) -> None:
                 pass
 
 
-def install_heartbeat_warning() -> None:
-    """Patch ``AutoTradingSpi`` and ``AutoMarketDataSpi`` with heartbeat handlers."""
-    global _INSTALLED
+def install_heartbeat_warning() -> bool:
+    """Patch ``AutoTradingSpi`` and ``AutoMarketDataSpi`` with heartbeat handlers.
+
+    Returns True when the handler is now active (either freshly installed or
+    previously installed), False when installation failed. Inspect
+    :func:`get_install_error` for the reason.
+    """
+    global _INSTALLED, _INSTALL_ERROR
     if _INSTALLED:
-        return
+        return True
 
     try:
         import auto_trading_spi as ats
         import auto_market_data_spi as amds
-    except Exception:
-        return
+    except Exception as e:
+        _INSTALL_ERROR = f'import auto_trading_spi/auto_market_data_spi 失败: {e}'
+        return False
 
     AutoTradingSpi = getattr(ats, 'AutoTradingSpi', None)
     AutoMarketDataSpi = getattr(amds, 'AutoMarketDataSpi', None)
     if AutoTradingSpi is None or AutoMarketDataSpi is None:
-        return
+        _INSTALL_ERROR = (
+            'AutoTradingSpi / AutoMarketDataSpi 未找到（autotrade 版本不兼容？）'
+        )
+        return False
 
     def td_handler(self, nTimeLapse):
         _on_heartbeat_warning(self, nTimeLapse, channel='td')
@@ -156,3 +177,5 @@ def install_heartbeat_warning() -> None:
     AutoTradingSpi.OnHeartBeatWarning = td_handler
     AutoMarketDataSpi.OnHeartBeatWarning = md_handler
     _INSTALLED = True
+    _INSTALL_ERROR = None
+    return True

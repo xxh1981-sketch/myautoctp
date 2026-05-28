@@ -111,9 +111,23 @@ class TestExternalAckPersist(unittest.TestCase):
             cfg['_auto_restart'] = True
             cfg['spread_tradeinfo'] = [{'future': 'lc', 'month': '2609'}]
             cfg['strangle_tradeinfo'] = []
-            ack = cfg['dual_strategy']['startup_ack_file']
+            spread = os.path.join(tmp, 'spread_positions.csv')
+            strangle = os.path.join(tmp, 'strangle_positions.csv')
+            ledger_path = os.path.join(tmp, 'ledger_strangle.json')
+            for p in (spread, strangle, ledger_path):
+                with open(p, 'w', encoding='utf-8') as f:
+                    f.write('1\n')
+            dual = cfg['dual_strategy']
+            dual['spread_positions_csv'] = spread
+            dual['strangle_positions_csv'] = strangle
+            dual['startup_ack_track_ledger_files'] = True
+            cfg['strangle'] = {'ledger_path': ledger_path}
+            ack = dual['startup_ack_file']
             with open(ack, 'w', encoding='utf-8') as f:
                 f.write(f'confirmed {date.today().isoformat()}\n')
+            from startup_ack_fingerprint import save_startup_ack_fingerprint
+
+            save_startup_ack_fingerprint(cfg)
             save_external_ack_file(cfg, {'LC2609-C-198000': 1})
 
             conn = MagicMock()

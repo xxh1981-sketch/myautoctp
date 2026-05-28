@@ -26,8 +26,20 @@ preserved unchanged.
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 _INSTALLED = False
+_INSTALL_ERROR: Optional[str] = None
+
+
+def is_installed() -> bool:
+    """Return True when the health check wrapper is currently active."""
+    return _INSTALLED
+
+
+def get_install_error() -> Optional[str]:
+    """Return last install failure reason, or None when patch is installed."""
+    return _INSTALL_ERROR
 
 # Same pending-status set as ctp_recovery_patch.
 _PENDING_STATUS = frozenset({'1', '3', 'a', 'b', 'c'})
@@ -66,20 +78,28 @@ def _exchange_pending_refs(conn, logger) -> set:
     return out
 
 
-def install_health_check_patch() -> None:
-    """Replace ``HealthChecker.check_now`` with a safer auto-cancel path."""
-    global _INSTALLED
+def install_health_check_patch() -> bool:
+    """Replace ``HealthChecker.check_now`` with a safer auto-cancel path.
+
+    Returns True when the patch is now active, False when installation failed.
+    Inspect :func:`get_install_error` for the reason.
+    """
+    global _INSTALLED, _INSTALL_ERROR
     if _INSTALLED:
-        return
+        return True
 
     try:
         import auto_health_check as ahc
-    except Exception:
-        return
+    except Exception as e:
+        _INSTALL_ERROR = f'import auto_health_check 失败: {e}'
+        return False
 
     HealthChecker = getattr(ahc, 'HealthChecker', None)
     if HealthChecker is None:
-        return
+        _INSTALL_ERROR = (
+            'auto_health_check.HealthChecker 未找到（autotrade 版本不兼容？）'
+        )
+        return False
 
     original = HealthChecker.check_now
 
@@ -185,3 +205,5 @@ def install_health_check_patch() -> None:
 
     HealthChecker.check_now = patched_check_now
     _INSTALLED = True
+    _INSTALL_ERROR = None
+    return True

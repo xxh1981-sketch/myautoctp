@@ -15,7 +15,7 @@ STRANGLE_DEFAULTS = {
     'benchmark_multiplier': 0.8,
     'post_close_cooldown_sec': 300,
     'phase1_timeout': 180,
-    'phase2_timeout': 120,
+    'phase2_timeout': 15,
     'phase2_max_retries': 5,
     'phase1_spread_pct': 0.25,
     'ledger_path': 'data/ledger_strangle.json',
@@ -68,6 +68,7 @@ DUAL_STRATEGY_DEFAULTS = {
     'exclude_strangle_from_spread_reconcile': True,
     'pause_spread_open_on_reconcile_mismatch': True,
     'spread_fill_require_tradeinfo_match': True,
+    'spread_fill_skip_strangle_owned_instruments': True,
     'spread_derive_require_tradeinfo_match': True,
     'spread_purge_invalid_claims_on_startup': True,
     'spread_reconcile_fallback_heuristic': False,
@@ -86,6 +87,9 @@ DUAL_STRATEGY_DEFAULTS = {
     'startup_ack_persist': True,
     'startup_ack_require_today': False,
     'startup_ack_file': 'data/position_startup_ack.txt',
+    # 确认时记录 spread/strangle CSV 与宽跨 ledger 指纹；改文件后自动重启将拒用旧 ack
+    'startup_ack_track_ledger_files': True,
+    'startup_ack_tracked_files': [],
     'external_positions_ack_file': 'data/external_positions_ack.json',
     'external_ack_persist': True,
     'external_ack_require_today': False,
@@ -100,6 +104,9 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'fail_fast_on_guard_install': True,
     'fail_fast_on_empty_target_months': True,
     'block_start_without_margin_limit': True,
+    'compat_lock_path': 'docs/compat_lock.yaml',
+    'compat_lock_enforce': False,
+    'compat_lock_warn_dirty': True,
 }
 
 

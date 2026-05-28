@@ -39,6 +39,16 @@ def _save_ack_file(ack_file: str) -> None:
     atomic_write_text_with_newline(ack_file, f'confirmed {date.today().isoformat()}')
 
 
+def _save_ack_with_fingerprint(config: dict, ack_file: str) -> None:
+    _save_ack_file(ack_file)
+    try:
+        from startup_ack_fingerprint import save_startup_ack_fingerprint
+
+        save_startup_ack_fingerprint(config)
+    except Exception:
+        pass
+
+
 def _read_ack_text(ack_file: str) -> str:
     try:
         with open(ack_file, 'r', encoding='utf-8') as f:
@@ -794,7 +804,7 @@ def _persist_ack(dual: dict, ack_file: str, logger, config: dict = None) -> bool
     if dual.get('startup_ack_each_run', False):
         persist = False
     if persist:
-        _save_ack_file(ack_file)
+        _save_ack_with_fingerprint(config, ack_file)
         logger.info(f"[启动] 已确认，记录到 {ack_file}")
     else:
         logger.info('[启动] 已确认（本次有效，下次启动仍会询问）')
@@ -887,7 +897,7 @@ def _run_account_decomposition_step(
         if ext:
             logger.info(
                 f'[启动] 外部仓已持久化到 {external_ack_path(config)} '
-                '(改 CSV/外部持仓后请删此文件与 position_startup_ack.txt 再冷启动)'
+                '(改 CSV/外部持仓后请运行 scripts/invalidate_startup_ack.py 再冷启动)'
             )
         return True
     return False
@@ -909,18 +919,39 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
         and not manual_start
         and _file_ack_ok(config, require_today=require_today)
     ):
+        if dual.get('startup_ack_track_ledger_files', True):
+            from account_decomposition import external_ack_path
+            from startup_ack_fingerprint import check_startup_ack_fingerprint
+
+            fp_ok, fp_reasons = check_startup_ack_fingerprint(config)
+            if not fp_ok:
+                logger.error(
+                    '[启动] 持久确认与当前账本不一致，禁止无人值守跳过确认。'
+                    f'原因: {"; ".join(fp_reasons)}'
+                )
+                logger.error(
+                    '[启动] 请人工冷启动重新确认，或执行: '
+                    'python scripts/invalidate_startup_ack.py'
+                )
+                logger.error(
+                    '[启动] 相关文件: %s , %s',
+                    ack_file,
+                    external_ack_path(config),
+                )
+                return False
         ack_day = _ack_date(_read_ack_text(ack_file))
         if ack_day and ack_day != date.today() and not require_today:
             logger.info(
                 f"[启动] 使用持久确认文件 {ack_file} "
-                f"(确认日 {ack_day.isoformat()}，非今日；改 CSV 后请删文件重确认)"
+                f"(确认日 {ack_day.isoformat()}，非今日；改 CSV/ledger 后请删文件或运行 "
+                "scripts/invalidate_startup_ack.py 重确认)"
             )
         else:
             logger.info(f"[启动] 持仓已确认: {ack_file}")
         return _finish_unattended_startup_ack(config, logger, ledger, conn)
 
     if _env_auto_confirm():
-        _save_ack_file(ack_file)
+        _save_ack_with_fingerprint(config, ack_file)
         logger.info('[启动] AUTOCTP_CONFIRM=yes，已自动确认')
         return _finish_unattended_startup_ack(config, logger, ledger, conn)
 

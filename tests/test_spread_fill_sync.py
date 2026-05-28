@@ -16,6 +16,7 @@ from spread_fill_sync import (
     sync_csv_from_spread_trades,
 )
 from spread_ledger import SpreadLegStore
+from pairtrade.constants import OFFSET_CLOSE
 
 
 def _cfg(tmp, journal_name='spread_journal.jsonl'):
@@ -84,6 +85,54 @@ class TestSpreadFillSync(unittest.TestCase):
             self.assertTrue(apply_spread_trade_record(cfg, store, trade))
             self.assertFalse(apply_spread_trade_record(cfg, store, trade))
             self.assertEqual(store.list_leg_claims()['MA609C2900'], 1)
+
+    def test_skip_spread_fill_when_only_strangle_claims(self):
+        """宽跨-only 合约 + 价差段 ref：勿污染 spread_positions.csv。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['spread_tradeinfo'] = [{'future': 'rb', 'month': '2610'}]
+            store = SpreadLegStore()
+            ledger = MagicMock()
+            ledger.list_leg_claims.return_value = {'rb2610C3450': 1}
+            ledger.list_unmatched_legs.return_value = []
+            conn = MagicMock()
+            conn._runtime_state = {'_strangle_ledger': ledger}
+            cfg['_spread_fill_conn'] = conn
+            trade = {
+                'order_ref': 892,
+                'instrument': 'rb2610C3450',
+                'direction': DIRECTION_SELL,
+                'offset': OFFSET_CLOSE,
+                'volume': 1,
+                'trade_id': 'RB_CLOSE',
+            }
+            self.assertFalse(apply_spread_trade_record(cfg, store, trade))
+            self.assertEqual(store.list_leg_claims(), {})
+            journal = cfg['dual_strategy']['spread_trade_journal']
+            with open(journal, 'r', encoding='utf-8') as f:
+                body = f.read()
+            self.assertIn('strangle_owned_only', body)
+
+    def test_allow_spread_fill_when_spread_store_has_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            store = SpreadLegStore()
+            store.set_leg_claims({'MA609C2900': 1})
+            ledger = MagicMock()
+            ledger.list_leg_claims.return_value = {'MA609C2900': 2}
+            ledger.list_unmatched_legs.return_value = []
+            conn = MagicMock()
+            conn._runtime_state = {'_strangle_ledger': ledger}
+            cfg['_spread_fill_conn'] = conn
+            trade = {
+                'order_ref': 102,
+                'instrument': 'MA609C2900',
+                'direction': DIRECTION_SELL,
+                'offset': OFFSET_CLOSE,
+                'volume': 1,
+                'trade_id': 'T_close',
+            }
+            self.assertTrue(apply_spread_trade_record(cfg, store, trade))
 
     def test_spread_sell_open_short(self):
         with tempfile.TemporaryDirectory() as tmp:

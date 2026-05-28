@@ -14,7 +14,11 @@ from auto_initializer import initialize_connection, prepare_trading_environment
 
 from env_utils import resolve_manual_start
 from merged_config import load_merged_config, setup_merged_logger, prepare_merged_connection
-from merged_startup_checks import apply_startup_margin, audit_target_months
+from merged_startup_checks import (
+    apply_startup_margin,
+    audit_repo_compat_lock,
+    audit_target_months,
+)
 from merged_tradeinfo import load_dual_tradeinfo
 from merged_startup_ack import require_startup_position_ack
 from merged_main_loop import run_merged_main_loop
@@ -88,14 +92,26 @@ def main():
                 logger.warning('启动拒绝飞书通知发送失败: %s', e, exc_info=True)
             sys.exit(2)
 
+    if not audit_repo_compat_lock(config, logger):
+        sys.exit(5)
+
     from strangle_ledger_atomic import install_atomic_save
     from order_whitelist_guard import (
         install_send_order_month_guard,
         get_install_error as _whitelist_install_error,
     )
-    from ctp_heartbeat_guard import install_heartbeat_warning
-    from ctp_recovery_patch import install_recovery_patch
-    from health_check_patch import install_health_check_patch
+    from ctp_heartbeat_guard import (
+        install_heartbeat_warning,
+        get_install_error as _heartbeat_install_error,
+    )
+    from ctp_recovery_patch import (
+        install_recovery_patch,
+        get_install_error as _recovery_install_error,
+    )
+    from health_check_patch import (
+        install_health_check_patch,
+        get_install_error as _health_install_error,
+    )
     install_atomic_save()
     # 发单月白名单守卫是核心邻月错单防护；安装失败必须显式告警，
     # 不能像旧实现那样静默 return。
@@ -121,9 +137,37 @@ def main():
         if config.get('fail_fast_on_guard_install', False):
             logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
             sys.exit(4)
-    install_heartbeat_warning()
-    install_recovery_patch()
-    install_health_check_patch()
+    # 三个 CTP 补丁是断线重连/僵尸单/死链早检的关键加固，安装失败必须显式告警
+    # （否则会静默回退到 autotrade 原版较弱语义：码表超时仍清隔离、健康检查无确认即撤单等）。
+    _patch_install_errors: list = []
+    for label, install_fn, error_fn in (
+        ('CTP 心跳早检守卫', install_heartbeat_warning, _heartbeat_install_error),
+        ('CTP 重连恢复补丁', install_recovery_patch, _recovery_install_error),
+        ('健康检查补丁', install_health_check_patch, _health_install_error),
+    ):
+        if not install_fn():
+            reason = error_fn() or '未知原因'
+            _patch_install_errors.append((label, reason))
+    if _patch_install_errors:
+        detail = '\n'.join(f'- {lbl}: {rsn}' for lbl, rsn in _patch_install_errors)
+        msg = (
+            f'CTP 补丁未全部安装：\n{detail}\n'
+            '将回退到 autotrade 原版语义；建议核对 autotrade 版本与 sys.path 后再启动。'
+        )
+        logger.error('[启动自检] %s', msg)
+        try:
+            from auto_feishu import send_feishu_message
+            send_feishu_message(
+                f'⚠️ **AutoCTP 启动自检告警**\n\n{msg}',
+                config=config,
+            )
+        except Exception as notify_err:
+            logger.warning(
+                'CTP 补丁未安装飞书通知失败: %s', notify_err, exc_info=True,
+            )
+        if config.get('fail_fast_on_guard_install', False):
+            logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
+            sys.exit(4)
 
     str_cfg = config.get('strangle', {})
     ledger = StrangleLedger(str_cfg['ledger_path'])

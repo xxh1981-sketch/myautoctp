@@ -95,9 +95,12 @@ class TestStrangleFillSync(unittest.TestCase):
             self.assertEqual(n, 1)
             journal = cfg['dual_strategy']['strangle_trade_journal']
             lines = open(journal, encoding='utf-8').read().strip().splitlines()
-            self.assertEqual(len(lines), 1)
-            row = json.loads(lines[0])
-            self.assertEqual(row['order_ref'], 500010)
+            applied = [
+                json.loads(line) for line in lines
+                if json.loads(line).get('journal_state') == 'applied'
+            ]
+            self.assertEqual(len(applied), 1)
+            self.assertEqual(applied[0]['order_ref'], 500010)
 
 
 class TestWireStrangleTradeRuntime(unittest.TestCase):

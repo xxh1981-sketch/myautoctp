@@ -175,7 +175,17 @@ def _spread_close_only(conn, item, vix_engine, config, logger) -> bool:
     if enforce_hours and not is_trading_time(symbol):
         return False
     if conn._reconnect_quarantine or not conn.td_logined or not conn.md_logined:
-        return False
+        runtime = getattr(conn, '_runtime_state', None) or {}
+        allow_quarantine_close_only = bool(
+            runtime.get('_allow_quarantine_close_only', False),
+        )
+        if not (
+            allow_quarantine_close_only
+            and conn._reconnect_quarantine
+            and conn.td_logined
+            and conn.md_logined
+        ):
+            return False
 
     sym = symbol.lower()
     vix = vix_engine.calculate_vix(sym, conn, logger)
