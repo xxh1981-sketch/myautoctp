@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import MagicMock
 
 from strategy_status_snapshot import (
-    STATUS_CLOSE,
     STATUS_OPEN,
     STATUS_OTHER,
     _resolve_spread_status,

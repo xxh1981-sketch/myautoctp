@@ -9,7 +9,6 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from startup_ack_fingerprint import (
-    build_ledger_fingerprint,
     check_startup_ack_fingerprint,
     invalidate_startup_ack_files,
     save_startup_ack_fingerprint,

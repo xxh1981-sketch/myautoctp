@@ -92,7 +92,6 @@ def _spread_runtime_block(
     config: dict,
     feishu_paused: bool,
 ) -> Tuple[bool, str]:
-    sym = (symbol or "").lower()
     if feishu_paused:
         return True, "飞书全停(含平仓扫描)"
     try:
@@ -214,7 +213,7 @@ def _resolve_spread_status(
             if urgency:
                 tag = "紧急" if urgency == "urgent" else "常规"
                 return STATUS_CLOSE, f"{tag}平仓: {close_reason}"
-        except Exception as e:
+        except Exception:
             pass
 
     if symbol_positions and vix is None:
@@ -357,7 +356,6 @@ def _resolve_strangle_status(
 ) -> Tuple[str, str]:
     symbol = (item.get("future") or "").upper()
     month = str(item.get("month") or "")
-    sym = symbol.lower()
     key = (symbol, month)
     vol_of_combo = int(item.get("vol_of_combo") or 0)
 
