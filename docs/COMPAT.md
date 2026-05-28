@@ -24,6 +24,14 @@ pytest D:\autoctp\tests\ -q
 |------|---------|-----------|--------------|------|
 | （填写） | `git rev-parse --short HEAD` | … | … | 大版本上线前记录 |
 
+## 兼容锁（启动自检）
+
+仓库内提供 `docs/compat_lock.yaml`：
+
+- 填写 `expected_commits.autoctp/autotrade/autostraggle`
+- 启动时会打印三仓实际 commit 并比对
+- `compat_lock_enforce=true` 时，不匹配将拒绝启动（exit code 5）
+
 ```powershell
 # 在三仓根目录各执行，将输出填入上表
 git rev-parse --short HEAD

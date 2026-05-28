@@ -28,6 +28,7 @@ from trade_journal import (
     journal_retain_days,
     load_applied_keys,
     map_direction_offset,
+    scan_unresolved_pending,
     trade_dedupe_key,
 )
 
@@ -93,6 +94,31 @@ class TestTradeJournal(unittest.TestCase):
             keys = load_applied_keys(base, cfg)
             self.assertIn('recent', keys)
             self.assertNotIn('old', keys)
+
+    def test_load_applied_ignores_pending_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, 'j.jsonl')
+            cfg = {'dual_strategy': {'journal_daily_shards': False}}
+            append_journal(base, {'dedupe_key': 'k_pending', 'journal_state': 'pending'}, cfg)
+            append_journal(base, {'dedupe_key': 'k_applied', 'journal_state': 'applied'}, cfg)
+            keys = load_applied_keys(base, cfg)
+            self.assertIn('k_applied', keys)
+            self.assertNotIn('k_pending', keys)
+            keys_with_pending = load_applied_keys(base, cfg, include_pending=True)
+            self.assertIn('k_applied', keys_with_pending)
+            self.assertIn('k_pending', keys_with_pending)
+
+    def test_scan_unresolved_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, 'j.jsonl')
+            cfg = {'dual_strategy': {'journal_daily_shards': False}}
+            append_journal(base, {'dedupe_key': 'k1', 'journal_state': 'pending'}, cfg)
+            append_journal(base, {'dedupe_key': 'k2', 'journal_state': 'pending'}, cfg)
+            append_journal(base, {'dedupe_key': 'k2', 'journal_state': 'applied'}, cfg)
+            stats = scan_unresolved_pending(base, cfg)
+            self.assertEqual(stats['unresolved_pending'], 1)
+            self.assertEqual(stats['malformed_lines'], 0)
+            self.assertGreaterEqual(stats['total_lines'], 3)
 
     def test_map_direction_offset(self):
         d, o = map_direction_offset('0', '0')

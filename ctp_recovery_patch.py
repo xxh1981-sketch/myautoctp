@@ -9,6 +9,14 @@ Two issues addressed:
   case so the watchdog has a chance to retry next round (or escalate to
   full_recovery once ``quarantine_max_seconds`` elapses).
 
+  R3 also covers the symmetric failure: cancel was *attempted* but raised
+  (broker rate-limit, RPC error). The original wrapper used
+  ``cancel_attempted_ok or not skip_cancel`` which short-circuits to True on
+  any successful attempt path regardless of the actual cancel outcome, so a
+  raised exception still cleared quarantine. We now require *both*
+  ``not skip_cancel`` and ``cancel_attempted_ok`` before declaring recovery
+  successful — i.e. cancel must have completed without throwing.
+
 * **B5**: After ``cancel_all_pending_orders`` is *attempted*, query the
   exchange once more; if any order is still in a non-terminal state, rebuild
   ``OrderInfo`` (with FrontID / SessionID) into the local ``pending_orders``
@@ -24,8 +32,20 @@ first, then perform the extra checks.
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 _INSTALLED = False
+_INSTALL_ERROR: Optional[str] = None
+
+
+def is_installed() -> bool:
+    """Return True when the recovery wrapper is currently active."""
+    return _INSTALLED
+
+
+def get_install_error() -> Optional[str]:
+    """Return last install failure reason, or None when patch is installed."""
+    return _INSTALL_ERROR
 
 
 def _is_pending_status(order_status: str) -> bool:
@@ -108,20 +128,30 @@ def _rebuild_pending_orders_from_exchange(conn, logger) -> int:
     return rebuilt
 
 
-def install_recovery_patch() -> None:
-    """Wrap ``run_post_reconnect_recovery`` with R3 (quarantine guard) + B5 (rebuild)."""
-    global _INSTALLED
+def install_recovery_patch() -> bool:
+    """Wrap ``run_post_reconnect_recovery`` with R3 (quarantine guard) + B5 (rebuild).
+
+    Returns True when the patch is now active (either freshly installed or
+    previously installed), False when installation failed. Inspect
+    :func:`get_install_error` for the reason.
+    """
+    global _INSTALLED, _INSTALL_ERROR
     if _INSTALLED:
-        return
+        return True
 
     try:
         import auto_reconnect_recovery as arr
-    except Exception:
-        return
+    except Exception as e:
+        _INSTALL_ERROR = f'import auto_reconnect_recovery 失败: {e}'
+        return False
 
     original = getattr(arr, 'run_post_reconnect_recovery', None)
     if original is None:
-        return
+        _INSTALL_ERROR = (
+            'auto_reconnect_recovery.run_post_reconnect_recovery 未找到'
+            '（autotrade 版本不兼容？）'
+        )
+        return False
 
     def patched(conn, logger) -> None:
         # We re-implement the body to weave in the two new behaviors. We
@@ -192,11 +222,16 @@ def install_recovery_patch() -> None:
                     logger.warning(f"[重连] 重建 pending_orders 异常: {e}")
 
             # R3: Only declare recovery successful when we are confident
-            # nothing is still hanging on the exchange. Skipped cancel ⇒
-            # keep quarantine on so the next round retries.
+            # nothing is still hanging on the exchange. Two failure modes
+            # both keep quarantine on:
+            #   - ``skip_cancel`` (code table not loaded) ⇒ never attempted
+            #   - ``cancel_attempted_ok=False`` (exception during cancel) ⇒
+            #     exchange-side orders may still exist; B5 rebuild reflects
+            #     them in pending_orders but the broker call itself failed
             recovery_ok = (
                 both_channels_ready(conn)
-                and (cancel_attempted_ok or not skip_cancel)
+                and not skip_cancel
+                and cancel_attempted_ok
             )
         finally:
             if recovery_ok and conn._reconnect_quarantine:
@@ -213,3 +248,5 @@ def install_recovery_patch() -> None:
 
     arr.run_post_reconnect_recovery = patched
     _INSTALLED = True
+    _INSTALL_ERROR = None
+    return True

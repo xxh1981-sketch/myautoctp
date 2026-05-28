@@ -267,6 +267,6 @@ def format_spread_claims_audit(issues: List[str]) -> str:
         lines.append(f'  ... 共 {len(issues)} 条')
     lines.append(
         '  修复：启动确认选「CTP−宽跨推导」重写 spread_positions.csv，'
-        '或手工编辑 CSV 后删 position_startup_ack.txt 重确认'
+        '或手工编辑 CSV/ledger 后运行 scripts/invalidate_startup_ack.py 重确认'
     )
     return '\n'.join(lines)

@@ -10,6 +10,53 @@ from merged_strategy_logger import strategy_logger, strategy_logging
 from merged_vix_cache import begin_round_vix_cache, wrap_vix_engine
 
 
+def _update_bool_metric(runtime: dict, name: str, active: bool, now: float) -> None:
+    active_key = f'_metric_{name}_active'
+    since_key = f'_metric_{name}_since'
+    count_key = f'_metric_{name}_enter_count'
+    total_key = f'_metric_{name}_total_sec'
+    prev = bool(runtime.get(active_key, False))
+    if active and not prev:
+        runtime[count_key] = int(runtime.get(count_key, 0) or 0) + 1
+        runtime[since_key] = now
+    elif not active and prev:
+        since = float(runtime.get(since_key, now) or now)
+        runtime[total_key] = float(runtime.get(total_key, 0.0) or 0.0) + max(0.0, now - since)
+        runtime[since_key] = 0.0
+    elif active and not runtime.get(since_key):
+        runtime[since_key] = now
+    runtime[active_key] = bool(active)
+
+
+def _metric_total_sec(runtime: dict, name: str, now: float) -> float:
+    total = float(runtime.get(f'_metric_{name}_total_sec', 0.0) or 0.0)
+    if bool(runtime.get(f'_metric_{name}_active', False)):
+        since = float(runtime.get(f'_metric_{name}_since', now) or now)
+        total += max(0.0, now - since)
+    return total
+
+
+def _emit_runtime_metrics_if_due(conn, config: dict, logger, now: float) -> None:
+    runtime = conn._runtime_state
+    interval = float(config.get('metrics_log_interval_sec', 300) or 300)
+    last = float(runtime.get('_metrics_last_log_ts', 0.0) or 0.0)
+    if now - last < interval:
+        return
+    runtime['_metrics_last_log_ts'] = now
+    logger.info(
+        '[运行指标] '
+        f'quarantine={int(runtime.get("_metric_quarantine_enter_count", 0))}次/'
+        f'{_metric_total_sec(runtime, "quarantine", now):.0f}s '
+        f'journal_halt={int(runtime.get("_metric_journal_halt_enter_count", 0))}次/'
+        f'{_metric_total_sec(runtime, "journal_halt", now):.0f}s '
+        f'spread_halt={int(runtime.get("_metric_spread_halt_enter_count", 0))}次/'
+        f'{_metric_total_sec(runtime, "spread_halt", now):.0f}s '
+        f'strangle_halt={int(runtime.get("_metric_strangle_halt_enter_count", 0))}次/'
+        f'{_metric_total_sec(runtime, "strangle_halt", now):.0f}s '
+        f'loop_errors={int(runtime.get("_metric_loop_error_count", 0))}'
+    )
+
+
 def _prefetch_round_data(conn, logger) -> tuple:
     """Single CTP query of positions + trades shared across reconcile passes."""
     positions = None
@@ -125,10 +172,14 @@ def _sync_strangle_open_halt(conn, ledger, str_cfg: dict) -> None:
     recon_issues = list(runtime.get('_strangle_reconcile_issues') or [])
     margin_halt = bool(runtime.get('_margin_halt_open', False))
     margin_reason = runtime.get('_margin_halt_reason') or '保证金超限，暂停新开'
+    journal_halt = bool(runtime.get('_journal_halt_open', False))
+    journal_reason = runtime.get('_journal_halt_reason') or 'journal存在未完成入账，暂停新开'
 
-    target_halt = recon_halt or margin_halt
+    target_halt = recon_halt or margin_halt or journal_halt
     if recon_halt:
         target_reason = '; '.join(recon_issues[:5])
+    elif journal_halt:
+        target_reason = journal_reason
     elif margin_halt:
         target_reason = margin_reason
     else:
@@ -142,6 +193,88 @@ def _sync_strangle_open_halt(conn, ledger, str_cfg: dict) -> None:
     if current_halt == target_halt and current_reason == target_reason:
         return
     ledger.set_open_halt(target_halt, target_reason)
+
+
+def _quarantine_close_only_enabled(config: dict) -> bool:
+    q_cfg = config.get('reconnect_quarantine') or {}
+    return bool(q_cfg.get('close_only_enabled', False))
+
+
+def _can_run_quarantine_close_only(conn, config: dict) -> tuple:
+    """Strict guard for quarantine close-only mode.
+
+    This mode is intentionally conservative: it is off by default and only
+    activates when login, code table, and local pending-order state are all
+    healthy enough to reduce the chance of side effects.
+    """
+    if not _quarantine_close_only_enabled(config):
+        return False, 'disabled'
+    if not conn._reconnect_quarantine:
+        return False, 'not_quarantine'
+    if not (conn.td_logined and conn.md_logined):
+        return False, 'channels_not_ready'
+    if not getattr(conn, 'code_table_loaded', False):
+        return False, 'code_table_not_ready'
+    pending = len(getattr(conn, 'pending_orders', {}) or {})
+    if pending > 0:
+        return False, f'pending_orders={pending}'
+    return True, 'ok'
+
+
+def _run_quarantine_close_only_round(
+    conn,
+    spread_tradeinfo: list,
+    strangle_tradeinfo: list,
+    tradeinfo_by_key: dict,
+    round_vix_engine,
+    config: dict,
+    logger,
+    ledger,
+    str_executor,
+    loop_interval: float,
+) -> None:
+    from spread_ledger_execution import _spread_close_only
+    from straggle_processor import process_strangle_symbol
+    from strangle_rebalance_close_only import run_close_only_rebalance
+
+    logger.warning('[重连] 隔离期安全降级：仅执行平仓/close-only，再平衡开仓暂停')
+    conn._runtime_state['_allow_quarantine_close_only'] = True
+    try:
+        for item in spread_tradeinfo:
+            with strategy_logging(conn, logger, 'spread') as s_logger:
+                try:
+                    _spread_close_only(conn, item, round_vix_engine, config, s_logger)
+                except Exception as e:
+                    s_logger.error(f"[{item['future']}] 隔离期close-only异常: {e}", exc_info=True)
+
+        with strategy_logging(conn, logger, 'strangle') as s_logger:
+            for item in strangle_tradeinfo:
+                try:
+                    process_strangle_symbol(
+                        conn,
+                        item,
+                        round_vix_engine,
+                        config,
+                        s_logger,
+                        ledger,
+                        str_executor,
+                        circuit_breaker=None,
+                        allow_quarantine_close_only=True,
+                    )
+                except Exception as e:
+                    s_logger.error(
+                        f"[{item['future']}] 隔离期宽跨平仓扫描异常: {e}",
+                        exc_info=True,
+                    )
+            try:
+                handled = run_close_only_rebalance(str_executor, ledger, tradeinfo_by_key)
+                if handled:
+                    s_logger.info(f'隔离期close-only再平衡处理 {handled} 条')
+            except Exception as e:
+                s_logger.error(f'隔离期close-only再平衡异常: {e}', exc_info=True)
+    finally:
+        conn._runtime_state.pop('_allow_quarantine_close_only', None)
+        time.sleep(loop_interval)
 
 
 def run_merged_main_loop(
@@ -169,6 +302,10 @@ def run_merged_main_loop(
         is_connection_suspended,
         sync_connection_suspend_state,
     )
+    from strategy_status_snapshot import (
+        build_strategy_status_snapshot,
+        format_strategy_status_message,
+    )
 
     if health_checker is None:
         health_checker = HealthChecker(conn, config, logger)
@@ -187,7 +324,18 @@ def run_merged_main_loop(
     strategy_order = dual.get('strategy_order', ['spread', 'strangle'])
     str_cfg = config.get('strangle', {})
 
-    start_command_receiver(config)
+    receiver = start_command_receiver(config)
+    if receiver is not None and hasattr(receiver, 'set_status_provider'):
+        def _status_provider(command_text: str) -> str:
+            snapshot = conn._runtime_state.get('_strategy_status_snapshot')
+            if not snapshot:
+                return 'ℹ️ 策略状态尚未就绪或本轮尚未生成快照，请稍后再试。'
+            return format_strategy_status_message(snapshot, command_text=command_text)
+
+        try:
+            receiver.set_status_provider(_status_provider)
+        except Exception as e:
+            logger.debug(f'[飞书指令] 注册状态查询 provider 失败: {e}')
     loop_interval = config.get('loop_interval', 10)
     spread_daily_limit = config.get('daily_trade_limit', 100)
     strangle_buy_limit = float(str_cfg.get('daily_buy_limit_yuan', 300000))
@@ -199,6 +347,7 @@ def run_merged_main_loop(
     _health_alert_cooldown = config.get('health_alert_cooldown', 300)
     _last_reconcile_time = 0.0
     _last_margin_check_time = time.time()
+    _last_journal_check_time = 0.0
     _consecutive_loop_errors = 0
     _max_loop_errors = int(config.get('main_loop_max_consecutive_errors', 10) or 0)
     conn._runtime_state.setdefault('_margin_halt_open', False)
@@ -257,6 +406,13 @@ def run_merged_main_loop(
                                             f"健康检查飞书通知失败: {e}",
                                         )
 
+                now = time.time()
+                _update_bool_metric(
+                    conn._runtime_state, 'quarantine',
+                    bool(conn._reconnect_quarantine), now,
+                )
+                _emit_runtime_metrics_if_due(conn, config, logger, now)
+
                 if conn._reconnect_quarantine or not conn.td_logined or not conn.md_logined:
                     from auto_reconnect_recovery import check_quarantine_watchdog
                     from auto_scheduled_pause import log_main_loop_offline_skip
@@ -264,9 +420,28 @@ def run_merged_main_loop(
                     conn._runtime_state['_force_reconcile'] = True
                     if conn._reconnect_quarantine and not is_connection_suspended(config):
                         check_quarantine_watchdog(conn, config, logger)
+                    can_close_only, reason = _can_run_quarantine_close_only(conn, config)
+                    if can_close_only:
+                        begin_round_vix_cache(conn)
+                        round_vix_engine = wrap_vix_engine(vix_engine, conn, logger)
+                        _run_quarantine_close_only_round(
+                            conn=conn,
+                            spread_tradeinfo=spread_tradeinfo,
+                            strangle_tradeinfo=strangle_tradeinfo,
+                            tradeinfo_by_key=tradeinfo_by_key,
+                            round_vix_engine=round_vix_engine,
+                            config=config,
+                            logger=logger,
+                            ledger=ledger,
+                            str_executor=str_executor,
+                            loop_interval=loop_interval,
+                        )
+                        continue
                     log_main_loop_offline_skip(
                         conn, config, logger, quarantine=conn._reconnect_quarantine,
                     )
+                    if _quarantine_close_only_enabled(config) and conn._reconnect_quarantine:
+                        logger.info(f'[重连] 隔离期close-only未启用: {reason}')
                     try:
                         from runtime_risk_alerts import notify_quarantine_prolonged
                         notify_quarantine_prolonged(conn, config, logger)
@@ -311,7 +486,75 @@ def run_merged_main_loop(
                     conn, combined_tradeinfo, logger, conn._runtime_state, fp_interval,
                 )
 
-                now = time.time()
+                if (
+                    now - _last_journal_check_time >= reconcile_interval
+                    or conn._runtime_state.pop('_force_journal_check', False)
+                ):
+                    _last_journal_check_time = now
+                    try:
+                        from fill_ledger import fill_ledger_journal_path
+                        from spread_fill_sync import _journal_path as _spread_journal_path
+                        from strangle_fill_sync import _journal_path as _strangle_journal_path
+                        from trade_journal import scan_unresolved_pending
+
+                        spread_j = scan_unresolved_pending(
+                            _spread_journal_path(config), config,
+                        )
+                        strangle_j = scan_unresolved_pending(
+                            _strangle_journal_path(config), config,
+                        )
+                        fill_j = scan_unresolved_pending(
+                            fill_ledger_journal_path(config), config,
+                        )
+                        unresolved = (
+                            int(spread_j.get('unresolved_pending', 0))
+                            + int(strangle_j.get('unresolved_pending', 0))
+                            + int(fill_j.get('unresolved_pending', 0))
+                        )
+                        malformed = (
+                            int(spread_j.get('malformed_lines', 0))
+                            + int(strangle_j.get('malformed_lines', 0))
+                            + int(fill_j.get('malformed_lines', 0))
+                        )
+                        runtime = conn._runtime_state
+                        prev_halt = bool(runtime.get('_journal_halt_open', False))
+                        prev_reason = str(runtime.get('_journal_halt_reason') or '')
+                        if unresolved > 0:
+                            new_reason = (
+                                f'journal未完成入账 {unresolved} 条'
+                                f'（spread={spread_j.get("unresolved_pending", 0)}, '
+                                f'strangle={strangle_j.get("unresolved_pending", 0)}, '
+                                f'fill={fill_j.get("unresolved_pending", 0)}）'
+                            )
+                            runtime['_journal_halt_open'] = True
+                            runtime['_journal_halt_reason'] = new_reason
+                            if (not prev_halt) or (prev_reason != new_reason):
+                                logger.warning(
+                                    f'[journal] 检测到未完成入账，暂停新开: '
+                                    f'{runtime["_journal_halt_reason"]}'
+                                )
+                        else:
+                            runtime['_journal_halt_open'] = False
+                            runtime['_journal_halt_reason'] = ''
+                            if prev_halt:
+                                logger.info('[journal] 未完成入账已清零，恢复新开判定')
+                        if malformed > 0:
+                            logger.warning(
+                                f'[journal] 检测到 {malformed} 行损坏记录（已忽略），'
+                                '请关注磁盘/断电风险'
+                            )
+                    except Exception as e:
+                        logger.warning(f'[journal] 健康检查异常，保守暂停新开: {e}')
+                        conn._runtime_state['_journal_halt_open'] = True
+                        conn._runtime_state['_journal_halt_reason'] = (
+                            f'journal健康检查异常: {e}'
+                        )
+                _update_bool_metric(
+                    conn._runtime_state, 'journal_halt',
+                    bool(conn._runtime_state.get('_journal_halt_open', False)),
+                    now,
+                )
+
                 if (
                     now - _last_margin_check_time >= margin_recheck_interval
                     or conn._runtime_state.pop('_force_margin_check', False)
@@ -329,7 +572,8 @@ def run_merged_main_loop(
                             f'{reason} (限额 {config.get("global_margin_limit", 0)})'
                         )
                         spread_logger.warning(
-                            '保证金超限，暂停双策略新开/再平衡（仍允许平仓）'
+                            '保证金超限：暂停双策略新开；允许平仓、补A与平A，'
+                            '保证金halt下 B<2*A 仅允许平A修复，不再补B'
                         )
                     else:
                         # unknown: 持仓查询多次失败，沿用上轮 halt 状态
@@ -372,6 +616,8 @@ def run_merged_main_loop(
                     issues = list(runtime.get('_strangle_reconcile_issues') or [])
                     spread_halt = bool(runtime.get('_spread_reconcile_halt', False))
                     spread_issues = list(runtime.get('_spread_reconcile_issues') or [])
+                _update_bool_metric(conn._runtime_state, 'spread_halt', bool(spread_halt), now)
+                _update_bool_metric(conn._runtime_state, 'strangle_halt', bool(halt), now)
 
                 spread_open_ok = True
                 if spread_halt and dual.get('pause_spread_open_on_reconcile_mismatch', True):
@@ -382,6 +628,20 @@ def run_merged_main_loop(
                     )
                 if _margin_halt_open:
                     spread_open_ok = False
+                if conn._runtime_state.get('_journal_halt_open', False):
+                    spread_open_ok = False
+                    j_reason = str(conn._runtime_state.get('_journal_halt_reason') or '')
+                    last_warn_reason = str(
+                        conn._runtime_state.get('_journal_spread_warn_reason') or '',
+                    )
+                    if j_reason and j_reason != last_warn_reason:
+                        spread_logger.warning(
+                            'journal存在未完成入账，暂停价差新开/再平衡（仍允许平仓）: '
+                            + j_reason
+                        )
+                        conn._runtime_state['_journal_spread_warn_reason'] = j_reason
+                else:
+                    conn._runtime_state.pop('_journal_spread_warn_reason', None)
 
                 from spread_fill_sync import count_spread_filled_open_orders
                 from spread_daily_limit import resolve_spread_daily_limit
@@ -462,8 +722,15 @@ def run_merged_main_loop(
                                                 spread_rem = max(
                                                     0, spread_daily_limit - spread_filled,
                                                 )
-                                        except Exception:
-                                            spread_filled += 1
+                                        except Exception as e:
+                                            # 与轮初 fc=None 一致：计数不可信时禁新开，
+                                            # 不用 +1 估计（避免与真实笔数漂移）。
+                                            s_logger.warning(
+                                                '价差日笔数刷新失败，本轮余量置 0 '
+                                                f'保守禁新开: {e}'
+                                            )
+                                            spread_rem = 0
+                                            spread_open_ok = False
                                 except Exception as e:
                                     s_logger.error(f"[{item['future']}] {e}", exc_info=True)
                     elif name == 'strangle':
@@ -557,6 +824,35 @@ def run_merged_main_loop(
                     except Exception as e:
                         s_logger.debug(f'[风控告警] reconcile halt open: {e}')
 
+                try:
+                    snapshot = build_strategy_status_snapshot(
+                        conn=conn,
+                        ledger=ledger,
+                        config=config,
+                        spread_tradeinfo=spread_tradeinfo,
+                        strangle_tradeinfo=strangle_tradeinfo,
+                        vix_engine=round_vix_engine,
+                        spread_halt=spread_halt,
+                        strangle_reconcile_halt=halt,
+                        margin_halt_open=_margin_halt_open,
+                        spread_open_ok=spread_open_ok,
+                        spread_filled=spread_filled,
+                        spread_daily_limit=spread_daily_limit,
+                        strangle_buy_spent=strangle_buy_spent,
+                        strangle_buy_limit=strangle_buy_limit,
+                        feishu_paused=is_trading_paused(),
+                        logger=logger,
+                        journal_halt_open=bool(
+                            conn._runtime_state.get('_journal_halt_open', False),
+                        ),
+                        journal_halt_reason=str(
+                            conn._runtime_state.get('_journal_halt_reason', '') or '',
+                        ),
+                    )
+                    conn._runtime_state['_strategy_status_snapshot'] = snapshot
+                except Exception as e:
+                    logger.debug(f'[状态快照] 构建失败: {e}')
+
                 round_elapsed = time.time() - round_t0
                 logger.debug(
                     f'[主循环] 本轮 {round_elapsed:.1f}s | '
@@ -570,6 +866,9 @@ def run_merged_main_loop(
                 raise
             except Exception as e:
                 _consecutive_loop_errors += 1
+                conn._runtime_state['_metric_loop_error_count'] = (
+                    int(conn._runtime_state.get('_metric_loop_error_count', 0) or 0) + 1
+                )
                 logger.error(
                     f"[主循环] ({_consecutive_loop_errors}/{_max_loop_errors or '∞'}) {e}",
                     exc_info=True,

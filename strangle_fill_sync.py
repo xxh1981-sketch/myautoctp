@@ -51,7 +51,7 @@ def apply_strangle_trade_record(
     dedupe_key = trade_dedupe_key(trade)
 
     with journal_lock(journal_file):
-        applied = load_applied_keys(journal_file, config)
+        applied = load_applied_keys(journal_file, config, include_pending=True)
         if dedupe_key in applied:
             return False
 
@@ -59,6 +59,18 @@ def apply_strangle_trade_record(
         volume = int(trade.get('volume') or 0)
         if not instrument or volume <= 0:
             return False
+
+        append_journal(journal_file, {
+            'dedupe_key': dedupe_key,
+            'trade_id': trade.get('trade_id', ''),
+            'order_ref': order_ref,
+            'instrument': instrument,
+            'direction': trade.get('direction'),
+            'offset': trade.get('offset'),
+            'volume': volume,
+            'journal_state': 'pending',
+            'applied_on': date.today().isoformat(),
+        }, config)
 
         direction, offset = map_direction_offset(
             trade.get('direction'), trade.get('offset'),
@@ -80,6 +92,7 @@ def apply_strangle_trade_record(
             'price': trade.get('price'),
             'trade_date': trade.get('trade_date', ''),
             'trade_time': trade.get('trade_time', ''),
+            'journal_state': 'applied',
             'applied_on': date.today().isoformat(),
         }, config)
     if logger:
@@ -221,7 +234,7 @@ def sync_csv_from_strangle_trades(
     from auto_strategy_order_ref import is_strangle_order_ref
 
     journal_file = _journal_path(config)
-    applied = load_applied_keys(journal_file, config)
+    applied = load_applied_keys(journal_file, config, include_pending=True)
     new_count = 0
     for trade in trades:
         if not is_strangle_order_ref(trade.get('order_ref'), config):
