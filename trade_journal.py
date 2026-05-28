@@ -82,7 +82,12 @@ def _journal_glob_paths(base_path: str, config: dict = None) -> list:
     return paths
 
 
-def load_applied_keys(journal_base: str, config: dict = None) -> Set[str]:
+def load_applied_keys(
+    journal_base: str,
+    config: dict = None,
+    *,
+    include_pending: bool = False,
+) -> Set[str]:
     keys: Set[str] = set()
     for path in _journal_glob_paths(journal_base, config):
         with open(path, 'r', encoding='utf-8') as f:
@@ -94,10 +99,59 @@ def load_applied_keys(journal_base: str, config: dict = None) -> Set[str]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                state = str(row.get('journal_state') or '').lower()
+                if state == 'pending' and not include_pending:
+                    continue
                 key = row.get('dedupe_key') or row.get('trade_id')
                 if key:
                     keys.add(str(key))
     return keys
+
+
+def scan_unresolved_pending(
+    journal_base: str,
+    config: dict = None,
+) -> dict:
+    """Return unresolved pending rows and malformed count for one journal.
+
+    A pending row is unresolved when no later non-pending row with the same
+    dedupe key exists in retained shards.
+    """
+    pending_keys: Set[str] = set()
+    applied_keys: Set[str] = set()
+    malformed_lines = 0
+    total_lines = 0
+
+    for path in _journal_glob_paths(journal_base, config):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                total_lines += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed_lines += 1
+                    continue
+                key = row.get('dedupe_key') or row.get('trade_id')
+                if not key:
+                    continue
+                key = str(key)
+                state = str(row.get('journal_state') or '').lower()
+                if state == 'pending':
+                    pending_keys.add(key)
+                    continue
+                applied_keys.add(key)
+                if key in pending_keys:
+                    pending_keys.remove(key)
+
+    unresolved = pending_keys - applied_keys
+    return {
+        'unresolved_pending': len(unresolved),
+        'malformed_lines': malformed_lines,
+        'total_lines': total_lines,
+    }
 
 
 def append_journal(journal_base: str, row: dict, config: dict = None) -> str:

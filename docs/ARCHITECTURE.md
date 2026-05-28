@@ -67,7 +67,7 @@ flowchart LR
 | `data/*` | 持仓 CSV、账本、启动 ack、fill_ledger（保留 `*example*` 模板） |
 | `futuretrade/` | autotrade 执行统计（如 `execution_stats/*.jsonl`），本仓编排不写此目录 |
 
-`.gitignore` 与 `scripts/check_sensitive_files.py` 会拦截误跟踪；改 CSV 后删 `data/position_startup_ack.txt` 再冷启动。
+`.gitignore` 与 `scripts/check_sensitive_files.py` 会拦截误跟踪；改 CSV/ledger 后运行 `python scripts/invalidate_startup_ack.py` 再冷启动（删 ack + .meta.json + external JSON）。
 
 ## 残余风险告警（可选）
 

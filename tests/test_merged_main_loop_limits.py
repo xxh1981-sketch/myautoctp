@@ -688,5 +688,134 @@ class TestRebalanceCloseOnlyOnStrangleReconcileHalt(unittest.TestCase):
         )
 
 
+class TestJournalHaltMainLoop(unittest.TestCase):
+    """journal unresolved pending should conservatively halt opens while
+    preserving close scan behavior (same as daily-limit semantics)."""
+
+    @patch('merged_main_loop._run_reconcile', return_value=(False, [], False, []))
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_unresolved_pending_sets_journal_halt_and_spread_remaining_zero(
+        self,
+        mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_recon,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'trade_journal.scan_unresolved_pending',
+            side_effect=[
+                {'unresolved_pending': 1, 'malformed_lines': 0, 'total_lines': 1},
+                {'unresolved_pending': 0, 'malformed_lines': 0, 'total_lines': 1},
+                {'unresolved_pending': 0, 'malformed_lines': 0, 'total_lines': 1},
+            ],
+        ), patch('spread_fill_sync.count_spread_filled_open_orders', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertTrue(
+            conn._runtime_state.get('_journal_halt_open', False),
+            'unresolved pending should set journal halt open',
+        )
+        self.assertIn(
+            'journal未完成入账',
+            str(conn._runtime_state.get('_journal_halt_reason', '')),
+        )
+        self.assertGreaterEqual(mock_process.call_count, 1)
+        self.assertEqual(
+            mock_process.call_args_list[0].kwargs.get('remaining_limit'), 0,
+            'journal halt should set spread remaining_limit=0 (open disabled)',
+        )
+        self.assertTrue(
+            any('暂停新开' in str(msg) for _, msg in logger.messages),
+        )
+
+    @patch('merged_main_loop._run_reconcile', return_value=(False, [], False, []))
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_journal_health_check_exception_conservatively_halts(
+        self,
+        mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_recon,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'trade_journal.scan_unresolved_pending',
+            side_effect=RuntimeError('journal read failed'),
+        ), patch('spread_fill_sync.count_spread_filled_open_orders', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertTrue(conn._runtime_state.get('_journal_halt_open', False))
+        self.assertIn(
+            'journal健康检查异常',
+            str(conn._runtime_state.get('_journal_halt_reason', '')),
+        )
+        self.assertTrue(
+            any('健康检查异常' in str(msg) for _, msg in logger.messages),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

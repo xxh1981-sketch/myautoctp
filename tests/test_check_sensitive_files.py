@@ -28,7 +28,10 @@ class TestCheckSensitiveFiles(unittest.TestCase):
 
     def test_blocks_local_docs(self):
         self.assertTrue(_is_blocked_path('docs/LOCAL完整说明.md'))
+        self.assertTrue(_is_blocked_path('docs/UNATTENDED_CHECKLIST.md'))
+        self.assertTrue(_is_blocked_path('docs/compat_lock.yaml'))
         self.assertFalse(_is_blocked_path('docs/ARCHITECTURE.md'))
+        self.assertFalse(_is_blocked_path('docs/compat_lock.example.yaml'))
 
     def test_blocks_cursor_rules(self):
         self.assertTrue(_is_blocked_path('.cursor/rules/foo.mdc'))

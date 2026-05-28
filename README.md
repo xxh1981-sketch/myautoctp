@@ -17,6 +17,7 @@
 |------|------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 双策略编排、halt 路径、认领模型（公开脱敏） |
 | [docs/COMPAT.md](docs/COMPAT.md) | 三仓版本配套与 CI 说明 |
+| [docs/UNATTENDED_CHECKLIST.md](docs/UNATTENDED_CHECKLIST.md) | 无人值守上线/巡检核对清单 |
 | **`docs/LOCAL完整说明.md`** | 完整使用说明（**仅本地**，已 `.gitignore`，含 halt 与执行路径约定） |
 | [docs/PUBLIC_REPO.md](docs/PUBLIC_REPO.md) | 公开本仓时的边界与自检 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发、测试与提交规范 |
@@ -55,7 +56,7 @@ python merged_main.py
 | 项 | 行为 |
 |----|------|
 | 启动确认 | **人工冷启动**弹窗三选一（含 **价差=CTP−宽跨并确认**）；**进程内自动重启**跳过 |
-| 改 CSV 后 | 删除 `position_startup_ack.txt` 再启动，或设 `startup_ack_require_today: true` |
+| 改 CSV/ledger 后 | 运行 `python scripts/invalidate_startup_ack.py` 再启动，或设 `startup_ack_require_today: true` |
 | 无显示器服务器 | `startup_ack_use_gui: false`（模板已设）；首次可用 `$env:AUTOCTP_CONFIRM='yes'` 一次性确认 |
 | fail-fast | 邻月守卫未安装、`target_months` 为空、`global_margin_limit=0` → **拒绝启动** |
 | 飞书「暂停」 | **全停含平仓**；无人值守勿用暂停代替 halt，敞口需恢复后再扫 |
@@ -74,7 +75,7 @@ python merged_main.py
 | **宽跨日限** | `daily_buy_limit_yuan`；达限仍允许平仓 |
 | **宽跨持仓** | 开盘前维护 `data/strangle_positions.csv` |
 | **价差认领** | `data/spread_positions.csv` 或启动 derive；建仓/再平衡/平仓均认该账本 |
-| **7×24 默认** | 持久启动确认 + fail-fast 自检；改 CSV 删 ack 重确认 |
+| **7×24 默认** | 持久启动确认 + fail-fast 自检；改 CSV/ledger 运行 `invalidate_startup_ack.py` 重确认 |
 
 ---
 
@@ -110,6 +111,7 @@ CI 与私有库 clone 见 [docs/CI.md](docs/CI.md)。三仓版本见 [docs/COMPA
 | `scripts/dev_check.ps1` | ruff + 敏感文件检查 + unit 测试 |
 | `scripts/preview_startup_data.py` | 开盘前离线检查 CSV/账本（不连 CTP） |
 | `scripts/backup_data.ps1` | 备份 `data/` 运行时文件 |
+| `scripts/invalidate_startup_ack.py` | 失效启动确认（可选 `--account-switch` 清理 journal/fill_ledger 并重置宽跨 runtime） |
 
 ---
 

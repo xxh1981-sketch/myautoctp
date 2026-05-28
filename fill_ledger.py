@@ -205,7 +205,9 @@ def apply_fill_record(
     journal_file = journal_file or fill_ledger_journal_path(config)
     dedupe_key = trade_dedupe_key(trade)
 
-    if dedupe_key in load_applied_keys(journal_file, config):
+    if dedupe_key in load_applied_keys(
+        journal_file, config, include_pending=True,
+    ):
         return False
 
     row = build_fill_row(conn, trade, config)
@@ -213,8 +215,21 @@ def apply_fill_record(
         return False
 
     with journal_lock(journal_file):
-        if dedupe_key in load_applied_keys(journal_file, config):
+        if dedupe_key in load_applied_keys(
+            journal_file, config, include_pending=True,
+        ):
             return False
+        append_journal(journal_file, {
+            'dedupe_key': dedupe_key,
+            'trade_id': trade.get('trade_id', ''),
+            'order_ref': trade.get('order_ref', 0),
+            'instrument': row['instrument_code'],
+            'fill_side': row['fill_side'],
+            'strategy': row['strategy'],
+            'trade_date': trade.get('trade_date', ''),
+            'trade_time': trade.get('trade_time', ''),
+            'journal_state': 'pending',
+        }, config)
         csv_path = fill_ledger_csv_path(config)
         append_fill_row(csv_path, row)
         append_journal(journal_file, {
@@ -226,6 +241,7 @@ def apply_fill_record(
             'strategy': row['strategy'],
             'trade_date': trade.get('trade_date', ''),
             'trade_time': trade.get('trade_time', ''),
+            'journal_state': 'applied',
         }, config)
     if logger:
         logger.info(
@@ -305,7 +321,7 @@ def sync_fill_ledger_from_trades(
         return 0
 
     journal_file = fill_ledger_journal_path(config)
-    applied = load_applied_keys(journal_file, config)
+    applied = load_applied_keys(journal_file, config, include_pending=True)
     new_count = 0
     for trade in trades:
         key = trade_dedupe_key(trade)

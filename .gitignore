@@ -48,6 +48,10 @@ desktop.ini
 docs/GUIDE.md
 docs/LOCAL完整说明.md
 docs/LOCAL-CL工作清单.md
+docs/UNATTENDED_CHECKLIST.md
+# 三仓 commit 锁（本机 git rev-parse 结果，复制 example 后填写）
+docs/compat_lock.yaml
+!docs/compat_lock.example.yaml
 
 # ---------------------------------------------------------------------------
 # Secrets

@@ -92,6 +92,12 @@ class TestStartupAckFile(unittest.TestCase):
     def test_require_startup_ack_skips_interactive_on_auto_restart_with_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             ack_file = os.path.join(tmp, 'position_startup_ack.txt')
+            spread = os.path.join(tmp, 'spread_positions.csv')
+            strangle = os.path.join(tmp, 'strangle_positions.csv')
+            ledger_path = os.path.join(tmp, 'ledger_strangle.json')
+            for p in (spread, strangle, ledger_path):
+                with open(p, 'w', encoding='utf-8') as f:
+                    f.write('1\n')
             with open(ack_file, 'w', encoding='utf-8') as f:
                 f.write(f'confirmed {date.today().isoformat()}\n')
             config = {
@@ -102,8 +108,15 @@ class TestStartupAckFile(unittest.TestCase):
                     'startup_ack_each_run': False,
                     'startup_ack_require_today': False,
                     'startup_ack_file': ack_file,
+                    'spread_positions_csv': spread,
+                    'strangle_positions_csv': strangle,
+                    'startup_ack_track_ledger_files': True,
                 },
+                'strangle': {'ledger_path': ledger_path},
             }
+            from startup_ack_fingerprint import save_startup_ack_fingerprint
+
+            save_startup_ack_fingerprint(config)
             ledger = MagicMock()
             ledger.list_positions.return_value = []
             ledger.list_leg_claims.return_value = {}
@@ -113,6 +126,33 @@ class TestStartupAckFile(unittest.TestCase):
             ok = require_startup_position_ack(config, logger, ledger, conn=None)
             self.assertTrue(ok)
             logger.info.assert_any_call(f'[启动] 持仓已确认: {ack_file}')
+
+    def test_auto_restart_rejects_stale_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = os.path.join(tmp, 'position_startup_ack.txt')
+            spread = os.path.join(tmp, 'spread_positions.csv')
+            with open(spread, 'w', encoding='utf-8') as f:
+                f.write('1\n')
+            with open(ack_file, 'w', encoding='utf-8') as f:
+                f.write(f'confirmed {date.today().isoformat()}\n')
+            config = {
+                '_manual_start': False,
+                '_auto_restart': True,
+                'dual_strategy': {
+                    'require_startup_ack': True,
+                    'startup_ack_each_run': False,
+                    'startup_ack_file': ack_file,
+                    'spread_positions_csv': spread,
+                    'strangle_positions_csv': os.path.join(tmp, 's.csv'),
+                    'startup_ack_track_ledger_files': True,
+                },
+                'strangle': {'ledger_path': os.path.join(tmp, 'l.json')},
+            }
+            logger = MagicMock()
+            ok = require_startup_position_ack(config, logger, MagicMock(), conn=None)
+            self.assertFalse(ok)
+            logged = ' '.join(str(c) for c in logger.error.call_args_list)
+            self.assertIn('指纹', logged)
 
     def test_manual_start_ignores_ack_file_and_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -89,7 +89,7 @@ python scripts/run_unit_tests.py
 |------|------|
 | 1 | 勿与 `auto_main.py` / `straggle_main.py` 同账户并行；确认仅一个 `merged_main.py` 进程（`data/autoctp.pid`） |
 | 2 | `merged_config.yaml`：`global_margin_limit > 0`、`fail_fast_on_guard_install: true`、OrderRef 分段与 example 一致 |
-| 3 | `tradeinfo/*.csv` 与 `data/spread_positions.csv`、`data/strangle_positions.csv` 已维护；**改 CSV 后删除** `data/position_startup_ack.txt` 再冷启动 |
+| 3 | `tradeinfo/*.csv` 与 `data/spread_positions.csv`、`data/strangle_positions.csv` 已维护；**改 CSV/ledger 后运行** `python scripts/invalidate_startup_ack.py` 再冷启动 |
 | 4 | `python scripts/preview_startup_data.py` 无阻断项 |
 | 5 | 冷启动完成持仓确认（GUI/终端/`AUTOCTP_CONFIRM`）；外部仓已写入 `data/external_positions_ack.json`（若适用） |
 | 6 | 飞书「暂停」= **全停含平仓**；无人值守勿用暂停代替 halt，敞口需恢复交易后再扫 |

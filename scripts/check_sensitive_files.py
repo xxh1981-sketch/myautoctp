@@ -17,6 +17,8 @@ BLOCKED_DOCS_EXACT = {
     "docs/GUIDE.md",
     "docs/LOCAL完整说明.md",
     "docs/LOCAL-CL工作清单.md",
+    "docs/UNATTENDED_CHECKLIST.md",
+    "docs/compat_lock.yaml",
 }
 
 
