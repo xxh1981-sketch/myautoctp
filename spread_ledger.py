@@ -6,7 +6,7 @@ import re
 import threading
 from typing import Dict, Optional
 
-from auto_connection import extract_symbol_prefix
+from spread_contract_utils import symbol_prefix as _symbol_prefix
 
 
 class SpreadLegStore:
@@ -52,7 +52,7 @@ class SpreadLegStore:
             return False
         if re.search(r'[-]?C[-]?\d', inst):
             return True
-        prefix = extract_symbol_prefix(inst)
+        prefix = _symbol_prefix(inst)
         if not prefix:
             return False
         tail = inst[len(prefix):].upper()

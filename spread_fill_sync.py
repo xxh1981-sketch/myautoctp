@@ -9,8 +9,10 @@ from typing import List, Optional
 
 from import_spread_positions import (
     apply_fill_to_spread_csv,
+    read_spread_claim_volume,
     sync_spread_leg_claims,
 )
+from import_spread_positions import spread_fill_delta
 from trade_journal import (
     append_journal,
     load_applied_keys,
@@ -220,6 +222,14 @@ def apply_spread_trade_record(
                         '配置错乱，请核对 strategy_order_ref。'
                     )
 
+        direction, offset = map_direction_offset(
+            trade.get('direction'), trade.get('offset'),
+        )
+        # 记录 pre/post（on-disk signed claim 与应用后净额），供自愈器在崩溃后
+        # 幂等判断 CSV 是否已体现本笔（cur==post 已应用；cur==pre 未应用）。
+        # 读 CSV 失败会抛出（不写 pending，本轮中止、下轮重试），不污染账本。
+        pre_volume = read_spread_claim_volume(config, instrument)
+        post_volume = pre_volume + spread_fill_delta(direction, offset, volume)
         append_journal(journal_file, {
             'dedupe_key': dedupe_key,
             'trade_id': trade.get('trade_id', ''),
@@ -228,13 +238,12 @@ def apply_spread_trade_record(
             'direction': trade.get('direction'),
             'offset': trade.get('offset'),
             'volume': volume,
+            'pre_volume': pre_volume,
+            'post_volume': post_volume,
             'journal_state': 'pending',
             'applied_on': date.today().isoformat(),
         }, config)
 
-        direction, offset = map_direction_offset(
-            trade.get('direction'), trade.get('offset'),
-        )
         claims = apply_fill_to_spread_csv(
             config, instrument, direction, offset, volume, logger,
         )

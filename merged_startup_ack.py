@@ -203,6 +203,69 @@ _DERIVE_SPREAD_HELP = (
     '并视为已确认宽跨账本无误。'
 )
 
+_INVALIDATE_LABEL = '清除旧确认并刷新'
+_INVALIDATE_HELP = (
+    '删除旧的启动确认 / 指纹 / 外部仓登记（不会修改持仓 CSV）；'
+    '改过账本后用它重新核对，无需手动运行 scripts/invalidate_startup_ack.py。'
+)
+
+
+def _detect_stale_ack(config: dict) -> tuple:
+    """
+    检测磁盘上是否存在与当前账本不一致的旧启动确认产物。
+
+    返回 (stale, reasons)。stale=True 表示存在持久 ack 且其指纹与当前
+    spread/strangle CSV、宽跨 ledger 不一致——此时应清除旧确认后重新核对。
+    仅在「有持久 ack + 有指纹文件 + 跟踪开启」时给出 stale，避免每次冷启动误报。
+    """
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('startup_ack_track_ledger_files', True):
+        return False, []
+    ack_file = _ack_path(config)
+    if not (os.path.isfile(ack_file) and _ack_valid(_read_ack_text(ack_file))):
+        return False, []
+    try:
+        from startup_ack_fingerprint import (
+            check_startup_ack_fingerprint,
+            load_startup_ack_fingerprint,
+        )
+    except Exception:
+        return False, []
+    if load_startup_ack_fingerprint(config) is None:
+        return False, []
+    ok, reasons = check_startup_ack_fingerprint(config)
+    return (not ok), list(reasons or [])
+
+
+def _run_invalidate_ack(config: dict, logger) -> list:
+    """窗口内一键失效启动确认（等价 scripts/invalidate_startup_ack.py 默认行为）。"""
+    try:
+        from startup_ack_fingerprint import invalidate_startup_ack_files
+
+        removed = invalidate_startup_ack_files(config)
+    except Exception as e:
+        logger.warning(f'[启动] 清除旧确认失败: {e}', exc_info=True)
+        return []
+    if removed:
+        logger.warning('[启动] 已清除旧启动确认产物（请重新核对后确认）:')
+        for path in removed:
+            logger.warning(f'  - {path}')
+    else:
+        logger.info('[启动] 无旧启动确认产物可清除')
+    return removed
+
+
+def _format_stale_ack_warning(reasons: list) -> str:
+    if not reasons:
+        return ''
+    lines = ['⚠ 【旧确认已失配】检测到上次确认后账本被修改：']
+    for msg in list(reasons)[:10]:
+        lines.append(f'  • {msg}')
+    lines.append(
+        '建议点「' + _INVALIDATE_LABEL + '」清除旧确认后重新核对，再确认启动。'
+    )
+    return '\n'.join(lines)
+
 
 def _preview_reconcile(conn, ledger, config: dict, logger) -> tuple:
     """Return (halt, issues, log_lines). Includes strangle + spread reconcile preview."""
@@ -259,10 +322,13 @@ def _preview_reconcile(conn, ledger, config: dict, logger) -> tuple:
             logger.info('[对账预览] 宽跨与价差均无差异')
         return halt, all_issues, lines
     except Exception as e:
-        msg = f'[对账预览] {e}'
+        # H2: 预览异常时不能当作"无差异"放行——否则用户可能在状态未知的情况下
+        # 直接点 yes/derive。保守返回 halt=True，强制对账步骤以"不一致"姿态弹出，
+        # 要求人工显式确认或重试，避免带着未知真相进入交易。
+        msg = f'[对账预览] 预览失败，保守按对账不一致处理（请重试或人工核对）: {e}'
         if logger:
-            logger.warning(msg)
-        return False, [str(e)], [msg]
+            logger.warning(msg, exc_info=True)
+        return True, [f'对账预览失败: {e}'], [msg]
 
 
 def _build_startup_summary(ledger, conn, config=None) -> tuple:
@@ -387,10 +453,12 @@ def _prompt_ledger_reconcile_step(
     summary: str,
     issues: list,
     reconcile_halt: bool = False,
+    allow_invalidate: bool = False,
+    stale_reasons: list = None,
 ) -> str:
     """
     冷启动第一步：账本核对 / derive（无论对账预览有无差异均弹出）。
-    返回 yes | derive | no。
+    返回 yes | derive | invalidate | no。
     """
     has_issues = bool(issues) or reconcile_halt
     if has_issues:
@@ -404,11 +472,16 @@ def _prompt_ledger_reconcile_step(
             '【步骤 1/2 账本核对】对账预览无差异。\n'
             '请核对宽跨/价差账本；可直接确认进入下一步，或使用 derive 更新价差 CSV。\n'
         )
+    if allow_invalidate:
+        stale_block = _format_stale_ack_warning(stale_reasons or [])
+        if stale_block:
+            header = stale_block + '\n\n' + header
     return _prompt_reconcile_mismatch_ack(
         config, logger, summary, issues,
         context='账本核对',
         allow_derive=True,
         header=header,
+        allow_invalidate=allow_invalidate,
     )
 
 
@@ -551,10 +624,11 @@ def _prompt_reconcile_mismatch_ack(
     context: str = '启动前对账',
     allow_derive: bool = True,
     header: str = None,
+    allow_invalidate: bool = False,
 ) -> str:
     """
     对账有差异时弹出确认（GUI 优先）。
-    返回 yes | derive | no。
+    返回 yes | derive | invalidate | no。
     """
     dual = config.get('dual_strategy') or {}
     if not dual.get('startup_ack_interactive', True):
@@ -581,8 +655,10 @@ def _prompt_reconcile_mismatch_ack(
         prompt += (
             '  确认 → 进入下一步\n'
             f'  derive → {_DERIVE_SPREAD_LABEL}\n'
-            '  取消 → 不启动\n'
         )
+        if allow_invalidate:
+            prompt += f'  invalidate → {_INVALIDATE_LABEL}\n'
+        prompt += '  取消 → 不启动\n'
     else:
         prompt += '  yes → 仍要启动    no → 取消\n'
 
@@ -597,7 +673,9 @@ def _prompt_reconcile_mismatch_ack(
         log_hint = '对账有差异' if has_issues else '账本核对'
         logger.info(f'[启动] {log_hint}，弹出确认对话框 ({context})…')
         if allow_derive:
-            action = _confirm_via_gui_choice(title, message, logger=logger)
+            action = _confirm_via_gui_choice(
+                title, message, logger=logger, allow_invalidate=allow_invalidate,
+            )
             if action is not None:
                 if action == 'no':
                     config['_startup_ack_retry'] = False
@@ -618,15 +696,18 @@ def _prompt_reconcile_mismatch_ack(
         logger.info(message)
         try:
             if allow_derive:
+                opts = 'yes/derive/invalidate/no' if allow_invalidate else 'yes/derive/no'
                 q = (
-                    '对账有差异，仍要启动? [yes/derive/no]: '
-                    if has_issues else '确认进入下一步? [yes/derive/no]: '
+                    f'对账有差异，仍要启动? [{opts}]: '
+                    if has_issues else f'确认进入下一步? [{opts}]: '
                 )
                 ans = input(q).strip().lower()
                 if ans in ('yes', 'y', 'ok', 'confirmed'):
                     return 'yes'
                 if ans in ('derive', 'spread', 'ctp', 'auto', 'd'):
                     return 'derive'
+                if allow_invalidate and ans in ('invalidate', 'inv', 'clear', 'reset'):
+                    return 'invalidate'
             else:
                 ans = input('对账有差异，仍要启动? [yes/no]: ').strip().lower()
                 if ans in ('yes', 'y', 'ok', 'confirmed'):
@@ -640,7 +721,9 @@ def _prompt_reconcile_mismatch_ack(
         log_hint = '对账有差异' if has_issues else '账本核对'
         logger.info(f'[启动] {log_hint}，弹出确认对话框 ({context})…')
         if allow_derive:
-            action = _confirm_via_gui_choice(title, message, logger=logger)
+            action = _confirm_via_gui_choice(
+                title, message, logger=logger, allow_invalidate=allow_invalidate,
+            )
             if action is not None:
                 if action == 'no':
                     config['_startup_ack_retry'] = False
@@ -658,9 +741,14 @@ def _prompt_reconcile_mismatch_ack(
     return 'no'
 
 
-def _confirm_via_gui_choice(title: str, message: str, logger=None) -> Optional[str]:
+def _confirm_via_gui_choice(
+    title: str,
+    message: str,
+    logger=None,
+    allow_invalidate: bool = False,
+) -> Optional[str]:
     """
-    GUI 三选一：yes | derive | no
+    GUI 选择框：yes | derive | no（allow_invalidate=True 时增加 invalidate）。
     Returns None if GUI unavailable (caller may fall back to terminal).
     """
     try:
@@ -682,9 +770,12 @@ def _confirm_via_gui_choice(title: str, message: str, logger=None) -> Optional[s
         txt.insert('1.0', message)
         txt.config(state=tk.DISABLED)
 
+        hint_text = _DERIVE_SPREAD_HELP
+        if allow_invalidate:
+            hint_text = _DERIVE_SPREAD_HELP + '\n' + _INVALIDATE_HELP
         hint = tk.Label(
             root,
-            text=_DERIVE_SPREAD_HELP,
+            text=hint_text,
             justify=tk.LEFT,
             wraplength=700,
         )
@@ -710,6 +801,13 @@ def _confirm_via_gui_choice(title: str, message: str, logger=None) -> Optional[s
             width=24,
             command=lambda: _done('derive'),
         ).pack(side=tk.LEFT, padx=6)
+        if allow_invalidate:
+            tk.Button(
+                btn_row,
+                text=_INVALIDATE_LABEL,
+                width=18,
+                command=lambda: _done('invalidate'),
+            ).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_row, text='取消', width=10, command=lambda: _done('no')).pack(
             side=tk.LEFT, padx=6,
         )
@@ -991,15 +1089,37 @@ def require_startup_position_ack(config: dict, logger, ledger, conn=None) -> boo
         logger.error('[启动] 缺少 CTP 连接，无法完成账本核对与账户分解')
         return False
 
+    # 自动检测「旧确认与当前账本不一致」：是则在确认窗给出一键清除按钮，
+    # 无需人工记忆何时运行 scripts/invalidate_startup_ack.py。
+    stale, stale_reasons = _detect_stale_ack(config)
+    if stale:
+        logger.warning(
+            '[启动] 检测到旧启动确认与当前账本不一致（可在确认窗一键清除）: %s',
+            '; '.join(stale_reasons),
+        )
+
     while True:
         action = _prompt_ledger_reconcile_step(
             config, logger, summary, reconcile_issues, reconcile_halt,
+            allow_invalidate=stale, stale_reasons=stale_reasons,
         )
         if action == 'no':
             logger.error('=' * 60)
             logger.error('未完成账本核对，程序不进入交易。')
             logger.error('=' * 60)
             return False
+        if action == 'invalidate':
+            _run_invalidate_ack(config, logger)
+            stale, stale_reasons = _detect_stale_ack(config)
+            reconcile_halt, reconcile_issues, reconcile_lines = _preview_reconcile(
+                conn, ledger, config, logger,
+            )
+            summary = _build_full_startup_summary(
+                ledger, conn, config,
+                _format_ctp_positions_preview(conn, config, logger),
+                reconcile_lines,
+            )
+            continue
         if action == 'derive':
             from spread_derive import apply_derived_spread_from_ctp
             from spread_ledger import store_from_conn

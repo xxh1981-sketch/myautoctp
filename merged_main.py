@@ -79,6 +79,11 @@ def main():
             acquire_singleton(
                 pid_path=config.get('singleton_pid_path'),
                 logger=logger,
+                # C-02: 默认 fail-closed。正常平台（Windows msvcrt / POSIX fcntl）
+                # 硬锁恒可用，该开关永不触发；仅当运行环境缺锁原语（罕见）时，
+                # 拒绝带病裸跑——避免软检测漏判导致双开破坏 journal 去重。
+                # 如确需在无锁原语环境运行，可显式置 require_hard_singleton_lock=false。
+                require_hard_lock=bool(config.get('require_hard_singleton_lock', True)),
             )
         except AlreadyRunningError as e:
             logger.error(str(e))
@@ -95,7 +100,10 @@ def main():
     if not audit_repo_compat_lock(config, logger):
         sys.exit(5)
 
-    from strangle_ledger_atomic import install_atomic_save
+    from strangle_ledger_atomic import (
+        install_atomic_save,
+        get_install_error as _atomic_save_install_error,
+    )
     from order_whitelist_guard import (
         install_send_order_month_guard,
         get_install_error as _whitelist_install_error,
@@ -112,7 +120,29 @@ def main():
         install_health_check_patch,
         get_install_error as _health_install_error,
     )
-    install_atomic_save()
+    # 宽跨账本原子保存补丁：失败则 _save 回退到非原子写，kill/断电可能损坏
+    # ledger JSON，必须显式告警（不能像旧实现那样静默 return）。
+    if not install_atomic_save():
+        reason = _atomic_save_install_error() or '未知原因'
+        msg = (
+            f'宽跨账本原子保存补丁未安装：{reason}。'
+            'StrangleLedger._save 将回退非原子写，kill/断电可能损坏 ledger JSON；'
+            '建议检查 autostraggle 版本与 sys.path 后再启动。'
+        )
+        logger.error('[启动自检] %s', msg)
+        try:
+            from auto_feishu import send_feishu_message
+            send_feishu_message(
+                f'⚠️ **AutoCTP 启动自检告警**\n\n{msg}',
+                config=config,
+            )
+        except Exception as notify_err:
+            logger.warning(
+                '原子保存补丁未安装飞书通知失败: %s', notify_err, exc_info=True,
+            )
+        if config.get('fail_fast_on_guard_install', False):
+            logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
+            sys.exit(4)
     # 发单月白名单守卫是核心邻月错单防护；安装失败必须显式告警，
     # 不能像旧实现那样静默 return。
     whitelist_ok = install_send_order_month_guard()
@@ -168,6 +198,17 @@ def main():
         if config.get('fail_fast_on_guard_install', False):
             logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
             sys.exit(4)
+
+    # 周末非交易抑制（仅双休日）：失败不致命，仅退回"周末照常尝试重连"的噪音行为。
+    from weekend_pause_patch import (
+        install_weekend_pause,
+        get_install_error as _weekend_install_error,
+    )
+    if not install_weekend_pause():
+        logger.warning(
+            '[启动自检] 周末非交易抑制补丁未安装：%s（周末将照常按 09/13/21 尝试重连）',
+            _weekend_install_error() or '未知原因',
+        )
 
     str_cfg = config.get('strangle', {})
     ledger = StrangleLedger(str_cfg['ledger_path'])
@@ -226,6 +267,28 @@ def main():
             )
             sync_spread_leg_claims(spread_store, config, logger=logger)
             sync_fill_ledger_from_trades(conn, config, logger)
+
+            # 崩溃自愈：收尾 pending↔applied 之间被杀遗留的 unresolved pending，
+            # 避免无人值守因 journal_halt 长期禁新开（详见 journal_pending_recovery）。
+            # CTP 回放（上面 sync_*）先跑：自愈只处理带 pending 标记、回放无法触达
+            # 的卡死行。自愈后重新把 CSV 同步进内存认领，保证后续对账一致。
+            try:
+                from journal_pending_recovery import recover_all_pending
+                rec = recover_all_pending(
+                    config, store=spread_store, ledger=ledger, logger=logger,
+                )
+                if rec.get('healed') or rec.get('ambiguous') or rec.get('errors'):
+                    logger.warning(
+                        '[自愈] 启动收尾 pending: '
+                        f'healed={rec.get("healed", 0)} '
+                        f'ambiguous={rec.get("ambiguous", 0)} '
+                        f'errors={rec.get("errors", 0)}'
+                    )
+                    if rec.get('healed'):
+                        sync_strangle_leg_claims(ledger, config, logger=logger)
+                        sync_spread_leg_claims(spread_store, config, logger=logger)
+            except Exception as heal_err:
+                logger.warning('[自愈] 启动收尾异常: %s', heal_err, exc_info=True)
 
             if not require_startup_position_ack(config, logger, ledger, conn):
                 time.sleep(1)

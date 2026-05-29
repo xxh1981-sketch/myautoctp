@@ -3,8 +3,6 @@
 import os
 from typing import Any, Dict, Tuple
 
-import ctp_bootstrap
-
 STRANGLE_DEFAULTS = {
     'enabled': True,
     'daily_buy_limit_yuan': 300000,
@@ -101,6 +99,24 @@ DUAL_STRATEGY_DEFAULTS = {
 MERGED_TOP_LEVEL_DEFAULTS = {
     'global_margin_limit': 100000,
     'main_loop_max_consecutive_errors': 10,
+    # 长跑磁盘治理（7×24）：清理过期 journal 分片、轮转 fill_ledger、保留日志天数。
+    'housekeeping_enabled': True,
+    'housekeeping_interval_sec': 21600,
+    'log_retain_days': 30,
+    'fill_ledger_rotate_enabled': True,
+    'fill_ledger_max_mb': 50,
+    'fill_ledger_archive_keep': 10,
+    # 周末非交易抑制（仅双休日；法定节假日不处理，当交易日）。周六仅在此时刻
+    # 之后才算周末，避开周五夜盘跨零点到周六凌晨。
+    'weekend_pause_enabled': True,
+    'weekend_pause_saturday_from_hour': 5,
+    # 单轮看门狗：一轮耗时超阈值告警（CTP 查询串行变慢的可观测性）。
+    'round_slow_warn_sec': 30,
+    'slow_round_alert_cooldown_sec': 300,
+    # 保证金连续 unknown（持仓查询失败）达到该次数后，即使上一轮非 halt 也
+    # 保守暂停新开，消除"长期查询失败 → 真实超限无法发现仍可新开"的盲区。
+    # 0 表示禁用该升级（仅沿用上轮状态，回到旧行为）。
+    'margin_unknown_halt_after': 3,
     'fail_fast_on_guard_install': True,
     'fail_fast_on_empty_target_months': True,
     'block_start_without_margin_limit': True,
@@ -153,6 +169,8 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
 
 
 def load_merged_config(local_path: str = None) -> Dict[str, Any]:
+    import ctp_bootstrap
+
     local_path = local_path or os.path.join(_project_dir(), 'merged_config.yaml')
     pre_cfg = {}
     if os.path.isfile(local_path):
@@ -206,9 +224,58 @@ def load_merged_config(local_path: str = None) -> Dict[str, Any]:
     return config
 
 
+def _install_rotating_log_handler(logger, config: Dict[str, Any]) -> None:
+    """把 autotrade setup_logger 装的普通 FileHandler 升级为按天轮转。
+
+    autotrade 的 ``setup_logger`` 在进程启动时按当天命名 ``info/YYYYMMDD.log`` 并
+    用普通 FileHandler——7×24 长跑会把多天日志全写进启动日那个文件、永不轮转。
+    这里替换为 TimedRotatingFileHandler（每日切分 + backupCount 自动删旧），并把
+    日志目录写入 ``config['_log_dir']`` 供 housekeeping 兜底清理遗留旧文件。
+    """
+    import logging
+    from logging.handlers import TimedRotatingFileHandler
+
+    plain = [
+        h for h in list(logger.handlers)
+        if isinstance(h, logging.FileHandler)
+        and not isinstance(h, TimedRotatingFileHandler)
+    ]
+    if not plain:
+        return
+    base_file = plain[0].baseFilename
+    log_dir = os.path.dirname(base_file)
+    formatter = plain[0].formatter
+    level = plain[0].level
+    retain = int(config.get('log_retain_days', 30) or 30)
+
+    rotating_path = os.path.join(log_dir, 'autoctp.log')
+    handler = TimedRotatingFileHandler(
+        rotating_path, when='midnight', backupCount=retain, encoding='utf-8',
+    )
+    handler.setLevel(level)
+    if formatter is not None:
+        handler.setFormatter(formatter)
+    for h in plain:
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    logger.addHandler(handler)
+    config['_log_dir'] = log_dir
+    logger.info(
+        f'[日志] 已启用按天轮转 + 保留 {retain} 天: {rotating_path}'
+    )
+
+
 def setup_merged_logger(config: Dict[str, Any]):
     from pairtrade.config import setup_logger
-    return setup_logger('AutoCTP', log_level=config.get('log_level', 'INFO'))
+    logger = setup_logger('AutoCTP', log_level=config.get('log_level', 'INFO'))
+    try:
+        _install_rotating_log_handler(logger, config)
+    except Exception as e:
+        logger.warning(f'[日志] 轮转升级失败，沿用原 FileHandler: {e}')
+    return logger
 
 
 def prepare_merged_connection(conn, config: Dict[str, Any]) -> None:

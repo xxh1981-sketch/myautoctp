@@ -176,6 +176,22 @@ class TestApplyFillToCsv(unittest.TestCase):
             self.assertEqual(claims, {'SA609C1000': 1})
             self.assertEqual(os.path.getmtime(path), mtime_before)
 
+    def test_read_failure_raises_and_preserves_file(self):
+        """读已有 CSV 失败时必须抛出、保留原文件，绝不能用空表续写抹掉认领。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'pos.csv')
+            cfg = {'dual_strategy': {'strangle_positions_csv': path}}
+            # 写入一份"含损坏行"的 CSV：load_positions_csv 会在坏行抛 ValueError。
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('SA609C1000,2\nSA609C1100,not_an_int\n')
+            before = open(path, encoding='utf-8').read()
+            with self.assertRaises(Exception):
+                apply_fill_to_csv(
+                    cfg, 'SA609C9999', DIRECTION_BUY, OFFSET_OPEN, 1, None,
+                )
+            # 原文件原样保留（未被空表覆盖）。
+            self.assertEqual(open(path, encoding='utf-8').read(), before)
+
 
 class TestSyncStrangleLegClaims(unittest.TestCase):
 

@@ -51,8 +51,10 @@ def _send_feishu(body: str, config: dict, logger, log_prefix: str) -> None:
         from auto_feishu import send_feishu_message
         send_feishu_message(body, config=config)
     except Exception as e:
+        # 风控告警发送失败属可观测性缺口（无人值守可能因此漏掉关键风险），
+        # 升为 warning 而非 debug；告警正文已先以 warning 打到日志，仍可追溯。
         if logger:
-            logger.debug(f'{log_prefix} 飞书失败: {e}')
+            logger.warning(f'{log_prefix} 飞书告警发送失败: {e}', exc_info=True)
 
 
 def _open_unmatched_items(ledger) -> List[dict]:

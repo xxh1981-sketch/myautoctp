@@ -57,8 +57,26 @@ if _use_autotrade_stubs():
     autotrade_stubs.ensure_autostraggle_stubs()
     _ensure_pairtrade_constants_stub()
 else:
-    # pytest-full: drop any in-memory auto_feishu left from a prior import order.
+    # pytest-full: inject AUTOTRADE_ROOT / AUTOSTRAGGLE_ROOT into sys.path
+    # before any test module imports spread_ledger (auto_connection) etc.
+    import ctp_bootstrap  # noqa: F401
     autotrade_stubs.ensure_auto_feishu_stub()
+
+
+def _bootstrap_test_deps() -> None:
+    """Idempotent: ensure autotrade paths or stubs before test module import."""
+    if _use_autotrade_stubs():
+        autotrade_stubs.ensure_auto_feishu_stub()
+        autotrade_stubs.ensure_autotrade_stubs(autotrade_stubs.ALL_STUB_MODULES)
+        autotrade_stubs.ensure_autostraggle_stubs()
+        _ensure_pairtrade_constants_stub()
+    else:
+        import ctp_bootstrap  # noqa: F401
+        autotrade_stubs.ensure_auto_feishu_stub()
+
+
+def pytest_configure(config) -> None:
+    _bootstrap_test_deps()
 
 
 def _unit_test_basenames() -> set[str]:
@@ -99,6 +117,13 @@ def pytest_ignore_collect(collection_path, config):
         if name in _autostraggle_test_basenames():
             return True
     if not _autotrade_root_available() and name not in _unit_test_basenames():
+        return True
+    # pytest-full (-m "not unit") 仍会 import 测试模块；unit 已在 pytest-unit 覆盖，跳过收集。
+    if (
+        _autotrade_root_available()
+        and os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() != '1'
+        and name in _unit_test_basenames()
+    ):
         return True
     return False
 

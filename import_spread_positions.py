@@ -8,7 +8,6 @@ from typing import Dict
 
 from atomic_io import atomic_write_text
 from env_utils import is_config_abs_path
-from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
     'instrument', 'volume',
@@ -102,6 +101,22 @@ def spread_fill_delta(direction: str, offset: str, traded: int) -> int:
     return 0
 
 
+def read_spread_claim_volume(config: dict, instrument: str) -> int:
+    """当前 on-disk 价差认领（signed）；文件不存在视为 0。
+
+    读取失败时抛出（与 :func:`apply_fill_to_spread_csv` 一致，绝不静默当 0），
+    供成交入账记录 pre_volume，以及自愈器比对 on-disk CSV。
+    """
+    inst = str(instrument or '').strip()
+    if not inst:
+        return 0
+    path = spread_positions_csv_path(config)
+    if not os.path.isfile(path):
+        return 0
+    claims = load_spread_positions_csv(path)
+    return int(claims.get(inst, 0))
+
+
 def apply_fill_to_spread_csv(
     config: dict,
     instrument: str,
@@ -118,11 +133,16 @@ def apply_fill_to_spread_csv(
     path = spread_positions_csv_path(config)
     claims: Dict[str, int] = {}
     if os.path.isfile(path):
+        # 读已有认领失败时绝不能用空表续写——那会把其它合约的认领整表抹掉。
+        # 抛出让上层流水停在 pending（触发 journal_halt 止血），原 CSV 原样保留。
         try:
             claims = load_spread_positions_csv(path)
         except Exception as e:
             if logger:
-                logger.warning(f"[价差持仓] 读取 CSV 失败，将重建: {e}")
+                logger.error(
+                    f"[价差持仓] 读取 CSV 失败，拒绝重建以保护既有认领: {e} ({path})"
+                )
+            raise
     inst = str(instrument).strip()
     new_vol = int(claims.get(inst, 0)) + delta
     if new_vol == 0:
@@ -161,6 +181,7 @@ def sync_spread_leg_claims(
 
 
 def _load_config_with_tradeinfo():
+    from merged_config import load_merged_config
     from merged_tradeinfo import load_dual_tradeinfo
 
     config = load_merged_config()

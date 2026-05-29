@@ -56,76 +56,109 @@ def _is_pending_status(order_status: str) -> bool:
     return order_status in ('1', '3', 'a', 'b', 'c')
 
 
-def _rebuild_pending_orders_from_exchange(conn, logger) -> int:
-    """Rebuild local ``pending_orders`` from CTP order query (best effort)."""
+def _rebuild_pending_orders_from_exchange(conn, logger):
+    """Rebuild local ``pending_orders`` from CTP order query (best effort).
+
+    Returns ``(rebuilt, total_pending)`` where:
+      * ``rebuilt`` — newly added local records;
+      * ``total_pending`` — total non-terminal exchange orders observed, or
+        ``None`` when the order query failed (unknown). H4 uses
+        ``total_pending`` to decide whether the exchange is truly clear before
+        clearing quarantine; ``None`` must not block recovery (avoid never
+        recovering when the query is flaky).
+    """
     try:
         orders = conn.query_orders_sync(timeout=8, use_cache=False)
     except Exception as e:
         logger.warning(f"[重连] 重建 pending_orders: 订单查询异常: {e}")
-        return 0
+        return 0, None
     if orders is None:
         logger.warning("[重连] 重建 pending_orders: 订单查询失败，跳过")
-        return 0
+        return 0, None
 
-    from pairtrade.models import OrderInfo
+    # H4: 先用一遍不依赖 OrderInfo 的轻量遍历统计交易所非终结挂单总数，
+    # 即便后续重建（依赖 pairtrade.models / OrderInfo 构造）失败，total_pending
+    # 仍可信，用于"解除隔离前确认交易所已清空"的判定。
+    total_pending = sum(
+        1 for o in orders
+        if _is_pending_status(str(o.get('status', '') or ''))
+    )
+
+    try:
+        from pairtrade.models import OrderInfo
+    except Exception as e:
+        logger.warning(
+            f"[重连] 重建 pending_orders: OrderInfo 不可用，跳过重建"
+            f"（total_pending={total_pending} 仍有效）: {e}"
+        )
+        return 0, total_pending
 
     rebuilt = 0
     now = time.time()
-    with conn.lock:
-        for o in orders:
-            status = str(o.get('status', '') or '')
-            if not _is_pending_status(status):
-                continue
-            try:
-                order_ref = int(o.get('order_ref') or 0)
-            except (TypeError, ValueError):
-                continue
-            if order_ref <= 0:
-                continue
-            if order_ref in conn.pending_orders:
-                continue
-            try:
-                volume_total = int(o.get('volume_total') or 0)
-            except (TypeError, ValueError):
-                volume_total = 0
-            try:
-                price = float(o.get('price') or 0.0)
-            except (TypeError, ValueError):
-                price = 0.0
-            instrument = str(o.get('instrument') or '').strip()
-            exchange_id = str(o.get('exchange_id') or '').strip()
-            direction = str(o.get('direction') or '')
-            offset = str(o.get('offset') or '0')
-            front_id = o.get('front_id')
-            session_id = o.get('session_id')
-            if not instrument or not exchange_id:
-                continue
+    # 重建本身是 best-effort：即便某条订单构造失败也不能丢掉已统计好的
+    # total_pending（H4 据此判定隔离是否可解除）。
+    try:
+        with conn.lock:
+            for o in orders:
+                status = str(o.get('status', '') or '')
+                if not _is_pending_status(status):
+                    continue
+                try:
+                    order_ref = int(o.get('order_ref') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if order_ref <= 0:
+                    continue
+                if order_ref in conn.pending_orders:
+                    continue
+                try:
+                    volume_total = int(o.get('volume_total') or 0)
+                except (TypeError, ValueError):
+                    volume_total = 0
+                try:
+                    price = float(o.get('price') or 0.0)
+                except (TypeError, ValueError):
+                    price = 0.0
+                instrument = str(o.get('instrument') or '').strip()
+                exchange_id = str(o.get('exchange_id') or '').strip()
+                direction = str(o.get('direction') or '')
+                offset = str(o.get('offset') or '0')
+                front_id = o.get('front_id')
+                session_id = o.get('session_id')
+                if not instrument or not exchange_id:
+                    continue
 
-            info = OrderInfo(
-                order_ref=order_ref,
-                instrument_id=instrument,
-                exchange_id=exchange_id,
-                volume=volume_total,
-                price=price,
-                direction=direction,
-                offset=offset,
-                create_time=now,
-            )
-            try:
-                info.front_id = front_id
-                info.session_id = session_id
-                info.order_status = status
-            except Exception:
-                pass
-            conn.pending_orders[order_ref] = info
-            conn.order_traded[order_ref] = False
-            rebuilt += 1
+                info = OrderInfo(
+                    order_ref=order_ref,
+                    instrument_id=instrument,
+                    exchange_id=exchange_id,
+                    volume=volume_total,
+                    price=price,
+                    direction=direction,
+                    offset=offset,
+                    create_time=now,
+                )
+                try:
+                    info.front_id = front_id
+                    info.session_id = session_id
+                    info.order_status = status
+                except Exception:
+                    pass
+                conn.pending_orders[order_ref] = info
+                conn.order_traded[order_ref] = False
+                rebuilt += 1
+    except Exception as e:
+        logger.warning(
+            f"[重连] 重建 pending_orders 遍历异常（total_pending={total_pending} "
+            f"仍有效）: {e}"
+        )
+        return rebuilt, total_pending
 
     if rebuilt:
         logger.warning(
             f"[重连] 已根据 CTP 订单查询重建 {rebuilt} 个本地 pending_orders 记录"
         )
-    return rebuilt
+    return rebuilt, total_pending
 
 
 def install_recovery_patch() -> bool:
@@ -215,11 +248,15 @@ def install_recovery_patch() -> bool:
             # local map so future logic (assert_no_pending, watchdog,
             # cancel_all_pending_orders fallback) sees the truth even if
             # the cancel was rate-limited or partial.
+            exchange_pending_total = None
             if conn.td_logined and conn.td_api:
                 try:
-                    _rebuild_pending_orders_from_exchange(conn, logger)
+                    _rebuilt, exchange_pending_total = (
+                        _rebuild_pending_orders_from_exchange(conn, logger)
+                    )
                 except Exception as e:
                     logger.warning(f"[重连] 重建 pending_orders 异常: {e}")
+                    exchange_pending_total = None
 
             # R3: Only declare recovery successful when we are confident
             # nothing is still hanging on the exchange. Two failure modes
@@ -233,6 +270,20 @@ def install_recovery_patch() -> bool:
                 and not skip_cancel
                 and cancel_attempted_ok
             )
+            # H4: 撤单调用"未抛异常"不等于交易所已清空（可能限频/部分撤单/
+            # 撤单确认尚未回报）。仅当 B5 查询确认交易所非终结挂单为 0 时才解除
+            # 隔离；查询失败(None)时不在此维度阻塞（避免永不恢复，依赖 B5 已
+            # 重建的本地映射 + 看门狗下一轮重试）。
+            if (
+                recovery_ok
+                and exchange_pending_total is not None
+                and exchange_pending_total > 0
+            ):
+                logger.warning(
+                    f"[重连] 撤单后交易所仍有 {exchange_pending_total} 个非终结挂单，"
+                    "保持隔离期（等待撤单确认或下一轮重试）"
+                )
+                recovery_ok = False
         finally:
             if recovery_ok and conn._reconnect_quarantine:
                 set_quarantine(conn, False)

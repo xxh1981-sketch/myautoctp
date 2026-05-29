@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
-from strangle_ledger_atomic import install_atomic_save
+from strangle_ledger_atomic import install_atomic_save, get_install_error
 from straggle_ledger import StrangleLedger
 
 
@@ -18,6 +18,11 @@ class TestStrangleLedgerAtomicSave(unittest.TestCase):
 
     def setUp(self):
         install_atomic_save()
+
+    def test_install_returns_true_and_no_error(self):
+        """安装成功必须返回 True 且无错误信息（供 merged_main 决定是否 fail-fast）。"""
+        self.assertTrue(install_atomic_save())
+        self.assertEqual(get_install_error(), '')
 
     def test_save_writes_full_payload(self):
         with tempfile.TemporaryDirectory() as tmp:

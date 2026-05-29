@@ -73,6 +73,39 @@ class TestCheckMarginStatus(unittest.TestCase):
         self.assertEqual(status, 'unknown')
         self.assertIn('持仓查询失败', reason)
 
+    def test_max_attempts_override_single_attempt_no_sleep(self):
+        # 主循环周期路径：max_attempts=1 → 仅查 1 次、绝不 sleep（即便配置 retry=30）。
+        cfg = {
+            'global_margin_limit': 100000,
+            'margin_check_max_attempts': 3,
+            'margin_retry_interval': 30,
+        }
+        self.conn.query_positions_sync.return_value = None
+        import time as _t
+        with patch.object(_t, 'sleep') as mock_sleep:
+            status, reason = margin_check.check_margin_status(
+                self.conn, cfg, self.logger, context='主循环', max_attempts=1,
+            )
+        self.assertEqual(status, 'unknown')
+        self.assertEqual(self.conn.query_positions_sync.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_retry_interval_override(self):
+        # 覆盖 retry_interval：失败重试间隔用入参而非配置的 30s。
+        cfg = {
+            'global_margin_limit': 100000,
+            'margin_check_max_attempts': 2,
+            'margin_retry_interval': 30,
+        }
+        self.conn.query_positions_sync.return_value = None
+        import time as _t
+        with patch.object(_t, 'sleep') as mock_sleep:
+            margin_check.check_margin_status(
+                self.conn, cfg, self.logger, retry_interval=0,
+            )
+        # 2 次尝试之间 sleep 一次，且用覆盖值 0
+        mock_sleep.assert_called_once_with(0)
+
 
 class TestCheckMarginLegacyWrapper(unittest.TestCase):
 

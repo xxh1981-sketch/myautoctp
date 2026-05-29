@@ -9,6 +9,13 @@ from datetime import date, timedelta
 from typing import Set
 
 
+# 合法的 journal_state 取值。仅 'pending'（待入账）与 'applied'（已入账，
+# 含 skipped 类已决行）。任何其它值（拼写错误、空串、损坏）都不得被当成
+# "已解决"——否则会误把未完成 pending 当作已应用，错误清除 journal_halt。
+JOURNAL_STATE_PENDING = 'pending'
+JOURNAL_STATE_APPLIED = 'applied'
+_RESOLVED_JOURNAL_STATES = frozenset({JOURNAL_STATE_APPLIED})
+
 
 def trade_dedupe_key(trade: dict) -> str:
     trade_id = (trade.get('trade_id') or '').strip()
@@ -100,7 +107,12 @@ def load_applied_keys(
                 except json.JSONDecodeError:
                     continue
                 state = str(row.get('journal_state') or '').lower()
-                if state == 'pending' and not include_pending:
+                if state == JOURNAL_STATE_PENDING:
+                    if not include_pending:
+                        continue
+                elif state and state not in _RESOLVED_JOURNAL_STATES:
+                    # 显式的未知/损坏状态：不视为已应用，避免据此抑制后续合法回放。
+                    # 空串（遗留无 journal_state 字段的旧行）仍按已应用处理。
                     continue
                 key = row.get('dedupe_key') or row.get('trade_id')
                 if key:
@@ -108,17 +120,20 @@ def load_applied_keys(
     return keys
 
 
-def scan_unresolved_pending(
-    journal_base: str,
-    config: dict = None,
-) -> dict:
-    """Return unresolved pending rows and malformed count for one journal.
+def _scan_journal(journal_base: str, config: dict = None) -> dict:
+    """Single pass over retained shards.
 
-    A pending row is unresolved when no later non-pending row with the same
-    dedupe key exists in retained shards.
+    Returns a dict with:
+      - ``pending_rows``: {key -> last pending row dict}
+      - ``resolved_keys``: set of keys with a later applied/legacy row
+      - ``malformed_lines`` / ``total_lines`` counters
+
+    Shared by :func:`scan_unresolved_pending` (counts) and
+    :func:`scan_unresolved_pending_rows` (the actual unresolved rows used by
+    the self-healer). Keep both consumers in sync via this single scanner.
     """
-    pending_keys: Set[str] = set()
-    applied_keys: Set[str] = set()
+    pending_rows: dict = {}
+    resolved_keys: Set[str] = set()
     malformed_lines = 0
     total_lines = 0
 
@@ -134,19 +149,64 @@ def scan_unresolved_pending(
                 except json.JSONDecodeError:
                     malformed_lines += 1
                     continue
+                state = str(row.get('journal_state') or '').lower()
+                # 显式非空且既非 pending 也非已知"已解决"状态 → 损坏行，计入
+                # malformed，且不得解除任何 pending（防止拼写错误状态误清未完成
+                # 入账）。空串（遗留无 journal_state 的旧行）仍按已应用处理。
+                if (
+                    state
+                    and state != JOURNAL_STATE_PENDING
+                    and state not in _RESOLVED_JOURNAL_STATES
+                ):
+                    malformed_lines += 1
+                    continue
                 key = row.get('dedupe_key') or row.get('trade_id')
                 if not key:
                     continue
                 key = str(key)
-                state = str(row.get('journal_state') or '').lower()
-                if state == 'pending':
-                    pending_keys.add(key)
+                if state == JOURNAL_STATE_PENDING:
+                    pending_rows[key] = row
                     continue
-                applied_keys.add(key)
-                if key in pending_keys:
-                    pending_keys.remove(key)
+                resolved_keys.add(key)
+    return {
+        'pending_rows': pending_rows,
+        'resolved_keys': resolved_keys,
+        'malformed_lines': malformed_lines,
+        'total_lines': total_lines,
+    }
 
-    unresolved = pending_keys - applied_keys
+
+def scan_unresolved_pending_rows(
+    journal_base: str,
+    config: dict = None,
+) -> list:
+    """Return the actual unresolved pending row dicts (for the self-healer).
+
+    A pending row is unresolved when no later applied/legacy row with the same
+    dedupe key exists in retained shards.
+    """
+    scan = _scan_journal(journal_base, config)
+    resolved = scan['resolved_keys']
+    return [
+        row for key, row in scan['pending_rows'].items()
+        if key not in resolved
+    ]
+
+
+def scan_unresolved_pending(
+    journal_base: str,
+    config: dict = None,
+) -> dict:
+    """Return unresolved pending rows and malformed count for one journal.
+
+    A pending row is unresolved when no later non-pending row with the same
+    dedupe key exists in retained shards.
+    """
+    scan = _scan_journal(journal_base, config)
+    pending_keys = set(scan['pending_rows'].keys())
+    unresolved = pending_keys - scan['resolved_keys']
+    malformed_lines = scan['malformed_lines']
+    total_lines = scan['total_lines']
     return {
         'unresolved_pending': len(unresolved),
         'malformed_lines': malformed_lines,

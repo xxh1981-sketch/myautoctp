@@ -120,6 +120,31 @@ class TestTradeJournal(unittest.TestCase):
             self.assertEqual(stats['malformed_lines'], 0)
             self.assertGreaterEqual(stats['total_lines'], 3)
 
+    def test_unknown_state_counted_malformed_and_keeps_pending(self):
+        """显式未知/拼写错误的 journal_state 不得当作 applied 清除 pending。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, 'j.jsonl')
+            cfg = {'dual_strategy': {'journal_daily_shards': False}}
+            append_journal(base, {'dedupe_key': 'k1', 'journal_state': 'pending'}, cfg)
+            # 同 key 的后续行状态拼写错误（'aplied'）→ 不应解除 pending。
+            append_journal(base, {'dedupe_key': 'k1', 'journal_state': 'aplied'}, cfg)
+            stats = scan_unresolved_pending(base, cfg)
+            self.assertEqual(stats['unresolved_pending'], 1)
+            self.assertEqual(stats['malformed_lines'], 1)
+            # load_applied_keys 也不得把未知状态当成已应用键。
+            keys = load_applied_keys(base, cfg, include_pending=False)
+            self.assertNotIn('k1', keys)
+
+    def test_legacy_missing_state_still_applied(self):
+        """无 journal_state 字段的旧行仍按 applied 处理（向后兼容）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, 'j.jsonl')
+            cfg = {'dual_strategy': {'journal_daily_shards': False}}
+            append_journal(base, {'dedupe_key': 'legacy'}, cfg)
+            stats = scan_unresolved_pending(base, cfg)
+            self.assertEqual(stats['malformed_lines'], 0)
+            self.assertIn('legacy', load_applied_keys(base, cfg))
+
     def test_map_direction_offset(self):
         d, o = map_direction_offset('0', '0')
         self.assertEqual((d, o), ('0', '0'))

@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -49,6 +50,26 @@ class TestProcessGuard(unittest.TestCase):
         self.assertIsNotNone(process_guard._HELD_FD)
         process_guard.release_singleton()
         self.assertIsNone(process_guard._HELD_FD)
+
+    def test_soft_mode_warns_and_can_require_hard_lock(self):
+        """缺锁原语（软模式）时应告警；require_hard_lock=True 必须拒启动。"""
+        orig = process_guard._try_lock
+        process_guard._try_lock = lambda fd: (True, False)  # 软模式：acquired 但非硬锁
+        logger = MagicMock()
+        try:
+            # 默认：软模式放行但显式 warning。
+            process_guard.acquire_singleton(pid_path=self.pid_path, logger=logger)
+            self.assertTrue(logger.warning.called)
+            process_guard.release_singleton()
+            process_guard._HELD_FD = None
+            process_guard._HELD_PID_PATH = None
+            # require_hard_lock=True：软模式拒启动。
+            with self.assertRaises(process_guard.AlreadyRunningError):
+                process_guard.acquire_singleton(
+                    pid_path=self.pid_path, logger=logger, require_hard_lock=True,
+                )
+        finally:
+            process_guard._try_lock = orig
 
     def test_second_process_simulation(self):
         """子进程尝试拿锁应失败（用 subprocess 避免 fork 继承 flock）。"""

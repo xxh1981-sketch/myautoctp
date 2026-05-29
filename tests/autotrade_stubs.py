@@ -119,6 +119,30 @@ def _install_auto_order_manager(mod):
 def _install_auto_processor(mod):
     mod.process_symbol = lambda *a, **kw: False
     mod.is_trading_time = lambda symbol: True
+    mod.process_close = lambda *a, **kw: False
+
+
+def _install_auto_utils(mod):
+    mod.resolve_min_tick = lambda conn, sym, month, tick, logger: float(tick or 0.5)
+
+
+def _install_auto_closer_conditions(mod):
+    mod.CLOSE_URGENCY_NORMAL = 'normal'
+    mod.CLOSE_URGENCY_URGENT = 'urgent'
+    mod.check_close_conditions_with_urgency = lambda *a, **kw: (None, '')
+
+
+def _install_auto_closer_plan(mod):
+    mod.calculate_close_plan_VIX_case = lambda *a, **kw: []
+    mod.calculate_close_plan_future_price_case = lambda *a, **kw: []
+
+
+def _install_auto_closer_executor(mod):
+    mod.execute_close_orders_with_limit = lambda *a, **kw: (False, 0)
+
+
+def _install_auto_closer(mod):
+    mod.process_close = lambda *a, **kw: False
 
 
 def _install_auto_initializer(mod):
@@ -252,6 +276,11 @@ _STUB_BUILDERS = {
     ),
     'auto_strategy_order_ref': _install_strategy_order_ref,
     'auto_processor': _install_auto_processor,
+    'auto_utils': _install_auto_utils,
+    'auto_closer_conditions': _install_auto_closer_conditions,
+    'auto_closer_plan': _install_auto_closer_plan,
+    'auto_closer_executor': _install_auto_closer_executor,
+    'auto_closer': _install_auto_closer,
     'auto_initializer': _install_auto_initializer,
     'auto_feishu': _install_auto_feishu,
     'auto_feishu_command': _install_auto_feishu_command,

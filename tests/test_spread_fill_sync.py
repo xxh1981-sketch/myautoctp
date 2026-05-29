@@ -17,6 +17,24 @@ from spread_fill_sync import (
 )
 from spread_ledger import SpreadLegStore
 from pairtrade.constants import OFFSET_CLOSE
+from import_spread_positions import apply_fill_to_spread_csv
+
+
+class TestApplyFillToSpreadCsvReadFailure(unittest.TestCase):
+
+    def test_read_failure_raises_and_preserves_file(self):
+        """读已有 spread CSV 失败时必须抛出、保留原文件，绝不能空表续写抹认领。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'spread.csv')
+            cfg = {'dual_strategy': {'spread_positions_csv': path}}
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('SA609C1000,2\nSA609C1100,not_an_int\n')
+            before = open(path, encoding='utf-8').read()
+            with self.assertRaises(Exception):
+                apply_fill_to_spread_csv(
+                    cfg, 'SA609C9999', DIRECTION_BUY, OFFSET_OPEN, 1, None,
+                )
+            self.assertEqual(open(path, encoding='utf-8').read(), before)
 
 
 def _cfg(tmp, journal_name='spread_journal.jsonl'):

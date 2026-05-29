@@ -74,27 +74,33 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _try_lock(fd) -> bool:
-    """非阻塞拿锁；返回是否拿到。无 fcntl/msvcrt 时返回 True（软模式）。"""
+def _try_lock(fd) -> tuple:
+    """非阻塞拿锁。
+
+    返回 ``(acquired, hard)``：
+      - ``acquired``：是否拿到锁（软模式恒视为拿到）。
+      - ``hard``：是否用了真正的 OS 强制锁。无 fcntl/msvcrt 时为 ``False``，
+        表示只能软检测，调用方应据此告警/可选拒启动（软模式无法真正防双开）。
+    """
     if os.name == 'nt':
         try:
             import msvcrt
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                return True
+                return True, True
             except OSError:
-                return False
+                return False, True
         except ImportError:
-            return True
+            return True, False
     try:
         import fcntl
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
+            return True, True
         except (BlockingIOError, OSError):
-            return False
+            return False, True
     except ImportError:
-        return True
+        return True, False
 
 
 def _default_pid_path() -> str:
@@ -108,7 +114,11 @@ def _default_pid_path() -> str:
     return os.path.join(data, 'autoctp.pid')
 
 
-def acquire_singleton(pid_path: Optional[str] = None, logger=None) -> str:
+def acquire_singleton(
+    pid_path: Optional[str] = None,
+    logger=None,
+    require_hard_lock: bool = False,
+) -> str:
     """获取单实例锁，返回 PID 信息文件路径；冲突时抛 :class:`AlreadyRunningError`。
 
     幂等：同进程多次调用直接返回已持有的路径。
@@ -134,7 +144,7 @@ def acquire_singleton(pid_path: Optional[str] = None, logger=None) -> str:
         pass
 
     fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
-    locked = _try_lock(fd)
+    locked, hard = _try_lock(fd)
     if not locked:
         existing_pid = _peek_existing_pid(pid_file)
         try:
@@ -145,6 +155,40 @@ def acquire_singleton(pid_path: Optional[str] = None, logger=None) -> str:
             f'另一 autoctp 实例已在运行 (PID={existing_pid}, lock={lock_file})。'
             '禁止双进程：会破坏 journal 去重与 fill_ledger 一致性。'
         )
+
+    if not hard:
+        # 软模式：无 fcntl/msvcrt，OS 强制锁不可用，acquired 恒 True，
+        # 无法真正阻止双开。退化为"PID 信息文件存活性"软检测，并显式告警；
+        # require_hard_lock=True 时直接拒启动（让无人值守不带病跑）。
+        existing_pid = _peek_existing_pid(pid_file)
+        if existing_pid > 0 and existing_pid != os.getpid() and _pid_alive(existing_pid):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise AlreadyRunningError(
+                f'软模式检测到另一 autoctp 实例可能在运行 (PID={existing_pid})。'
+                '禁止双进程：会破坏 journal 去重与 fill_ledger 一致性。'
+            )
+        warn_msg = (
+            '[process_guard] 缺少 fcntl/msvcrt，单实例锁退化为软检测，'
+            '无法可靠防止双开（双进程会破坏 journal 去重与 fill_ledger 一致性）。'
+            '请确认运行环境提供文件锁原语。'
+        )
+        if logger:
+            logger.warning(warn_msg)
+        else:
+            import warnings
+            warnings.warn(warn_msg, RuntimeWarning, stacklevel=2)
+        if require_hard_lock:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise AlreadyRunningError(
+                '单实例锁不可用（无 fcntl/msvcrt）且 require_hard_singleton_lock=true，'
+                '拒绝启动以避免无法防双开的无人值守运行。'
+            )
 
     # 写 PID 信息文件（与锁文件分离，可被其他进程读取）
     try:
