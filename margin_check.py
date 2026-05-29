@@ -25,12 +25,20 @@ MarginStatus = Literal['ok', 'over_limit', 'unknown']
 
 def check_margin_status(
     conn, config: dict, logger, context: str = '',
+    *, max_attempts: int = None, retry_interval: float = None,
 ) -> Tuple[MarginStatus, str]:
     """Return ``(status, reason)`` describing the global margin state.
 
     ``reason`` is a short Chinese phrase suitable for surfacing in the
     runtime ``_margin_halt_reason`` field; it is empty when ``status`` is
     ``'ok'``.
+
+    ``max_attempts`` / ``retry_interval`` override the config-derived values.
+    The periodic main-loop call passes ``max_attempts=1`` to avoid blocking the
+    loop on the in-call ``time.sleep(retry_interval)`` between attempts —
+    sustained failures are instead escalated across cycles by the caller's
+    ``_margin_unknown_streak`` logic (the inner ``query_positions_sync`` already
+    retries quickly and self-limits via its fail threshold → quarantine).
     """
     limit = config.get('global_margin_limit', 0)
     if limit <= 0:
@@ -44,8 +52,14 @@ def check_margin_status(
         return 'ok', ''
 
     prefix = f'保证金检查{(" (" + context + ")") if context else ""}'
-    retry = config.get('margin_retry_interval', 30)
-    max_attempts = config.get('margin_check_max_attempts', 3)
+    retry = (
+        retry_interval if retry_interval is not None
+        else config.get('margin_retry_interval', 30)
+    )
+    max_attempts = (
+        max_attempts if max_attempts is not None
+        else config.get('margin_check_max_attempts', 3)
+    )
     from auto_risk import sum_positions_margin_for_limit
 
     for attempt in range(max_attempts):

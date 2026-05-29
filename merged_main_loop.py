@@ -1,6 +1,7 @@
 """单进程双策略主循环（价差 + 宽跨）。"""
 
 import time
+from datetime import date
 
 import auto_processor  # 通过模块属性访问 process_symbol，确保 spread_ledger_execution 的 patch 生效
 from auto_initializer import manage_future_price_readiness
@@ -343,11 +344,23 @@ def run_merged_main_loop(
     reconcile_interval = float(dual.get('reconcile_interval_sec', 60))
     margin_recheck_interval = float(config.get('margin_recheck_interval_sec', 300))
     spread_limit_notified = False
+    # 跨日复位达限通知去重标志：CTP insert_date==today 使 spread_filled 次日归零、
+    # 日限本身天然跨日安全；但 spread_limit_notified 进程长跑不复位会让次日再次达限
+    # 时不再告警。按日历日复位，与 count_spread_filled_open_orders 的 insert_date==today
+    # 口径对齐（夜盘单 insert_date 即当晚日历日）。
+    _spread_notified_day = date.today()
     _last_unhealthy_alert_time = 0.0
     _health_alert_cooldown = config.get('health_alert_cooldown', 300)
     _last_reconcile_time = 0.0
     _last_margin_check_time = time.time()
     _last_journal_check_time = 0.0
+    _housekeeping_interval = float(config.get('housekeeping_interval_sec', 21600) or 0)
+    _last_housekeeping_time = time.time()
+    # 单轮看门狗：一轮耗时超阈值（CTP 查询变慢/半挂会令对账+保证金串行查询拖长）
+    # 时升级为 WARNING + 冷却飞书，给无人值守可观测性（不打断本轮，仅告警）。
+    _round_slow_warn_sec = float(config.get('round_slow_warn_sec', 30) or 0)
+    _slow_round_alert_cooldown = float(config.get('slow_round_alert_cooldown_sec', 300) or 0)
+    _last_slow_round_alert_time = 0.0
     _consecutive_loop_errors = 0
     _max_loop_errors = int(config.get('main_loop_max_consecutive_errors', 10) or 0)
     conn._runtime_state.setdefault('_margin_halt_open', False)
@@ -362,6 +375,12 @@ def run_merged_main_loop(
         f"保证金复检: {margin_recheck_interval:.0f}s"
     )
     logger.info("=" * 60)
+
+    try:
+        from housekeeping import run_housekeeping
+        run_housekeeping(config, logger)
+    except Exception as e:
+        logger.debug(f"[housekeeping] 启动清理异常: {e}")
 
     try:
         while True:
@@ -491,6 +510,51 @@ def run_merged_main_loop(
                     or conn._runtime_state.pop('_force_journal_check', False)
                 ):
                     _last_journal_check_time = now
+                    # 若上一轮已检出 unresolved pending（journal_halt 开），先尝试
+                    # 崩溃自愈收尾，再重新扫描判 halt——使 mid-run 卡死的 pending
+                    # 能自动清除而非长期禁新开。健康态（halt 关）不跑自愈以省 IO。
+                    if conn._runtime_state.get('_journal_halt_open'):
+                        try:
+                            from journal_pending_recovery import recover_all_pending
+                            _heal_store = conn._runtime_state.get('_spread_leg_store')
+                            _rec = recover_all_pending(
+                                config, store=_heal_store, ledger=ledger, logger=logger,
+                            )
+                            if _rec.get('healed'):
+                                logger.warning(
+                                    f'[自愈] 主循环收尾 {_rec["healed"]} 条 pending'
+                                    f'（ambiguous={_rec.get("ambiguous", 0)} '
+                                    f'errors={_rec.get("errors", 0)}）'
+                                )
+                                # H-02/M-04: 自愈改写了 CSV，但 already 分支不刷新内存
+                                # store；与启动路径（merged_main.py）一致，healed>0 后
+                                # 总是把 CSV 重新同步进内存认领，避免 ledger 模式
+                                # A/B/平仓确认读到落后于 CSV 的内存 store。
+                                try:
+                                    from import_strangle_positions import (
+                                        sync_strangle_leg_claims,
+                                    )
+                                    from import_spread_positions import (
+                                        sync_spread_leg_claims,
+                                    )
+                                    sync_strangle_leg_claims(
+                                        ledger, config, logger=logger,
+                                    )
+                                    if _heal_store is not None:
+                                        sync_spread_leg_claims(
+                                            _heal_store, config, logger=logger,
+                                        )
+                                except Exception as _sync_err:
+                                    logger.warning(
+                                        f'[自愈] 收尾后内存认领同步失败: {_sync_err}',
+                                        exc_info=True,
+                                    )
+                        except Exception as _heal_err:
+                            # M-04: 自愈失败可能导致 journal_halt 长期不解除，
+                            # 升为 warning + exc_info（与启动路径一致），便于排障。
+                            logger.warning(
+                                f'[自愈] 主循环收尾异常: {_heal_err}', exc_info=True,
+                            )
                     try:
                         from fill_ledger import fill_ledger_journal_path
                         from spread_fill_sync import _journal_path as _spread_journal_path
@@ -556,38 +620,83 @@ def run_merged_main_loop(
                 )
 
                 if (
+                    _housekeeping_interval > 0
+                    and now - _last_housekeeping_time >= _housekeeping_interval
+                ):
+                    _last_housekeeping_time = now
+                    try:
+                        from housekeeping import run_housekeeping
+                        run_housekeeping(config, logger)
+                    except Exception as e:
+                        logger.debug(f'[housekeeping] 周期清理异常: {e}')
+
+                if (
                     now - _last_margin_check_time >= margin_recheck_interval
                     or conn._runtime_state.pop('_force_margin_check', False)
                 ):
                     _last_margin_check_time = now
+                    # 周期检查单次尝试、不在循环内 sleep(retry)：避免 CTP 变慢时
+                    # 单轮被 margin 外层重试阻塞数十秒~分钟（持仓查询本身已内重试 3 次
+                    # 并在失败阈值触发 mark_connection_dead）。持续失败由下方
+                    # _margin_unknown_streak 跨轮升级 halt 兜底。
                     status, reason = margin_check.check_margin_status(
-                        conn, config, logger, context='主循环',
+                        conn, config, logger, context='主循环', max_attempts=1,
                     )
                     if status == 'ok':
                         conn._runtime_state['_margin_halt_open'] = False
                         conn._runtime_state['_margin_halt_reason'] = ''
+                        conn._runtime_state['_margin_unknown_streak'] = 0
                     elif status == 'over_limit':
                         conn._runtime_state['_margin_halt_open'] = True
                         conn._runtime_state['_margin_halt_reason'] = (
                             f'{reason} (限额 {config.get("global_margin_limit", 0)})'
                         )
+                        conn._runtime_state['_margin_unknown_streak'] = 0
                         spread_logger.warning(
                             '保证金超限：暂停双策略新开；允许平仓、补A与平A，'
                             '保证金halt下 B<2*A 仅允许平A修复，不再补B'
                         )
                     else:
-                        # unknown: 持仓查询多次失败，沿用上轮 halt 状态
-                        # （宁可保守不切换，避免连接波动误开/误平）
+                        # unknown: 持仓查询多次失败。短期沿用上轮 halt 状态
+                        # （避免连接波动误开/误平）；但持续失败会形成"超限盲区"——
+                        # 上轮非 halt 时真实超限无法被发现仍可能新开。因此连续
+                        # margin_unknown_halt_after 轮 unknown 后保守转 halt（禁新开，
+                        # 平仓不受影响），直到一次成功判定才解除。
                         prev_halt = bool(
                             conn._runtime_state.get('_margin_halt_open', False)
                         )
                         prev_reason = conn._runtime_state.get(
                             '_margin_halt_reason', ''
                         )
-                        spread_logger.warning(
-                            f'保证金检查失败（unknown），沿用上一轮风控状态'
-                            f' halt={prev_halt} reason={prev_reason or "无"}'
+                        # C1: streak 的持久化自增只由下方 record_margin_check_result
+                        # 负责（它是 streak 的唯一所有者，并有独立单测覆盖）。这里
+                        # 仅本地计算"本轮自增后"的值用于 halt 决策，不写回 runtime，
+                        # 否则会与 record_margin_check_result 形成每轮 +2 的双计数。
+                        streak = int(
+                            conn._runtime_state.get('_margin_unknown_streak', 0) or 0
+                        ) + 1
+                        unknown_halt_after = int(
+                            config.get('margin_unknown_halt_after', 3) or 0
                         )
+                        if (
+                            not prev_halt
+                            and unknown_halt_after > 0
+                            and streak >= unknown_halt_after
+                        ):
+                            conn._runtime_state['_margin_halt_open'] = True
+                            conn._runtime_state['_margin_halt_reason'] = (
+                                f'保证金连续 {streak} 次查询失败，保守暂停新开'
+                                '（无法确认是否超限）'
+                            )
+                            spread_logger.warning(
+                                f'保证金连续 {streak} 次 unknown（>= '
+                                f'{unknown_halt_after}），保守暂停新开（仅平仓）'
+                            )
+                        else:
+                            spread_logger.warning(
+                                f'保证金检查失败（unknown #{streak}），沿用上一轮风控状态'
+                                f' halt={prev_halt} reason={prev_reason or "无"}'
+                            )
                     try:
                         from runtime_risk_alerts import record_margin_check_result
                         record_margin_check_result(conn, config, logger, status)
@@ -645,6 +754,11 @@ def run_merged_main_loop(
 
                 from spread_fill_sync import count_spread_filled_open_orders
                 from spread_daily_limit import resolve_spread_daily_limit
+
+                _today = date.today()
+                if _today != _spread_notified_day:
+                    _spread_notified_day = _today
+                    spread_limit_notified = False
 
                 spread_filled = 0
                 spread_count_source = 'spread'
@@ -860,6 +974,35 @@ def run_merged_main_loop(
                     f'宽跨买入 {strangle_buy_spent:.0f}/{strangle_buy_limit:.0f} | '
                     f'对账 halt S={spread_halt} T={halt}'
                 )
+                if _round_slow_warn_sec > 0 and round_elapsed >= _round_slow_warn_sec:
+                    conn._runtime_state['_metric_slow_round_count'] = (
+                        int(conn._runtime_state.get('_metric_slow_round_count', 0) or 0)
+                        + 1
+                    )
+                    conn._runtime_state['_metric_last_round_sec'] = round_elapsed
+                    logger.warning(
+                        f'[主循环] 单轮耗时 {round_elapsed:.1f}s 超阈值 '
+                        f'{_round_slow_warn_sec:.0f}s（CTP 查询变慢/半挂？平仓/指令'
+                        '响应会被拖慢）'
+                    )
+                    _now_t = time.time()
+                    if (
+                        _slow_round_alert_cooldown > 0
+                        and _now_t - _last_slow_round_alert_time
+                        >= _slow_round_alert_cooldown
+                    ):
+                        _last_slow_round_alert_time = _now_t
+                        try:
+                            from auto_feishu import send_feishu_message
+                            send_feishu_message(
+                                f'🐢 **AutoCTP 单轮耗时过长**\n\n'
+                                f'本轮 {round_elapsed:.1f}s（阈值 '
+                                f'{_round_slow_warn_sec:.0f}s）。CTP 查询可能变慢或'
+                                '半挂，平仓与飞书指令响应会被拖慢，请关注连接质量。',
+                                config=config,
+                            )
+                        except Exception as e:
+                            logger.debug(f'[主循环] 慢轮飞书通知失败: {e}')
                 _consecutive_loop_errors = 0
                 time.sleep(loop_interval)
             except KeyboardInterrupt:

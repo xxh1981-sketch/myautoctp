@@ -7,9 +7,11 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from import_strangle_positions import (
+    _fill_volume_delta,
     apply_fill_to_csv,
     load_positions_csv,
     positions_csv_path,
+    read_claim_volume,
     save_positions_csv,
     sync_strangle_leg_claims,
 )
@@ -60,6 +62,14 @@ def apply_strangle_trade_record(
         if not instrument or volume <= 0:
             return False
 
+        direction, offset = map_direction_offset(
+            trade.get('direction'), trade.get('offset'),
+        )
+        # 记录 pre/post（on-disk 认领手数与应用后净额），供自愈器在崩溃后幂等
+        # 判断 CSV 是否已体现本笔（cur==post 已应用；cur==pre 未应用）。读 CSV
+        # 失败会抛出（不写 pending，本轮中止、下轮重试），不污染账本。
+        pre_volume = read_claim_volume(config, instrument)
+        post_volume = pre_volume + _fill_volume_delta(direction, offset, volume)
         append_journal(journal_file, {
             'dedupe_key': dedupe_key,
             'trade_id': trade.get('trade_id', ''),
@@ -68,13 +78,12 @@ def apply_strangle_trade_record(
             'direction': trade.get('direction'),
             'offset': trade.get('offset'),
             'volume': volume,
+            'pre_volume': pre_volume,
+            'post_volume': post_volume,
             'journal_state': 'pending',
             'applied_on': date.today().isoformat(),
         }, config)
 
-        direction, offset = map_direction_offset(
-            trade.get('direction'), trade.get('offset'),
-        )
         claims = apply_fill_to_csv(
             config, instrument, direction, offset, volume, logger,
         )
@@ -142,7 +151,11 @@ def _install_wire_handler(conn, kind: str, handler_fn) -> None:
     table[kind] = handler_fn
 
     def _dispatch(c, p_trade, logger):
-        # 按固定顺序依次调用，未注册的 kind 跳过；前序 handler 异常不阻塞后续。
+        # 按固定顺序依次调用，未注册的 kind 跳过；前序 handler 异常不阻塞后续
+        # （re-raise 会连累后续 handler 漏跑，反而更危险）。
+        # C-01: 单环失败会造成 CSV/journal/内存 store 三者不一致且极难排查，
+        # 因此从 debug 升级为 warning + exc_info，并在 runtime 累计错误计数，
+        # 便于无人值守可观测。
         for k in _WIRE_ORDER:
             fn = table.get(k)
             if fn is None:
@@ -150,8 +163,19 @@ def _install_wire_handler(conn, kind: str, handler_fn) -> None:
             try:
                 fn(c, p_trade, logger)
             except Exception as e:
+                try:
+                    rt = getattr(c, '_runtime_state', None)
+                    if isinstance(rt, dict):
+                        ck = f'_metric_wire_handler_error_{k}'
+                        rt[ck] = int(rt.get(ck, 0) or 0) + 1
+                except Exception:
+                    pass
                 if logger:
-                    logger.debug(f'[wire:{k}] handler error: {e}')
+                    logger.warning(
+                        f'[wire:{k}] 成交入账 handler 异常（CSV/journal/store '
+                        f'可能不一致，请核对该笔成交）: {e}',
+                        exc_info=True,
+                    )
 
     _dispatch.__wire_dispatch__ = True
     runtime['_unified_trade_handler'] = _dispatch

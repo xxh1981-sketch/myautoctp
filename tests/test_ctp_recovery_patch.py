@@ -182,6 +182,43 @@ class TestPatchedRecoveryOk(unittest.TestCase):
         self.arr.run_post_reconnect_recovery(conn, _FakeLogger())
         self.assertFalse(conn._reconnect_quarantine)
 
+    # ---- H4: 撤单成功但交易所仍有非终结挂单 → 保持隔离 ----
+
+    def test_exchange_still_pending_keeps_quarantine(self):
+        conn = _build_conn(
+            cancel_return=1,
+            query_orders=[{
+                'status': '3',  # NO_TRADE_QUEUEING，非终结
+                'order_ref': 1234,
+                'volume_total': 1,
+                'price': 1.0,
+                'instrument': 'rb2401C4000',
+                'exchange_id': 'SHFE',
+                'direction': '0',
+                'offset': '0',
+            }],
+        )
+        self.arr.run_post_reconnect_recovery(conn, _FakeLogger())
+        self.assertTrue(
+            conn._reconnect_quarantine,
+            '撤单后交易所仍有非终结挂单时必须保留隔离期',
+        )
+
+    # ---- H4: 撤单成功且交易所仅余终结态订单 → 正常解除隔离 ----
+
+    def test_exchange_only_terminal_clears_quarantine(self):
+        conn = _build_conn(
+            cancel_return=1,
+            query_orders=[{
+                'status': '5',  # CANCELED，终结态，不计入 pending
+                'order_ref': 1234,
+                'instrument': 'rb2401C4000',
+                'exchange_id': 'SHFE',
+            }],
+        )
+        self.arr.run_post_reconnect_recovery(conn, _FakeLogger())
+        self.assertFalse(conn._reconnect_quarantine)
+
 
 if __name__ == '__main__':
     unittest.main()

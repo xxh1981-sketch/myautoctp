@@ -464,6 +464,66 @@ class TestMarginUnknownPreservesPrevState(unittest.TestCase):
             conn._runtime_state['_margin_halt_reason'], '保证金超限 (前一轮)',
         )
 
+    @patch('margin_check.check_margin_status', return_value=('unknown', '查询失败'))
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_unknown_streak_escalates_to_halt(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_process,
+        mock_status,
+    ):
+        """上一轮非 halt + 连续 unknown 达 margin_unknown_halt_after → 保守转 halt，
+        消除"查询长期失败时真实超限仍可新开"的盲区。"""
+        conn = _make_conn()
+        conn._runtime_state['_margin_halt_open'] = False
+        conn._runtime_state['_margin_halt_reason'] = ''
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('spread_fill_sync.count_spread_filled_open_orders', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'global_margin_limit': 100000,
+                    'margin_unknown_halt_after': 1,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertTrue(conn._runtime_state['_margin_halt_open'])
+        self.assertIn('查询失败', conn._runtime_state['_margin_halt_reason'])
+        self.assertGreaterEqual(
+            int(conn._runtime_state.get('_margin_unknown_streak', 0)), 1,
+        )
+
 
 class TestSyncStrangleOpenHalt(unittest.TestCase):
     """`_sync_strangle_open_halt` is the single source of truth for ledger
@@ -815,6 +875,140 @@ class TestJournalHaltMainLoop(unittest.TestCase):
         self.assertTrue(
             any('健康检查异常' in str(msg) for _, msg in logger.messages),
         )
+
+
+class TestSpreadLimitNotifiedResetsAcrossDay(unittest.TestCase):
+    """spread_limit_notified 进程长跑跨日复位：次日再次达限应再次告警。"""
+
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_limit_warning_refires_next_day(
+        self,
+        mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process,
+    ):
+        from datetime import date as _date
+
+        conn = _make_conn()
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        d1 = _date(2026, 5, 28)
+        d2 = _date(2026, 5, 29)
+        # today() 调用序: 初始化(d1) → iter1 价差段(d1) → iter2 价差段(d2)...
+        day_seq = [d1, d1, d2]
+        idx = {'n': 0}
+
+        def fake_today():
+            i = idx['n'] if idx['n'] < len(day_seq) else len(day_seq) - 1
+            idx['n'] += 1
+            return day_seq[i]
+
+        fake_date = MagicMock()
+        fake_date.today.side_effect = fake_today
+
+        def sleep_side(*a, **kw):
+            # iter2 价差段已消费 today()（idx>=3）后再结束，确保 warning2 已记录。
+            if idx['n'] >= 3:
+                raise KeyboardInterrupt
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('merged_main_loop.date', fake_date), \
+             patch('spread_fill_sync.count_spread_filled_open_orders', return_value=5), \
+             patch('time.sleep', side_effect=sleep_side):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        warns = [m for _, m in logger.messages if '日笔数达限' in str(m)]
+        self.assertEqual(
+            len(warns), 2,
+            f'跨日应各告警一次，实得 {len(warns)}: {warns}',
+        )
+
+
+class TestSlowRoundWatchdog(unittest.TestCase):
+    """单轮耗时超阈值应升级 WARNING + 计数 + 飞书（冷却）。"""
+
+    @patch('auto_feishu.send_feishu_message')
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_slow_round_warns_and_alerts(
+        self,
+        mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_feishu,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        from merged_main_loop import run_merged_main_loop
+        # round_slow_warn_sec 极小 → 任何真实耗时都超阈值，触发看门狗。
+        with patch('spread_fill_sync.count_spread_filled_open_orders', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'round_slow_warn_sec': 0.0001,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertTrue(
+            any('单轮耗时' in str(m) for _, m in logger.messages),
+            f'应有慢轮 WARNING: {[m for _, m in logger.messages]}',
+        )
+        self.assertGreaterEqual(
+            int(conn._runtime_state.get('_metric_slow_round_count', 0)), 1,
+        )
+        mock_feishu.assert_called_once()
 
 
 if __name__ == '__main__':
