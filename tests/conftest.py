@@ -57,7 +57,10 @@ if _use_autotrade_stubs():
     autotrade_stubs.ensure_autostraggle_stubs()
     _ensure_pairtrade_constants_stub()
 else:
-    # pytest-full: drop any in-memory auto_feishu left from a prior import order.
+    # pytest-full: inject AUTOTRADE_ROOT / AUTOSTRAGGLE_ROOT into sys.path
+    # before any test module imports spread_ledger (auto_connection) etc.
+    import ctp_bootstrap  # noqa: F401
+    # Drop any in-memory auto_feishu left from a prior import order.
     autotrade_stubs.ensure_auto_feishu_stub()
 
 
