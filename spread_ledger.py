@@ -6,14 +6,7 @@ import re
 import threading
 from typing import Dict, Optional
 
-_SYMBOL_PREFIX_RE = re.compile(r'^([A-Za-z]+)')
-
-
-def _symbol_prefix(instrument: str) -> str:
-    if not instrument:
-        return ''
-    m = _SYMBOL_PREFIX_RE.match(str(instrument).strip())
-    return m.group(1).lower() if m else ''
+from spread_contract_utils import symbol_prefix as _symbol_prefix
 
 
 class SpreadLegStore:

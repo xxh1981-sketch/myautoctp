@@ -118,6 +118,13 @@ def pytest_ignore_collect(collection_path, config):
             return True
     if not _autotrade_root_available() and name not in _unit_test_basenames():
         return True
+    # pytest-full (-m "not unit") 仍会 import 测试模块；unit 已在 pytest-unit 覆盖，跳过收集。
+    if (
+        _autotrade_root_available()
+        and os.environ.get('AUTOCTP_ALLOW_MISSING_DEPS', '').strip() != '1'
+        and name in _unit_test_basenames()
+    ):
+        return True
     return False
 
 

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Dict, List, Set, Tuple
 
-from auto_connection import extract_symbol_prefix
-from auto_connection_utils import months_match
-from auto_position import extract_strike_from_instrument
+from spread_contract_utils import (
+    extract_strike_from_instrument,
+    months_match,
+    symbol_prefix as extract_symbol_prefix,
+)
 from spread_ledger import store_from_conn
 from spread_reconcile import (
     STRANGLE_TRANSIENT_STREAK_KEY,
