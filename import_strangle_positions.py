@@ -8,7 +8,6 @@ from typing import Dict, Set
 
 from atomic_io import atomic_write_text
 from env_utils import is_config_abs_path
-from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
     'instrument', 'volume',
@@ -310,6 +309,8 @@ def main(argv=None) -> int:
         help='also clear positions/unmatched runtime fields',
     )
     args = parser.parse_args(argv)
+
+    from merged_config import load_merged_config
 
     config = load_merged_config()
     ledger_path = config['strangle']['ledger_path']

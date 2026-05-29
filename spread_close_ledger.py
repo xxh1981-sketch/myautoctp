@@ -5,7 +5,8 @@ from __future__ import annotations
 import time
 from typing import List, Tuple
 
-from auto_connection import extract_symbol_prefix, months_match
+from auto_connection import extract_symbol_prefix
+from auto_connection_utils import months_match
 from spread_ledger import store_from_conn
 
 _ORIG_PROCESS_CLOSE = None

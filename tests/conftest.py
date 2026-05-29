@@ -60,8 +60,23 @@ else:
     # pytest-full: inject AUTOTRADE_ROOT / AUTOSTRAGGLE_ROOT into sys.path
     # before any test module imports spread_ledger (auto_connection) etc.
     import ctp_bootstrap  # noqa: F401
-    # Drop any in-memory auto_feishu left from a prior import order.
     autotrade_stubs.ensure_auto_feishu_stub()
+
+
+def _bootstrap_test_deps() -> None:
+    """Idempotent: ensure autotrade paths or stubs before test module import."""
+    if _use_autotrade_stubs():
+        autotrade_stubs.ensure_auto_feishu_stub()
+        autotrade_stubs.ensure_autotrade_stubs(autotrade_stubs.ALL_STUB_MODULES)
+        autotrade_stubs.ensure_autostraggle_stubs()
+        _ensure_pairtrade_constants_stub()
+    else:
+        import ctp_bootstrap  # noqa: F401
+        autotrade_stubs.ensure_auto_feishu_stub()
+
+
+def pytest_configure(config) -> None:
+    _bootstrap_test_deps()
 
 
 def _unit_test_basenames() -> set[str]:

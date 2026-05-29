@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autotrade_stubs
 
 autotrade_stubs.ensure_autotrade_stubs(['auto_connection'])
+import ctp_bootstrap  # noqa: F401 — pytest-full 注入 AUTOTRADE_ROOT
 
 from spread_derive import (
     _is_long,

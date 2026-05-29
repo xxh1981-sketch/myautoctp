@@ -3,8 +3,6 @@
 import os
 from typing import Any, Dict, Tuple
 
-import ctp_bootstrap
-
 STRANGLE_DEFAULTS = {
     'enabled': True,
     'daily_buy_limit_yuan': 300000,
@@ -171,6 +169,8 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
 
 
 def load_merged_config(local_path: str = None) -> Dict[str, Any]:
+    import ctp_bootstrap
+
     local_path = local_path or os.path.join(_project_dir(), 'merged_config.yaml')
     pre_cfg = {}
     if os.path.isfile(local_path):

@@ -8,7 +8,6 @@ from typing import Dict
 
 from atomic_io import atomic_write_text
 from env_utils import is_config_abs_path
-from merged_config import load_merged_config
 
 _CSV_HEADERS = frozenset({
     'instrument', 'volume',
@@ -182,6 +181,7 @@ def sync_spread_leg_claims(
 
 
 def _load_config_with_tradeinfo():
+    from merged_config import load_merged_config
     from merged_tradeinfo import load_dual_tradeinfo
 
     config = load_merged_config()
