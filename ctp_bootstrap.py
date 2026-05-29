@@ -15,12 +15,12 @@ def _resolve_root(
     env = os.environ.get(env_key, '').strip()
     if env:
         return os.path.abspath(env)
+    if allow_missing:
+        # CI / unit 测试：仅认显式 env，忽略 merged_config 与内置 D:\ 默认路径，
+        # 避免本机有 D:\autotrade 时污染 sys.path、与 conftest stub 冲突。
+        return None
     if config_val:
         return os.path.abspath(config_val)
-    if allow_missing:
-        # CI / 无源码测试：不回落到内置 D:\ 默认路径，避免本机有目录时
-        # 污染 sys.path、与 conftest stub 冲突。
-        return None
     if os.path.isdir(default):
         return os.path.abspath(default)
     return os.path.abspath(default)

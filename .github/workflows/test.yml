@@ -160,7 +160,7 @@ jobs:
           AUTOTRADE_ROOT: ${{ github.workspace }}/autotrade
           AUTOSTRAGGLE_ROOT: ${{ github.workspace }}/autostraggle
           AUTOCTP_STUB_OPENCTP: '1'
-        run: pytest tests/ -q --tb=long --strict-markers
+        run: pytest tests/ -m "not unit" -q --tb=long --strict-markers
 
       - name: Run autotrade-only integration suite
         if: steps.check_deps.outputs.configured == 'true' && steps.check_deps.outputs.autostraggle_configured != 'true'

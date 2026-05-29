@@ -57,6 +57,31 @@ class TestCtpBootstrapSoftFail(unittest.TestCase):
                 f'allow_missing 时不应新加入默认路径 {abspath}',
             )
 
+    def test_allow_missing_ignores_merged_config_roots(self):
+        """allow_missing 时 merged_config 里的 autotrade_root 也不应入 path。"""
+        os.environ['AUTOCTP_ALLOW_MISSING_DEPS'] = '1'
+        os.environ.pop('AUTOTRADE_ROOT', None)
+        os.environ.pop('AUTOSTRAGGLE_ROOT', None)
+        cfg = {
+            'merged': {
+                'autotrade_root': r'D:\autotrade',
+                'autostraggle_root': r'D:\autostraggle',
+            },
+        }
+        before = set(boot.sys.path)
+        with patch.object(boot.os.path, 'isdir', return_value=True):
+            rt, rg = boot.setup_paths(cfg)
+        after = set(boot.sys.path)
+        self.assertEqual(rt, '')
+        self.assertEqual(rg, '')
+        for default in (r'D:\autotrade', r'D:\autostraggle'):
+            abspath = boot.os.path.abspath(default)
+            self.assertNotIn(
+                abspath,
+                after - before,
+                f'allow_missing 时不应使用 merged_config 路径 {abspath}',
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

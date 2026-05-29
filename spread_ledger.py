@@ -6,7 +6,14 @@ import re
 import threading
 from typing import Dict, Optional
 
-from auto_connection import extract_symbol_prefix
+_SYMBOL_PREFIX_RE = re.compile(r'^([A-Za-z]+)')
+
+
+def _symbol_prefix(instrument: str) -> str:
+    if not instrument:
+        return ''
+    m = _SYMBOL_PREFIX_RE.match(str(instrument).strip())
+    return m.group(1).lower() if m else ''
 
 
 class SpreadLegStore:
@@ -52,7 +59,7 @@ class SpreadLegStore:
             return False
         if re.search(r'[-]?C[-]?\d', inst):
             return True
-        prefix = extract_symbol_prefix(inst)
+        prefix = _symbol_prefix(inst)
         if not prefix:
             return False
         tail = inst[len(prefix):].upper()

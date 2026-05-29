@@ -21,6 +21,7 @@ UNIT_TESTS = [
     'tests/test_weekend_pause_patch.py',
     'tests/test_runtime_risk_alerts.py',
     'tests/test_spread_claims_guard.py',
+    'tests/test_spread_close_ledger.py',
     'tests/test_strangle_positions_csv.py',
     'tests/test_ctp_bootstrap.py',
     'tests/test_ctp_heartbeat_guard.py',
