@@ -41,9 +41,11 @@ flowchart LR
 | **对账 halt** | CSV ≠ CTP | **close-only** | `open_halted` |
 | **日限 halt** | `daily_trade_limit` 达限 | 完整 `process_symbol`，禁新开 | 日金额限新开 |
 | **保证金 halt** | `global_margin_limit` 超限 | 完整 `process_symbol`，开仓/再平衡内检查 | `open_halted`（保证金） |
+| **journal halt** | unresolved pending | 禁新开，仍扫平仓 | `open_halted`（journal 检查后立即同步） |
 
-- 对账 halt 时账本不可信，禁止再平衡/开仓，仅尝试按认领平仓。
-- 日限/保证金 halt 时账本可信，仍走 autotrade 完整平仓条件与冷却；**不是**紧急全平。
+- 对账 halt 时账本不可信，禁止再平衡/开仓，仅尝试按认领平仓；宽跨再平衡降级 close-only。
+- 日限/保证金/journal halt 时账本大体可信或需保守禁新开，仍走 autotrade 完整平仓条件与冷却；**不是**紧急全平。
+- journal halt 触发/解除后，宽跨 `open_halted` 在 journal 检查块末尾立即同步（与价差 `spread_open_ok` 同轮）。
 
 ## spread_positions.csv 为空
 

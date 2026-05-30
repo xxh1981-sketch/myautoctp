@@ -527,7 +527,7 @@ class TestMarginUnknownPreservesPrevState(unittest.TestCase):
 
 class TestSyncStrangleOpenHalt(unittest.TestCase):
     """`_sync_strangle_open_halt` is the single source of truth for ledger
-    open_halted given (reconcile halt, margin halt)."""
+    open_halted given (reconcile halt, margin halt, journal halt)."""
 
     def _fake_ledger(self, halted=False, reason=''):
         ledger = MagicMock()
@@ -594,6 +594,29 @@ class TestSyncStrangleOpenHalt(unittest.TestCase):
         ledger, _ = self._fake_ledger(halted=True, reason='保证金超限')
         _sync_strangle_open_halt(conn, ledger, {})
         ledger.set_open_halt.assert_not_called()
+
+    def test_journal_halt_sets_ledger_with_reason(self):
+        from merged_main_loop import _sync_strangle_open_halt
+        conn = _make_conn()
+        conn._runtime_state['_journal_halt_open'] = True
+        conn._runtime_state['_journal_halt_reason'] = 'journal未完成入账 1 条'
+        ledger, state = self._fake_ledger()
+        _sync_strangle_open_halt(conn, ledger, {})
+        self.assertTrue(state['halted'])
+        self.assertIn('journal', state['reason'].lower())
+
+    def test_reconcile_reason_wins_over_journal(self):
+        from merged_main_loop import _sync_strangle_open_halt
+        conn = _make_conn()
+        conn._runtime_state['_strangle_reconcile_halt'] = True
+        conn._runtime_state['_strangle_reconcile_issues'] = ['SA609 gap=1']
+        conn._runtime_state['_journal_halt_open'] = True
+        conn._runtime_state['_journal_halt_reason'] = 'journal未完成入账 1 条'
+        ledger, state = self._fake_ledger()
+        _sync_strangle_open_halt(conn, ledger, {})
+        self.assertTrue(state['halted'])
+        self.assertIn('gap', state['reason'])
+        self.assertNotIn('journal', state['reason'].lower())
 
 
 class TestRebalanceCloseOnlyOnStrangleReconcileHalt(unittest.TestCase):
@@ -818,6 +841,16 @@ class TestJournalHaltMainLoop(unittest.TestCase):
         )
         self.assertTrue(
             any('暂停新开' in str(msg) for _, msg in logger.messages),
+        )
+        ledger.set_open_halt.assert_called()
+        journal_sync = [
+            c for c in ledger.set_open_halt.call_args_list
+            if c.args and c.args[0] is True
+            and 'journal' in str(c.args[1] if len(c.args) > 1 else '').lower()
+        ]
+        self.assertTrue(
+            journal_sync,
+            'journal halt should sync to strangle ledger immediately after journal check',
         )
 
     @patch('merged_main_loop._run_reconcile', return_value=(False, [], False, []))
