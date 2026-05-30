@@ -63,6 +63,38 @@ class TestRegimeVixUnified(unittest.TestCase):
         self.assertIn('608', msg)
         self.assertIn('609', msg)
 
+    def test_cache_hit_does_not_relog_unavailable(self):
+        """同轮缓存命中（逐腿 check_exit）时不重复打 "VIX 无法计算"。"""
+        engine = MagicMock()
+        engine.calculate_vix.return_value = None
+        conn = MagicMock()
+        conn._runtime_state = {MERGED_REGIME_VIX_CACHE_KEY: {}}
+        conn._normalize_month = lambda s, m: str(m)
+        logger = MagicMock()
+
+        for _ in range(5):
+            self.assertIsNone(
+                calculate_vix_for_month(engine, 'lc', '609', conn, logger)
+            )
+        engine.calculate_vix.assert_called_once()
+        self.assertEqual(logger.info.call_count, 1)
+
+    def test_cache_hit_does_not_relog_alignment(self):
+        """同轮缓存命中时不重复触发月份对照与近月复算。"""
+        engine = MagicMock()
+        engine.calculate_vix.return_value = 22.0
+        engine.discover_nearby_next.return_value = {'nearby_month': '608'}
+        conn = MagicMock()
+        conn._runtime_state = {MERGED_REGIME_VIX_CACHE_KEY: {}}
+        conn._normalize_month = lambda s, m: str(m)
+        logger = MagicMock()
+
+        for _ in range(5):
+            calculate_vix_for_month(engine, 'ma', '609', conn, logger)
+        engine.calculate_vix.assert_called_once()
+        engine.discover_nearby_next.assert_called_once()
+        self.assertEqual(logger.info.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -100,6 +100,22 @@ open_clip:
   floor_to_one_after_precheck: true
 
 log_level: INFO
+# 日志降噪（只收敛输出，不改 VIX 算法/缓存，不改 autotrade）：
+# - throttle_substrings：命中的 INFO/WARNING 在窗口内"同一条完整文本"只输出一次
+#   （压制 autotrade VIX 在宽跨路径同品种一轮重复打印十余次的噪音）。
+# - downgrade：把非交易态撤单回报等"预期摩擦"从 ERROR 降级（默认→WARNING）。
+# 安全：ERROR 及以上不会被节流；交易动作类日志（触发/开仓/平仓/账本选中）不在匹配范围。
+# 临时排障想看全量重复日志：把 enabled 置 false。
+log_noise:
+  enabled: true
+  throttle_window_sec: 60
+  throttle_substrings:
+    - 提升次近月为近月
+    - 品种整体 VIX 无法计算
+    - VIX无法计算
+  downgrade:
+    - substring: 当前状态禁止此项操作
+      to_level: WARNING
 loop_interval: 10
 # 未在 merged_config.yaml 显式设置时默认 10 万元；设为 0 且未 block 则警告（无人值守默认 block）
 global_margin_limit: 100000

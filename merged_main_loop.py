@@ -613,6 +613,11 @@ def run_merged_main_loop(
                         conn._runtime_state['_journal_halt_reason'] = (
                             f'journal健康检查异常: {e}'
                         )
+                    # journal 状态变更后立即同步宽跨 open_halt，与价差侧
+                    # spread_open_ok 同轮对齐，避免等 reconcile/margin 复检才
+                    # set_open_halt（最多 reconcile_interval 的窗口）。
+                    if str_cfg.get('pause_open_on_reconcile_mismatch', True):
+                        _sync_strangle_open_halt(conn, ledger, str_cfg)
                 _update_bool_metric(
                     conn._runtime_state, 'journal_halt',
                     bool(conn._runtime_state.get('_journal_halt_open', False)),
