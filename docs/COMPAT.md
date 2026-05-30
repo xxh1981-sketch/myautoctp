@@ -25,6 +25,7 @@ pytest D:\autoctp\tests\ -q
 | （填写） | `git rev-parse --short HEAD` | … | … | 大版本上线前记录 |
 | 2026-05-30 | `ae4fca7` | `45392a4` | `5b164c4` | 新增日志降噪过滤器（节流重复 VIX 日志 / 降级预期撤单回报），全量 unit 测试通过 |
 | 2026-05-30 | `9e05768` | `45392a4` | `5b164c4` | journal halt 同轮同步宽跨 open_halt；ARCHITECTURE 补 halt 语义 |
+| 2026-05-30 | `9e05768` | `45392a4` | `2fd677a` | autostraggle：同轮 VIX 缓存命中不再重复打日志（CI test_regime_vix_unified） |
 
 ## 兼容锁（启动自检）
 
