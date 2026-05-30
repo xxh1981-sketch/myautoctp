@@ -23,6 +23,7 @@ pytest D:\autoctp\tests\ -q
 | 日期 | autoctp | autotrade | autostraggle | 备注 |
 |------|---------|-----------|--------------|------|
 | （填写） | `git rev-parse --short HEAD` | … | … | 大版本上线前记录 |
+| 2026-05-30 | `ae4fca7` | `45392a4` | `5b164c4` | 新增日志降噪过滤器（节流重复 VIX 日志 / 降级预期撤单回报），全量 unit 测试通过 |
 
 ## 兼容锁（启动自检）
 
