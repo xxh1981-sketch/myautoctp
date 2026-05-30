@@ -31,6 +31,7 @@ UNIT_TESTS = [
     'tests/test_env_utils.py',
     'tests/test_merged_vix_cache.py',
     'tests/test_merged_strategy_logger.py',
+    'tests/test_log_noise_filter.py',
     'tests/test_margin_check_unit.py',
     'tests/test_spread_position_adjust_unit.py',
     'tests/test_spread_derive_unit.py',

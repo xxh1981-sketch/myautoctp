@@ -123,6 +123,22 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'compat_lock_path': 'docs/compat_lock.yaml',
     'compat_lock_enforce': False,
     'compat_lock_warn_dirty': True,
+    # 日志降噪：节流 autotrade VIX 重复提示（同品种一轮十余次）+ 把非交易态
+    # "撤单 当前状态禁止此项操作" 这类预期回报从 ERROR 降为 WARNING。
+    # 仅作用于日志输出，不改 VIX 算法 / 每轮缓存 / autotrade 代码；ERROR 及以上
+    # 永不被节流，交易动作类日志不在匹配范围。
+    'log_noise': {
+        'enabled': True,
+        'throttle_window_sec': 60,
+        'throttle_substrings': [
+            '提升次近月为近月',
+            '品种整体 VIX 无法计算',
+            'VIX无法计算',
+        ],
+        'downgrade': [
+            {'substring': '当前状态禁止此项操作', 'to_level': 'WARNING'},
+        ],
+    },
 }
 
 
@@ -275,6 +291,17 @@ def setup_merged_logger(config: Dict[str, Any]):
         _install_rotating_log_handler(logger, config)
     except Exception as e:
         logger.warning(f'[日志] 轮转升级失败，沿用原 FileHandler: {e}')
+    # 降噪过滤器：节流 autotrade VIX 重复提示 + 把非交易态撤单回报降级为 WARNING。
+    # 失败仅告警（退回原始噪音输出），不致命。
+    try:
+        from log_noise_filter import install_log_noise_filter, get_install_error
+        if not install_log_noise_filter(logger, config):
+            logger.warning(
+                '[日志] 降噪过滤器未安装: %s（沿用原始日志输出）',
+                get_install_error() or '未知原因',
+            )
+    except Exception as e:
+        logger.warning(f'[日志] 降噪过滤器安装异常: {e}')
     return logger
 
 
