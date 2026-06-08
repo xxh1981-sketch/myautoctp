@@ -211,12 +211,28 @@ def process_close_from_spread_ledger(
 
 
 def _ctp_still_has_residual(conn, symbol: str, month: str, logger) -> bool:
-    """Cross-check CTP positions; True iff CTP still shows any spread leg."""
+    """Cross-check CTP positions; True iff CTP still shows any spread leg.
+
+    Strangle-owned long calls on the same symbol+month are subtracted first so a
+    strangle holding is not counted as spread residual (false 需人工检查 alarm).
+    """
     try:
         positions = conn.query_positions_sync(timeout=5) or []
     except Exception as e:
         logger.debug(f'[{symbol}] CTP 持仓复查失败: {e}，按账本残留判断')
         return True
+
+    try:
+        from spread_position_adjust import (
+            _ledger_from_conn,
+            exclude_strangle_from_positions,
+            merge_strangle_owned_volumes,
+        )
+        vols = merge_strangle_owned_volumes(_ledger_from_conn(conn))
+        if vols:
+            positions = exclude_strangle_from_positions(positions, vols, None, symbol)
+    except Exception:
+        pass
 
     sym = symbol.lower()
     try:

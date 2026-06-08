@@ -228,6 +228,148 @@ def install_spread_process_symbol_halt(config: dict) -> None:
         _rebind_module_attr(mod_name, 'process_symbol', patched_process_symbol)
 
 
+_RISK_CHECK_PATCHED = False
+_REBALANCE_CLOSE_A_PATCHED = False
+
+
+def _dual_isolation_active(config: dict) -> bool:
+    """True when spread must isolate strangle-owned legs (ledger or exclusion on)."""
+    dual = config.get('dual_strategy') or {}
+    return bool(
+        spread_execution_from_ledger(config)
+        or dual.get('exclude_strangle_from_spread_positions', True)
+    )
+
+
+def _resolve_spread_positions_for_risk(conn, raw_positions, symbol, month, config):
+    """Spread-only A/B view for executor risk checks: ledger truth or CTP−strangle.
+
+    Mirrors ``install_spread_analyze_from_ledger._resolve_positions`` so the
+    executor never counts strangle long calls on a shared symbol+month as spread A.
+    """
+    store = store_from_conn(conn)
+    if store is not None:
+        return build_positions_from_spread_claims(store, conn, symbol, month)
+    dual = config.get('dual_strategy') or {}
+    if dual.get('exclude_strangle_from_spread_positions', True):
+        ledger = _ledger_from_conn(conn)
+        vols = merge_strangle_owned_volumes(ledger)
+        if vols:
+            return exclude_strangle_from_positions(raw_positions, vols, None, symbol)
+    return raw_positions
+
+
+def install_spread_risk_check_exclusion(config: dict) -> None:
+    """Wrap executor.check_risk_limits so A/B counts exclude strangle-owned long calls.
+
+    autotrade's ``RiskCheckMixin.check_risk_limits`` reads ``conn.position_tracker``
+    (full CTP). On a symbol+month shared with strangle, strangle long calls inflate
+    spread ``A_current`` → false "A类超限" / 2:1 failures during stage-3 open and B
+    retries. We resolve the tracker's per-symbol view to the spread ledger /
+    CTP−strangle only while the original check runs, then restore it.
+    """
+    global _RISK_CHECK_PATCHED
+    if _RISK_CHECK_PATCHED:
+        return
+    if not _dual_isolation_active(config):
+        return
+
+    import auto_executor_select
+
+    cls = auto_executor_select.RiskCheckMixin
+    orig_check = cls.check_risk_limits
+
+    def patched_check_risk_limits(
+        self, planned_A_groups=1, planned_B_groups=1, enforce_ratio=True,
+    ):
+        tracker = getattr(self.conn, 'position_tracker', None)
+        if tracker is None:
+            return orig_check(
+                self, planned_A_groups, planned_B_groups, enforce_ratio,
+            )
+        orig_get = tracker.get_positions_for_symbol
+        had_own = 'get_positions_for_symbol' in getattr(tracker, '__dict__', {})
+
+        def filtered_get(symbol, month=None, normalized_month=None):
+            raw = orig_get(symbol, month, normalized_month)
+            try:
+                return _resolve_spread_positions_for_risk(
+                    self.conn, raw, symbol, month, self.config,
+                )
+            except Exception:
+                return raw
+
+        tracker.get_positions_for_symbol = filtered_get
+        try:
+            return orig_check(
+                self, planned_A_groups, planned_B_groups, enforce_ratio,
+            )
+        finally:
+            if had_own:
+                tracker.get_positions_for_symbol = orig_get
+            else:
+                tracker.__dict__.pop('get_positions_for_symbol', None)
+
+    cls.check_risk_limits = patched_check_risk_limits
+    _RISK_CHECK_PATCHED = True
+
+
+def install_spread_rebalance_close_a_exclusion(config: dict) -> None:
+    """Filter rebalance_close_A_positions candidates through spread ledger / exclusion.
+
+    Under margin-halt, autotrade may sell-close excess A. Its candidate list comes
+    from raw CTP long calls (``query_positions_fallback``); on a shared symbol+month
+    that could target strangle long calls. We resolve the position source to
+    spread-owned legs while the close runs so only spread A legs are sold.
+    """
+    global _REBALANCE_CLOSE_A_PATCHED
+    if _REBALANCE_CLOSE_A_PATCHED:
+        return
+    if not _dual_isolation_active(config):
+        return
+
+    import auto_rebalance
+
+    if not hasattr(auto_rebalance, 'rebalance_close_A_positions'):
+        return
+    orig_fn = auto_rebalance.rebalance_close_A_positions
+    orig_qpf = auto_rebalance.query_positions_fallback
+
+    def patched_rebalance_close_A(
+        conn, analysis, symbol, month, min_tick, cfg, logger, vol_of_combo,
+    ):
+        target_month = month
+
+        def resolver(
+            c, timeout=5, logger=None, symbol=None,
+            month=None, normalized_month=None,
+        ):
+            raw = orig_qpf(
+                c, timeout=timeout, logger=logger, symbol=symbol,
+                month=month, normalized_month=normalized_month,
+            )
+            if not raw:
+                return raw
+            eff_month = month if month is not None else target_month
+            try:
+                return _resolve_spread_positions_for_risk(
+                    c, raw, symbol, eff_month, cfg or config,
+                )
+            except Exception:
+                return raw
+
+        auto_rebalance.query_positions_fallback = resolver
+        try:
+            return orig_fn(
+                conn, analysis, symbol, month, min_tick, cfg, logger, vol_of_combo,
+            )
+        finally:
+            auto_rebalance.query_positions_fallback = orig_qpf
+
+    auto_rebalance.rebalance_close_A_positions = patched_rebalance_close_A
+    _REBALANCE_CLOSE_A_PATCHED = True
+
+
 def install_spread_ledger_execution(config: dict) -> None:
     """Install all spread ledger-driven execution patches (idempotent)."""
     global _INSTALLED
@@ -237,6 +379,8 @@ def install_spread_ledger_execution(config: dict) -> None:
     install_spread_close_from_ledger(config)
     install_spread_rebalance_from_ledger(config)
     install_spread_process_symbol_halt(config)
+    install_spread_risk_check_exclusion(config)
+    install_spread_rebalance_close_a_exclusion(config)
     _INSTALLED = True
 
 

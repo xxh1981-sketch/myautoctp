@@ -17,7 +17,11 @@ def _rebind_auto_processor_attr(attr: str, value) -> None:
 
 
 def merge_strangle_owned_volumes(ledger) -> Dict[str, int]:
-    """Physical long-option volumes owned by strangle (CSV claims + unmatched legs)."""
+    """Physical long-option volumes owned by strangle (CSV claims + unmatched legs).
+
+    ``awaiting_phase2`` 的 Phase1 成交在登记未配对前已写入 ``leg_claims``（CSV），
+    不得再把 ``filled_instrument`` 与 CSV 相加（否则账户分解会出现虚假「外部差额」）。
+    """
     if ledger is None:
         return {}
     vols: Dict[str, int] = {}
@@ -26,6 +30,8 @@ def merge_strangle_owned_volumes(ledger) -> Dict[str, int]:
         if key and int(v) > 0:
             vols[key] = vols.get(key, 0) + int(v)
     for item in ledger.list_unmatched_legs():
+        if item.get('kind') == 'awaiting_phase2':
+            continue
         inst = (
             item.get('filled_instrument')
             or (item.get('leg') or {}).get('inst')
@@ -35,8 +41,10 @@ def merge_strangle_owned_volumes(ledger) -> Dict[str, int]:
             continue
         leg = item.get('leg') or {}
         v = int(item.get('volume') or leg.get('volume') or 1)
+        if v <= 0:
+            continue
         key = inst.upper()
-        vols[key] = vols.get(key, 0) + max(v, 0)
+        vols[key] = int(vols.get(key, 0) or 0) + v
     return vols
 
 
@@ -124,3 +132,12 @@ def install_spread_excludes_strangle(config: dict) -> None:
     auto_position.analyze_position_imbalance = patched_analyze
     auto_position.check_position_limits = patched_check
     _rebind_auto_processor_attr('analyze_position_imbalance', patched_analyze)
+
+    import sys
+
+    reb = sys.modules.get('auto_rebalance')
+    if reb is not None:
+        if hasattr(reb, 'analyze_position_imbalance'):
+            reb.analyze_position_imbalance = patched_analyze
+        if hasattr(reb, 'check_position_limits'):
+            reb.check_position_limits = patched_check

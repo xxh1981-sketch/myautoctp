@@ -148,6 +148,79 @@ class TestProcessSymbolPatchReachesMainLoop(unittest.TestCase):
             sys.modules.pop('autoctp_test_fake_consumer', None)
 
 
+class _FakeStrangleLedger:
+    def __init__(self, claims=None, unmatched=None):
+        self._claims = claims or {}
+        self._unmatched = unmatched or []
+
+    def list_leg_claims(self):
+        return dict(self._claims)
+
+    def list_unmatched_legs(self):
+        return list(self._unmatched)
+
+
+class TestResolveSpreadPositionsForRisk(unittest.TestCase):
+    """共享口径：check_risk_limits / rebalance 平A 候选都经此解析，只数价差腿。"""
+
+    def _conn(self):
+        conn = MagicMock()
+        conn._runtime_state = {}
+        conn._normalize_month = lambda symbol, month: month
+        return conn
+
+    def test_dual_isolation_active_default_true(self):
+        import spread_ledger_execution as sle
+        self.assertTrue(sle._dual_isolation_active({'dual_strategy': {}}))
+
+    def test_dual_isolation_inactive_when_all_off(self):
+        import spread_ledger_execution as sle
+        cfg = {'dual_strategy': {
+            'use_spread_leg_claims': False,
+            'spread_execution_from_ledger': False,
+            'spread_close_from_ledger': False,
+            'exclude_strangle_from_spread_positions': False,
+        }}
+        self.assertFalse(sle._dual_isolation_active(cfg))
+
+    def test_store_path_returns_only_ledger_legs(self):
+        import spread_ledger_execution as sle
+        from spread_ledger import SpreadLegStore
+
+        conn = self._conn()
+        store = SpreadLegStore()
+        store.set_leg_claims({'SA609C2400': 1, 'SA609C2500': -2})
+        conn._runtime_state['_spread_leg_store'] = store
+        raw = [
+            {'instrument': 'SA609C2400', 'direction': '2', 'position': 99},
+            {'instrument': 'SA609C9999', 'direction': '2', 'position': 20},
+        ]
+        out = sle._resolve_spread_positions_for_risk(
+            conn, raw, 'SA', '609', {'dual_strategy': {}},
+        )
+        by_inst = {p['instrument']: int(p['position']) for p in out}
+        self.assertEqual(by_inst.get('SA609C2400'), 1)
+        self.assertNotIn('SA609C9999', by_inst)
+
+    def test_no_store_excludes_strangle_long(self):
+        import spread_ledger_execution as sle
+
+        conn = self._conn()
+        conn._runtime_state['_strangle_ledger'] = _FakeStrangleLedger(
+            claims={'MA609C3650': 20},
+        )
+        raw = [
+            {'instrument': 'MA609C3650', 'direction': '2', 'position': 20},
+            {'instrument': 'MA609C3700', 'direction': '3', 'position': 10},
+        ]
+        out = sle._resolve_spread_positions_for_risk(
+            conn, raw, 'MA', '609', {'dual_strategy': {}},
+        )
+        by_inst = {p['instrument']: int(p['position']) for p in out}
+        self.assertNotIn('MA609C3650', by_inst)
+        self.assertEqual(by_inst.get('MA609C3700'), 10)
+
+
 class TestRebindModuleAttrHelper(unittest.TestCase):
 
     def test_returns_0_when_module_missing(self):

@@ -18,11 +18,24 @@ from spread_reconcile import (
     _previous_halt_state,
     _signed_from_position_row,
     _spread_symbol_months,
+    _strangle_long_calls_for_spread,
     ctp_spread_signed_claims,
     reconcile_spread_positions,
     SPREAD_TRANSIENT_STREAK_KEY,
 )
 from spread_ledger import SpreadLegStore
+
+
+class FakeStrangleLedger:
+    def __init__(self, claims=None, unmatched=None):
+        self._claims = claims or {}
+        self._unmatched = unmatched or []
+
+    def list_leg_claims(self):
+        return dict(self._claims)
+
+    def list_unmatched_legs(self):
+        return list(self._unmatched)
 
 
 class FakeConn:
@@ -169,6 +182,55 @@ class TestSpreadReconcilePure(unittest.TestCase):
         halt, issues = reconcile_spread_positions(conn, tradeinfo, None, config=cfg)
         self.assertTrue(halt)
         self.assertTrue(any('连续 2 次 transient' in i for i in issues))
+
+
+class TestStrangleLongCallsForSpread(unittest.TestCase):
+    """对账侧宽跨多头扣减：含 leg_claims + 未配对腿，排除 awaiting_phase2，仅 Call。"""
+
+    def test_none_ledger_returns_empty(self):
+        conn = FakeConn()
+        self.assertEqual(_strangle_long_calls_for_spread(conn), {})
+
+    def test_leg_claims_calls_only(self):
+        conn = FakeConn()
+        conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(
+            claims={'SA609C2400': 2, 'SA609P1900': 5},
+        )
+        out = _strangle_long_calls_for_spread(conn)
+        self.assertEqual(out['SA609C2400'], 2)
+        self.assertNotIn('SA609P1900', out)
+
+    def test_includes_unmatched_legs(self):
+        conn = FakeConn()
+        conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(
+            claims={'SA609C2400': 1},
+            unmatched=[{'filled_instrument': 'MA609C3650', 'volume': 20}],
+        )
+        out = _strangle_long_calls_for_spread(conn)
+        self.assertEqual(out['SA609C2400'], 1)
+        self.assertEqual(out['MA609C3650'], 20)
+
+    def test_awaiting_phase2_not_double_counted(self):
+        conn = FakeConn()
+        conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(
+            claims={'RM609C2750': 29},
+            unmatched=[{
+                'kind': 'awaiting_phase2',
+                'filled_instrument': 'RM609C2750',
+                'leg': {'inst': 'RM609P2025'},
+                'volume': 8,
+            }],
+        )
+        out = _strangle_long_calls_for_spread(conn)
+        self.assertEqual(out['RM609C2750'], 29)
+
+    def test_preserves_lowercase_symbol_case(self):
+        conn = FakeConn()
+        conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(
+            unmatched=[{'filled_instrument': 'm2609-C-3400', 'volume': 50}],
+        )
+        out = _strangle_long_calls_for_spread(conn)
+        self.assertEqual(out['m2609-C-3400'], 50)
 
 
 if __name__ == '__main__':
