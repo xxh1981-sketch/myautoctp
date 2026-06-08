@@ -82,23 +82,56 @@ def ctp_spread_signed_claims(
 
 
 def _strangle_long_calls_for_spread(conn) -> Dict[str, int]:
-    """Pull strangle long-call leg claims off conn for subtraction (Call only)."""
+    """Strangle-owned long Call volume for spread reconcile subtraction (Call only).
+
+    Includes both CSV ``leg_claims`` and filled-but-unmatched legs (excluding
+    ``awaiting_phase2``, whose Phase1 fill is already in ``leg_claims``), matching
+    ``merge_strangle_owned_volumes`` so a strangle long Call held in CTP but not yet
+    paired is not mis-flagged as spread "CTP ahead" → false ``_spread_open_halted``.
+
+    Original instrument case is preserved (unlike ``merge_strangle_owned_volumes``,
+    which upper-cases) because the consumer ``ctp_spread_signed_claims`` matches
+    against raw CTP instrument ids (e.g. lowercase ``m2609-C-3400``).
+    """
     from spread_ledger import SpreadLegStore
 
     runtime = getattr(conn, '_runtime_state', None) or {}
     ledger = runtime.get('_strangle_ledger')
     if ledger is None:
         return {}
+
+    raw: Dict[str, int] = {}
     try:
-        claims = ledger.list_leg_claims()
+        for inst, vol in (ledger.list_leg_claims() or {}).items():
+            try:
+                vol = int(vol)
+            except Exception:
+                continue
+            if vol > 0:
+                raw[inst] = raw.get(inst, 0) + vol
     except Exception:
         return {}
+
+    try:
+        for item in ledger.list_unmatched_legs():
+            if item.get('kind') == 'awaiting_phase2':
+                continue
+            inst = (
+                item.get('filled_instrument')
+                or (item.get('leg') or {}).get('inst')
+                or ''
+            ).strip()
+            if not inst:
+                continue
+            leg = item.get('leg') or {}
+            vol = int(item.get('volume') or leg.get('volume') or 1)
+            if vol > 0:
+                raw[inst] = raw.get(inst, 0) + vol
+    except Exception:
+        pass
+
     out: Dict[str, int] = {}
-    for inst, vol in (claims or {}).items():
-        try:
-            vol = int(vol)
-        except Exception:
-            continue
+    for inst, vol in raw.items():
         if vol <= 0:
             continue
         if not SpreadLegStore._is_call_instrument(inst):

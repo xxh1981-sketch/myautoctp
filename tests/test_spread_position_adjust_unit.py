@@ -38,6 +38,21 @@ class TestMergeStrangleOwnedVolumes(unittest.TestCase):
         self.assertEqual(vols['MA609C2900'], 1)
         self.assertEqual(vols['SA609C2400'], 2)
 
+    def test_awaiting_phase2_filled_not_double_counted(self):
+        """Phase1 已入 CSV 时，awaiting_phase2 的 filled_instrument 不再叠加。"""
+        ledger = FakeLedger(
+            claims={'RM609C2750': 29},
+            unmatched=[{
+                'kind': 'awaiting_phase2',
+                'filled_instrument': 'RM609C2750',
+                'leg': {'inst': 'RM609P2025'},
+                'volume': 8,
+            }],
+        )
+        vols = merge_strangle_owned_volumes(ledger)
+        self.assertEqual(vols['RM609C2750'], 29)
+        self.assertNotIn('RM609P2025', vols)
+
     def test_none_ledger_empty(self):
         self.assertEqual(merge_strangle_owned_volumes(None), {})
 
