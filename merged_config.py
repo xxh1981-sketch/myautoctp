@@ -27,6 +27,11 @@ def _project_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def merged_config_local_path() -> str:
+    """Absolute path to ``merged_config.yaml`` in the project root."""
+    return os.path.join(_project_dir(), 'merged_config.yaml')
+
+
 def _merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     out = base.copy()
     for key, value in override.items():
@@ -43,6 +48,7 @@ DUAL_STRATEGY_DEFAULTS = {
 
     'journal_daily_shards': True,
     'journal_retain_days': 14,
+    'trade_replay_lookback_days': 1,
     'reconcile_interval_sec': 60,
 
     'tradeinfo_path': 'tradeinfo',
@@ -67,6 +73,8 @@ DUAL_STRATEGY_DEFAULTS = {
     'pause_spread_open_on_reconcile_mismatch': True,
     'spread_fill_require_tradeinfo_match': True,
     'spread_fill_skip_strangle_owned_instruments': True,
+    'strangle_fill_require_tradeinfo_match': True,
+    'strangle_fill_skip_spread_owned_instruments': True,
     'spread_derive_require_tradeinfo_match': True,
     'spread_purge_invalid_claims_on_startup': True,
     'spread_reconcile_fallback_heuristic': False,
@@ -74,6 +82,10 @@ DUAL_STRATEGY_DEFAULTS = {
 
     'unified_fill_feishu': True,
     'fill_feishu_enabled': True,
+    # unified 成交开启时压制 notify_combo_done / notify_position_closed 等旧摘要
+    'suppress_legacy_fill_feishu': True,
+    # 操作性重复告警（拒单/流动性/平仓残留等）飞书冷却秒数；0=不冷却
+    'feishu_alert_cooldown_sec': 300,
 
     'require_startup_ack': True,
     # 7×24：人工冷启动仍交互确认；进程内 _auto_restart 才凭 ack 文件跳过。
@@ -106,13 +118,46 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'fill_ledger_rotate_enabled': True,
     'fill_ledger_max_mb': 50,
     'fill_ledger_archive_keep': 10,
+    # 磁盘空间预检：housekeeping 周期检查剩余空间，低于阈值飞书告警。
+    'disk_space_check_enabled': True,
+    'disk_space_warn_mb': 500,
+    # 单品种扫描超时（秒）；0=不限制。防止单品种 CTP/IO 挂死阻塞整轮。
+    'max_symbol_scan_sec': 120,
     # 周末非交易抑制（仅双休日；法定节假日不处理，当交易日）。周六仅在此时刻
     # 之后才算周末，避开周五夜盘跨零点到周六凌晨。
     'weekend_pause_enabled': True,
     'weekend_pause_saturday_from_hour': 5,
-    # 单轮看门狗：一轮耗时超阈值告警（CTP 查询串行变慢的可观测性）。
-    'round_slow_warn_sec': 30,
+    # 单轮看门狗：一轮耗时超阈值告警（与 merged_config.yaml 默认 60 对齐）。
+    'round_slow_warn_sec': 60,
+    # 宽跨每轮扫描时间预算（秒）；0=不限制。仅 defer 后续品种，不中断当前品种。
+    # 单品种硬超时见 max_symbol_scan_sec（默认 120s）。
+    'max_strangle_scan_sec': 600,
+    'health_offline_log_cooldown_sec': 60,
     'slow_round_alert_cooldown_sec': 300,
+    # 无人值守心跳：主循环每轮覆写心跳文件（供外部 watchdog 检查 mtime，发现
+    # 整进程挂死/被 kill——进程内重启循环覆盖不了这两类）；每天首次到达
+    # daily_heartbeat_hour 后发一条飞书"报平安"状态摘要，用"没收到"反向发现
+    # 程序或飞书链路整体故障。heartbeat_file 置空字符串可禁用心跳文件。
+    'heartbeat_file': 'data/main_loop_heartbeat.txt',
+    'daily_heartbeat_enabled': True,
+    'daily_heartbeat_hour': 9,
+    'daily_heartbeat_marker_file': 'data/daily_heartbeat_sent.txt',
+    # SIGTERM 优雅关闭最大等待秒数；超时 os._exit（仅计划内关停路径）。
+    'shutdown_timeout_sec': 15,
+    # 最近一次启动/重启/退出原因（纯可观测性）。
+    'restart_reason_file': 'data/restart_reason.txt',
+    # 外部 watchdog（scripts/check_heartbeat_watchdog.*）读取的配置。
+    'heartbeat_watchdog': {
+        'alert_after_sec': 300,
+        'alert_cooldown_sec': 600,
+        'feishu_webhook': '',
+    },
+    # 长跑时 merged_config.yaml 被编辑但未重启 → 周期性飞书提醒（纯可观测性）。
+    'config_drift_alert_enabled': True,
+    'config_drift_check_interval_sec': 600,
+    # 各类 halt 从 True→False 时飞书通知解除（纯可观测性，不改 halt 语义）。
+    'halt_recovery_notify_enabled': True,
+    'halt_recovery_alert_cooldown_sec': 300,
     # 保证金连续 unknown（持仓查询失败）达到该次数后，即使上一轮非 halt 也
     # 保守暂停新开，消除"长期查询失败 → 真实超限无法发现仍可新开"的盲区。
     # 0 表示禁用该升级（仅沿用上轮状态，回到旧行为）。
@@ -123,6 +168,12 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'compat_lock_path': 'docs/compat_lock.yaml',
     'compat_lock_enforce': False,
     'compat_lock_warn_dirty': True,
+    'session_close_guard': {
+        'enabled': True,
+        'no_new_group_before_close_sec': 600,
+        'hard_stop_before_close_sec': 60,
+        'include_morning_break': False,
+    },
     # 日志降噪：节流 autotrade VIX 重复提示（同品种一轮十余次）+ 把非交易态
     # "撤单 当前状态禁止此项操作" 这类预期回报从 ERROR 降为 WARNING。
     # 仅作用于日志输出，不改 VIX 算法 / 每轮缓存 / autotrade 代码；ERROR 及以上
@@ -130,13 +181,25 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'log_noise': {
         'enabled': True,
         'throttle_window_sec': 60,
+        'throttle_key_mode': 'substring',
         'throttle_substrings': [
             '提升次近月为近月',
             '品种整体 VIX 无法计算',
             'VIX无法计算',
+            '无法找到合适的期权组合',
+            '风控阻止开仓',
+            '单轮耗时',
+            '[健康] 交易连接断开',
+            '[健康] 行情连接断开',
+            '持仓追踪器超过',
+            'analyze_position_imbalance 计算结果',
+            '不平衡检查:',
         ],
         'downgrade': [
             {'substring': '当前状态禁止此项操作', 'to_level': 'WARNING'},
+            {'substring': '配对失败', 'to_level': 'WARNING'},
+            {'substring': '不允许重复报单', 'to_level': 'WARNING'},
+            {'substring': '订单不在pending且查询无结果', 'to_level': 'WARNING'},
         ],
     },
 }
@@ -165,6 +228,20 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
     reconcile_iv = float(dual.get('reconcile_interval_sec', 60))
     if reconcile_iv < 0:
         errors.append('dual_strategy.reconcile_interval_sec 不能为负')
+
+    if dual.get('pause_spread_open_on_reconcile_mismatch') is False:
+        warnings.append(
+            'dual_strategy.pause_spread_open_on_reconcile_mismatch=false：'
+            '价差对账不一致时不 halt（仍写入 _spread_reconcile_halt），'
+            '开仓/再平衡照常；仅审计告警模式，实盘慎用'
+        )
+    str_cfg = config.get('strangle') or {}
+    if str_cfg.get('pause_open_on_reconcile_mismatch') is False:
+        warnings.append(
+            'strangle.pause_open_on_reconcile_mismatch=false：'
+            '宽跨对账不一致时不 set ledger.open_halted，新开照常；'
+            '仅审计告警模式，实盘慎用'
+        )
 
     if 'global_margin_limit' not in config:
         return errors, warnings

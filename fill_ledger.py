@@ -25,7 +25,14 @@ FILL_LEDGER_COLUMNS = [
     'fill_volume',
     'fill_side',
     'strategy',
+    'position_csv_applied',
+    'skip_reason',
+    'trade_date',
+    'trade_time',
+    'combo_id',
 ]
+
+_FILL_CSV_STATUS_KEY = '_fill_ledger_csv_status'
 
 _FILL_SIDE_VALUES = frozenset({
     'buy_open', 'sell_open', 'buy_close', 'sell_close',
@@ -90,6 +97,48 @@ def resolve_strategy(order_ref, config: dict) -> str:
     return 'other'
 
 
+def stash_fill_csv_status(
+    conn,
+    trade: dict,
+    applied: bool,
+    skip_reason: str = '',
+) -> None:
+    """Record whether strangle/spread handlers applied this fill to position CSV."""
+    runtime = getattr(conn, '_runtime_state', None)
+    if runtime is None:
+        return
+    key = trade_dedupe_key(trade)
+    runtime.setdefault(_FILL_CSV_STATUS_KEY, {})[key] = {
+        'applied': bool(applied),
+        'skip_reason': (skip_reason or '').strip(),
+    }
+
+
+def pop_fill_csv_status(conn, trade: dict):
+    """Return (applied|None, skip_reason) and remove stashed status for this trade."""
+    runtime = getattr(conn, '_runtime_state', None)
+    if runtime is None:
+        return None, ''
+    bucket = runtime.get(_FILL_CSV_STATUS_KEY)
+    if not bucket:
+        return None, ''
+    key = trade_dedupe_key(trade)
+    entry = bucket.pop(key, None)
+    if entry is None:
+        return None, ''
+    return bool(entry.get('applied')), str(entry.get('skip_reason') or '')
+
+
+def resolve_position_csv_fields(conn, trade: dict, config: dict, strategy: str) -> tuple:
+    """Map handler stash to fill_ledger columns (yes/no/n/a/unknown)."""
+    applied, skip_reason = pop_fill_csv_status(conn, trade)
+    if applied is not None:
+        return ('yes' if applied else 'no', skip_reason)
+    if strategy in ('spread', 'strangle'):
+        return 'unknown', ''
+    return 'n/a', ''
+
+
 def _lookup_quote(conn, instrument: str):
     from auto_connection_utils import contract_case_variants
 
@@ -133,8 +182,33 @@ def slippage_vs_mid(fill_price: float, bid: float, ask: float, fill_side: str) -
     return f'{slip:.4f}'
 
 
+def _upgrade_csv_header_if_needed(csv_path: str) -> None:
+    """Append new analytics columns to an existing header row."""
+    if not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0:
+        return
+    with open(csv_path, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f)
+        try:
+            existing = next(reader)
+        except StopIteration:
+            return
+    if all(col in existing for col in FILL_LEDGER_COLUMNS):
+        return
+    merged = list(existing)
+    for col in FILL_LEDGER_COLUMNS:
+        if col not in merged:
+            merged.append(col)
+    with open(csv_path, 'r', encoding='utf-8', newline='') as f:
+        lines = f.readlines()
+    buf = io.StringIO()
+    csv.writer(buf).writerow(merged)
+    lines[0] = buf.getvalue()
+    atomic_write_text(csv_path, ''.join(lines))
+
+
 def _ensure_csv_header(csv_path: str) -> None:
     if os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0:
+        _upgrade_csv_header_if_needed(csv_path)
         return
     buf = io.StringIO()
     csv.writer(buf).writerow(FILL_LEDGER_COLUMNS)
@@ -177,6 +251,14 @@ def build_fill_row(conn, trade: dict, config: dict) -> Optional[Dict[str, Any]]:
     ask = float(ask_s) if ask_s else 0.0
     slip_s = slippage_vs_mid(fill_price, bid, ask, fill_side)
 
+    combo_id = ''
+    if conn is not None:
+        try:
+            from combo_id_registry import lookup_combo_id
+            combo_id = lookup_combo_id(conn, trade.get('order_ref'))
+        except Exception:
+            combo_id = ''
+
     return {
         'instrument_code': instrument,
         'fill_price': f'{fill_price:.4f}',
@@ -186,6 +268,9 @@ def build_fill_row(conn, trade: dict, config: dict) -> Optional[Dict[str, Any]]:
         'fill_volume': volume,
         'fill_side': fill_side,
         'strategy': resolve_strategy(trade.get('order_ref'), config),
+        'trade_date': (trade.get('trade_date') or '').strip(),
+        'trade_time': (trade.get('trade_time') or '').strip(),
+        'combo_id': combo_id,
     }
 
 
@@ -214,6 +299,12 @@ def apply_fill_record(
     if row is None:
         return False
 
+    csv_applied, skip_reason = resolve_position_csv_fields(
+        conn, trade, config, row['strategy'],
+    )
+    row['position_csv_applied'] = csv_applied
+    row['skip_reason'] = skip_reason
+
     with journal_lock(journal_file):
         if dedupe_key in load_applied_keys(
             journal_file, config, include_pending=True,
@@ -226,8 +317,9 @@ def apply_fill_record(
             'instrument': row['instrument_code'],
             'fill_side': row['fill_side'],
             'strategy': row['strategy'],
-            'trade_date': trade.get('trade_date', ''),
-            'trade_time': trade.get('trade_time', ''),
+            'trade_date': row.get('trade_date', ''),
+            'trade_time': row.get('trade_time', ''),
+            'combo_id': row.get('combo_id', ''),
             'journal_state': 'pending',
         }, config)
         csv_path = fill_ledger_csv_path(config)
@@ -239,8 +331,9 @@ def apply_fill_record(
             'instrument': row['instrument_code'],
             'fill_side': row['fill_side'],
             'strategy': row['strategy'],
-            'trade_date': trade.get('trade_date', ''),
-            'trade_time': trade.get('trade_time', ''),
+            'trade_date': row.get('trade_date', ''),
+            'trade_time': row.get('trade_time', ''),
+            'combo_id': row.get('combo_id', ''),
             'journal_state': 'applied',
         }, config)
     if logger:
@@ -278,6 +371,8 @@ def handle_fill_rtn(conn, p_trade, logger=None) -> None:
         'trade_time': safe_decode(getattr(p_trade, 'TradeTime', '') or ''),
     }
     config = getattr(conn, 'config', None) or {}
+    from trade_replay import record_trades_to_cache
+    record_trades_to_cache([trade], config, logger=logger)
     apply_fill_record(conn, config, trade, logger)
 
 
@@ -296,10 +391,11 @@ def wire_fill_ledger(conn) -> None:
     _install_wire_handler(conn, _WIRE_KIND_FILL_LEDGER, _handler)
 
 
-def _trades_from_query(conn) -> Optional[List[dict]]:
-    if not hasattr(conn, 'query_trades_sync'):
-        return None
-    return conn.query_trades_sync(timeout=12, use_cache=False)
+def _trades_from_query(conn, config: dict = None, logger=None) -> Optional[List[dict]]:
+    if config is None:
+        config = getattr(conn, 'config', None) or {}
+    from trade_replay import query_trades_for_replay
+    return query_trades_for_replay(conn, config, logger=logger)
 
 
 def sync_fill_ledger_from_trades(
@@ -314,7 +410,7 @@ def sync_fill_ledger_from_trades(
     extra CTP RPC during reconcile.
     """
     if trades is None:
-        trades = _trades_from_query(conn)
+        trades = _trades_from_query(conn, config, logger)
     if trades is None:
         if logger:
             logger.debug('[FillLedger] trade query unavailable, skip replay')

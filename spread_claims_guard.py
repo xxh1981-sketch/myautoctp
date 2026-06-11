@@ -27,6 +27,52 @@ def _spread_keys(spread_tradeinfo: list) -> Set[Tuple[str, str]]:
     return out
 
 
+def _strangle_keys(strangle_tradeinfo: list) -> Set[Tuple[str, str]]:
+    out: Set[Tuple[str, str]] = set()
+    for item in strangle_tradeinfo or []:
+        sym = (item.get('future') or '').lower()
+        month = str(item.get('month') or '').strip()
+        if sym and month:
+            out.add((sym, month))
+    return out
+
+
+def instrument_in_strangle_tradeinfo(
+    instrument: str,
+    conn,
+    strangle_tradeinfo: list,
+) -> bool:
+    """True when contract symbol+month matches any strangle tradeinfo row."""
+    inst = (instrument or '').strip()
+    if not inst:
+        return False
+    keys = _strangle_keys(strangle_tradeinfo)
+    if not keys:
+        return True
+
+    sym = _symbol_prefix(inst)
+    if not sym:
+        return False
+
+    try:
+        from auto_connection_utils import months_match
+    except Exception:
+        months_match = None  # type: ignore
+
+    for trade_sym, month in keys:
+        if trade_sym != sym:
+            continue
+        if months_match is None:
+            return True
+        try:
+            norm = conn._normalize_month(trade_sym, month) if conn else month
+        except Exception:
+            norm = month
+        if months_match(inst, month, norm):
+            return True
+    return False
+
+
 def instrument_in_spread_tradeinfo(
     instrument: str,
     conn,
@@ -63,6 +109,19 @@ def instrument_in_spread_tradeinfo(
     return False
 
 
+def _ctp_signed_volume(ctp_signed: Dict[str, int], inst: str) -> int:
+    """Case-insensitive lookup in CTP signed position map."""
+    if not ctp_signed:
+        return 0
+    key = str(inst).strip().upper()
+    if key in ctp_signed:
+        return int(ctp_signed[key])
+    for k, v in ctp_signed.items():
+        if str(k).strip().upper() == key:
+            return int(v)
+    return 0
+
+
 def invalid_spread_claim_keys(
     claims: Dict[str, int],
     spread_tradeinfo: list,
@@ -86,7 +145,7 @@ def invalid_spread_claim_keys(
                 bad.add(inst)
                 continue
         if ctp_signed is not None:
-            ctp_vol = int(ctp_signed.get(inst, 0))
+            ctp_vol = _ctp_signed_volume(ctp_signed, inst)
             if ctp_vol == 0 and abs(v) > 0:
                 bad.add(inst)
     return bad
@@ -119,7 +178,7 @@ def audit_spread_claims(
                     f'{inst}: CSV={v} 合约月份与 spread tradeinfo 不匹配'
                 )
         if ctp_signed is not None:
-            ctp_vol = int(ctp_signed.get(inst, 0))
+            ctp_vol = _ctp_signed_volume(ctp_signed, inst)
             if ctp_vol == 0 and abs(v) > 0:
                 issues.append(
                     f'{inst}: CSV={v} 但 CTP 无该合约净持仓（认领孤儿）'

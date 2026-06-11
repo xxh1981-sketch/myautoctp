@@ -133,18 +133,6 @@ def reconcile_strangle_positions_dual(
             if logger:
                 logger.warning(f'[reconcile] strangle CSV sync failed: {e}')
 
-    spread_cfg = dual.get('auto_sync_spread_positions_csv', True)
-    if exclude_spread and spread_cfg:
-        try:
-            from spread_fill_sync import sync_csv_from_spread_trades
-            store = store_from_conn(conn)
-            if store is not None:
-                sync_csv_from_spread_trades(conn, store, config, logger, trades=trades)
-        except Exception as e:
-            issues.append(f'spread CSV sync failed: {e}')
-            if logger:
-                logger.warning(f'[reconcile] spread CSV sync failed: {e}')
-
     if positions is None:
         try:
             positions = conn.query_positions_sync(timeout=10) or []
@@ -159,10 +147,18 @@ def reconcile_strangle_positions_dual(
                 '[reconcile]',
             )
 
-    claimed = {k: int(v) for k, v in ledger.list_leg_claims().items()}
-    ctp_long = _build_ctp_long(trade_symbols, positions)
+    # 与价差侧 reconcile 一致（spread_reconcile.normalize_inst_map）：按大写
+    # 合约号合并三方 map，避免 CTP 与 CSV 大小写不一致时产生假性双向 halt。
+    from account_decomposition import normalize_inst_map
+
+    claimed = normalize_inst_map(ledger.list_leg_claims())
+    ctp_long = normalize_inst_map(_build_ctp_long(trade_symbols, positions))
     spread_long = (
-        resolve_spread_long_call_volumes(conn, spread_tradeinfo, positions, config)
+        normalize_inst_map(
+            resolve_spread_long_call_volumes(
+                conn, spread_tradeinfo, positions, config,
+            )
+        )
         if exclude_spread else {}
     )
 
@@ -198,24 +194,17 @@ def reconcile_strangle_positions_dual(
         strangle_vol = max(0, ctp_vol - spread_vol)
         if book_vol > strangle_vol:
             msg = f'{inst}: CSV={book_vol} > strangle_CTP={strangle_vol} (CSV ahead)'
+            from account_decomposition import external_explains_reconcile_gap
+            if external_explains_reconcile_gap(inst, strangle_vol, book_vol, config):
+                msg += ' [已确认外部仓，不 halt]'
+                issues.append(msg)
+                if logger:
+                    logger.info(f'[reconcile] {msg}')
+                continue
             issues.append(msg)
             if logger:
                 logger.warning(f'[reconcile] {msg}')
             halt = True
-
-    if halt:
-        import time as _time
-
-        runtime = getattr(conn, '_runtime_state', None) or {}
-        until = float(runtime.get('_reconcile_grace_until') or 0.0)
-        if _time.time() < until:
-            if logger:
-                logger.warning(
-                    '[reconcile] 处于豁免窗口 (derive 后)，'
-                    f'{len(issues)} 条 strangle 差异仅记录不 halt'
-                )
-            clear_reconcile_transient_streak(conn, STRANGLE_TRANSIENT_STREAK_KEY)
-            return False, issues
 
     clear_reconcile_transient_streak(conn, STRANGLE_TRANSIENT_STREAK_KEY)
     return halt, issues

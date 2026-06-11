@@ -111,12 +111,14 @@ def derive_spread_claims_from_ctp(
                 continue
         strangle_vol = strangle_by_upper.get(inst.upper(), 0)
         rem = int(net) - strangle_vol
-        if rem != 0:
-            spread[inst] = rem
         if strangle_vol > max(net, 0) and net >= 0:
             warnings.append(
-                f'{inst}: 宽跨认领 {strangle_vol} > CTP多头 {net}，推导价差={rem}'
+                f'{inst}: 宽跨认领 {strangle_vol} > CTP净多 {net}，'
+                f'跳过虚构价差空头（原推导={rem}）'
             )
+            rem = 0
+        if rem != 0:
+            spread[inst] = rem
 
     for inst, sv in strangle_by_upper.items():
         if sv > 0 and not any(k.upper() == inst for k in ctp_signed):
@@ -170,10 +172,10 @@ def apply_derived_spread_from_ctp(conn, ledger, store, config, logger=None) -> O
         dual = (config.get('dual_strategy') or {}) if config else {}
         grace = float(dual.get('reconcile_grace_after_derive_sec', 90))
         if grace > 0:
-            runtime['_reconcile_grace_until'] = _time.time() + grace
+            runtime['_spread_reconcile_grace_until'] = _time.time() + grace
             if logger:
                 logger.info(
-                    f'[启动] 已开启对账豁免窗口 {grace:.0f}s '
-                    '(期间差异仅记录，不强制 halt)'
+                    f'[启动] 已开启价差对账豁免窗口 {grace:.0f}s '
+                    '(期间价差差异仅记录，不强制 halt；宽跨对账不受影响)'
                 )
     return claims

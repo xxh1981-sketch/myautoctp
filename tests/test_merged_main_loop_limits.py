@@ -60,6 +60,31 @@ def _make_conn():
     return conn
 
 
+def _fake_tracking_ledger(halted=False, reason=''):
+    """Ledger mock that tracks ``set_open_halt`` for integration tests."""
+    ledger = MagicMock()
+    state = {'halted': halted, 'reason': reason}
+    ledger.is_open_halted.side_effect = lambda: state['halted']
+    ledger.get_open_halt_reason.side_effect = lambda: state['reason']
+
+    def _set(h, r=''):
+        state['halted'] = bool(h)
+        state['reason'] = r or ''
+    ledger.set_open_halt.side_effect = _set
+    return ledger, state
+
+
+def _two_round_sleep():
+    """Allow two main-loop iterations then stop via KeyboardInterrupt."""
+    rounds = {'n': 0}
+
+    def _sleep(*a, **kw):
+        rounds['n'] += 1
+        if rounds['n'] >= 2:
+            raise KeyboardInterrupt
+    return _sleep
+
+
 class TestDailyLimitDoesNotSkipClose(unittest.TestCase):
 
     @patch('auto_processor.process_symbol', return_value=False)
@@ -619,6 +644,230 @@ class TestSyncStrangleOpenHalt(unittest.TestCase):
         self.assertNotIn('journal', state['reason'].lower())
 
 
+class TestDailyBuyLimitRebalanceGate(unittest.TestCase):
+    """日买入达限时必须 close-only 再平衡（禁 awaiting_phase2，保留 close_chp）。"""
+
+    @patch('strangle_rebalance_close_only.run_close_only_rebalance', return_value=1)
+    @patch('straggle_processor.process_strangle_symbol', return_value=False)
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_daily_buy_limit_uses_close_only_rebalance(
+        self, mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_strangle_proc,
+        mock_close_only,
+    ):
+        conn = _make_conn()
+        conn.get_filled_open_order_count = MagicMock(return_value=0)
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        buy_limit = 300000.0
+        ledger.get_daily_buy_amount.return_value = buy_limit
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'sa', 'month': '2608', 'kind': 'close_chp_pending'},
+        ]
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        executor_inst = mock_exec.return_value
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'merged_main_loop._run_reconcile',
+            return_value=(False, [], False, []),
+        ), patch(
+            'spread_fill_sync.count_spread_filled_open_orders', return_value=0,
+        ), patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                    'strangle': {
+                        'daily_buy_limit_yuan': buy_limit,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        mock_close_only.assert_called()
+        executor_inst.run_rebalance.assert_not_called()
+        buy_logs = [m for _, m in logger.messages if '日买入达限' in str(m)]
+        self.assertTrue(
+            buy_logs,
+            f'expected "日买入达限" in rebalance log, got '
+            f'{[m for _, m in logger.messages]}',
+        )
+
+
+class TestHaltRecoveryIntegration(unittest.TestCase):
+    """主循环 halt 恢复：margin over→ok、对账 mismatch→match。"""
+
+    @patch('straggle_processor.process_strangle_symbol', return_value=False)
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_margin_over_limit_then_ok_clears_halt_and_syncs_ledger(
+        self, mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_process, mock_strangle_proc,
+    ):
+        conn = _make_conn()
+        conn.get_filled_open_order_count = MagicMock(return_value=0)
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger, state = _fake_tracking_ledger()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+
+        margin_seq = iter([('over_limit', '保证金超限'), ('ok', '')])
+
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'margin_check.check_margin_status',
+            side_effect=lambda *a, **kw: next(margin_seq),
+        ), patch(
+            'merged_main_loop._run_reconcile',
+            return_value=(False, [], False, []),
+        ), patch(
+            'spread_fill_sync.count_spread_filled_open_orders', return_value=0,
+        ), patch('time.sleep', side_effect=_two_round_sleep()):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'global_margin_limit': 1000,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                    'strangle': {
+                        'daily_buy_limit_yuan': 300000,
+                        'pause_open_on_reconcile_mismatch': True,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertFalse(
+            conn._runtime_state.get('_margin_halt_open', True),
+            'second-round ok should clear margin halt',
+        )
+        self.assertFalse(
+            state['halted'],
+            'ledger open_halt should clear after margin recovers',
+        )
+        self.assertEqual(state['reason'], '')
+        self.assertTrue(
+            ledger.set_open_halt.call_count >= 2,
+            'expected set_open_halt on halt set and on recovery',
+        )
+
+    @patch('straggle_processor.process_strangle_symbol', return_value=False)
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_reconcile_halt_clears_resumes_full_rebalance(
+        self, mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_strangle_proc,
+    ):
+        conn = _make_conn()
+        conn.get_filled_open_order_count = MagicMock(return_value=0)
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        executor_inst = mock_exec.return_value
+        recon_states = [
+            (True, ['SA gap'], False, []),
+            (False, [], False, []),
+        ]
+        recon_idx = {'n': 0}
+
+        def _reconcile_side(*args, **kwargs):
+            i = min(recon_idx['n'], len(recon_states) - 1)
+            recon_idx['n'] += 1
+            halt, issues, spread_halt, spread_issues = recon_states[i]
+            conn._runtime_state['_strangle_reconcile_halt'] = halt
+            conn._runtime_state['_strangle_reconcile_issues'] = list(issues)
+            conn._runtime_state['_spread_reconcile_halt'] = spread_halt
+            conn._runtime_state['_spread_reconcile_issues'] = list(spread_issues)
+            return recon_states[i]
+
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'merged_main_loop._run_reconcile', side_effect=_reconcile_side,
+        ), patch(
+            'spread_fill_sync.count_spread_filled_open_orders', return_value=0,
+        ), patch('time.sleep', side_effect=_two_round_sleep()):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                    'strangle': {
+                        'daily_buy_limit_yuan': 300000,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertFalse(
+            conn._runtime_state.get('_strangle_reconcile_halt', True),
+            'second reconcile should clear strangle reconcile halt',
+        )
+        executor_inst.run_rebalance.assert_called()
+        skip_logs = [
+            m for _, m in logger.messages
+            if '跳过宽跨再平衡' in str(m)
+        ]
+        self.assertTrue(
+            skip_logs,
+            'first round with reconcile halt should skip full rebalance',
+        )
+
+
 class TestRebalanceCloseOnlyOnStrangleReconcileHalt(unittest.TestCase):
     """对账 halt 时主循环 rebalance 必须走 close-only 路径——autostraggle 的
     ``run_rebalance`` 不读 ``ledger.is_open_halted()``，否则会照常执行
@@ -767,6 +1016,81 @@ class TestRebalanceCloseOnlyOnStrangleReconcileHalt(unittest.TestCase):
         self.assertTrue(
             combined,
             f'expected combined halt reason in log, got '
+            f'{[m for _, m in logger.messages]}',
+        )
+
+    @patch('strangle_rebalance_close_only.run_close_only_rebalance', return_value=1)
+    @patch('straggle_processor.process_strangle_symbol', return_value=False)
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.is_trading_paused', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_journal_halt_uses_close_only_rebalance(
+        self, mock_hc, mock_exec, mock_cb, mock_sync, mock_start, mock_stop,
+        mock_paused, mock_margin, mock_process, mock_strangle_proc,
+        mock_close_only,
+    ):
+        """journal halt（账本可能落后于实际成交）也必须降级 close-only：
+        与 _sync_strangle_open_halt 的"journal halt = 禁新开"对齐，
+        不基于落后账本处理 awaiting_phase2 的开仓第二腿。"""
+        conn = _make_conn()
+        conn.get_filled_open_order_count = MagicMock(return_value=0)
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'sa', 'month': '2608', 'kind': 'close_chp_pending'},
+        ]
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        executor_inst = mock_exec.return_value
+        from merged_main_loop import run_merged_main_loop
+        with patch(
+            'merged_main_loop._run_reconcile',
+            return_value=(False, [], False, []),
+        ), patch(
+            'trade_journal.scan_unresolved_pending',
+            return_value={
+                'unresolved_pending': 1, 'malformed_lines': 0, 'total_lines': 1,
+            },
+        ), patch(
+            'spread_fill_sync.count_spread_filled_open_orders', return_value=0,
+        ), patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                    'strangle': {
+                        'daily_buy_limit_yuan': 300000,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        mock_close_only.assert_called()
+        executor_inst.run_rebalance.assert_not_called()
+        journal_logs = [
+            m for _, m in logger.messages if 'journal未完成入账' in str(m)
+        ]
+        self.assertTrue(
+            journal_logs,
+            f'expected "journal未完成入账" halt reason in log, got '
             f'{[m for _, m in logger.messages]}',
         )
 

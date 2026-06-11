@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -152,6 +153,7 @@ class TestRunHousekeeping(unittest.TestCase):
         out = housekeeping.run_housekeeping({'housekeeping_enabled': False}, None)
         self.assertEqual(out['journal_shards'], 0)
         self.assertFalse(out['fill_ledger_rotated'])
+        self.assertTrue(out['disk_space_ok'])
 
     def test_aggregates_and_isolates_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,6 +164,40 @@ class TestRunHousekeeping(unittest.TestCase):
             out = housekeeping.run_housekeeping(cfg, _FakeLogger())
             self.assertEqual(out['journal_shards'], 1)
             self.assertTrue(out['fill_ledger_rotated'])
+
+
+class TestCheckDiskSpace(unittest.TestCase):
+    def test_skips_when_disabled(self):
+        self.assertTrue(housekeeping.check_disk_space(
+            {'disk_space_check_enabled': False}, None,
+        ))
+
+    def test_ok_when_free_above_threshold(self):
+        with patch('housekeeping.shutil.disk_usage') as mock_usage:
+            mock_usage.return_value = type(
+                'U', (), {'free': 1024 ** 3, 'used': 0, 'total': 2 * 1024 ** 3},
+            )()
+            ok = housekeeping.check_disk_space(
+                {'disk_space_warn_mb': 500, 'heartbeat_file': 'data/hb.txt'},
+                None,
+            )
+        self.assertTrue(ok)
+
+    @patch('feishu_alert_cooldown.send_message_cooldown')
+    def test_alerts_when_low(self, mock_send):
+        with patch('housekeeping.shutil.disk_usage') as mock_usage:
+            mock_usage.return_value = type(
+                'U', (), {'free': 100 * 1024 ** 2, 'used': 900 * 1024 ** 2,
+                          'total': 1024 ** 3},
+            )()
+            logger = _FakeLogger()
+            ok = housekeeping.check_disk_space(
+                {'disk_space_warn_mb': 500, 'heartbeat_file': 'data/hb.txt'},
+                logger,
+            )
+        self.assertFalse(ok)
+        self.assertTrue(any('磁盘' in str(m) for _, m in logger.messages))
+        mock_send.assert_called_once()
 
 
 class TestRotatingLogHandler(unittest.TestCase):

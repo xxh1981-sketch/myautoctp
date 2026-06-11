@@ -34,6 +34,17 @@ def trade_dedupe_key(trade: dict) -> str:
     ])
 
 
+def is_plausible_ctp_trade_id(trade_id: str) -> bool:
+    """CTP TradeID is numeric; reject test/mock ids (Q1, T1, etc.)."""
+    tid = str(trade_id or '').strip()
+    return bool(tid) and tid.isdigit()
+
+
+def is_plausible_ctp_trade(trade: dict) -> bool:
+    """True when trade looks like a real CTP fill (numeric TradeID)."""
+    return is_plausible_ctp_trade_id(trade.get('trade_id'))
+
+
 def journal_daily_shards_enabled(config: dict = None) -> bool:
     dual = (config or {}).get('dual_strategy') or {}
     return bool(dual.get('journal_daily_shards', True))
@@ -212,6 +223,37 @@ def scan_unresolved_pending(
         'malformed_lines': malformed_lines,
         'total_lines': total_lines,
     }
+
+
+def scan_journal_truncated_tails(
+    journal_base: str,
+    config: dict = None,
+) -> int:
+    """Count journal shard files whose last non-empty line is invalid JSON.
+
+    A truncated ``applied`` line (power loss mid-write) drops dedupe keys on
+    restart and can cause duplicate CSV replay — treat as journal integrity risk.
+    """
+    count = 0
+    for path in _journal_glob_paths(journal_base, config):
+        if not os.path.isfile(path):
+            continue
+        last_line = ''
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped:
+                        last_line = stripped
+        except OSError:
+            continue
+        if not last_line:
+            continue
+        try:
+            json.loads(last_line)
+        except json.JSONDecodeError:
+            count += 1
+    return count
 
 
 def append_journal(journal_base: str, row: dict, config: dict = None) -> str:

@@ -14,17 +14,23 @@ dual_strategy:
   fill_ledger_journal: data/fill_ledger_journal.jsonl
   unified_fill_feishu: true
   fill_feishu_enabled: true
+  suppress_legacy_fill_feishu: true
   exclude_spread_from_strangle_reconcile: true
   exclude_strangle_from_spread_positions: true
   exclude_strangle_from_spread_reconcile: true
   use_spread_leg_claims: true
   spread_execution_from_ledger: true
   spread_close_from_ledger: true
+  # false=对账不一致仅记录/告警，不 halt 价差（不开 close-only、不禁新开）；实盘慎用
   pause_spread_open_on_reconcile_mismatch: true
   # true：价差段 OrderRef 成交仅当合约属于 spread tradeinfo 才写入 CSV
   spread_fill_require_tradeinfo_match: true
   # 价差段成交但合约仅宽跨认领、价差认领为 0 时不写入 spread CSV（防 OrderRef 串段）
   spread_fill_skip_strangle_owned_instruments: true
+  # true：宽跨段 OrderRef 成交仅当合约属于 strangle tradeinfo 才写入 CSV
+  strangle_fill_require_tradeinfo_match: true
+  # 宽跨段成交但合约仅价差认领、宽跨认领为 0 时不写入 strangle CSV（防 OrderRef 串段）
+  strangle_fill_skip_spread_owned_instruments: true
   # true：启动 derive 时跳过 spread tradeinfo 外合约（防 CTP−宽跨 污染 CSV）
   spread_derive_require_tradeinfo_match: true
   # true：启动回放成交后自动移除 tradeinfo 外 / CTP 无仓的孤儿认领
@@ -68,6 +74,9 @@ dual_strategy:
   reconcile_transient_halt_after: 1
   journal_daily_shards: true
   journal_retain_days: 14
+  # 跨日/断线成交回放：合并 CTP 当日查询与本地缓存（OnRtnTrade/历史 query）
+  trade_replay_lookback_days: 1
+  # trade_replay_cache: data/trade_replay_cache.jsonl
 
 # 心跳告警 / 死链检测（OnHeartBeatWarning 早于 OnFrontDisconnected 触发）
 # 单位: 秒。dead_threshold 超过即主动重连；log_cooldown / dead_cooldown 防刷
@@ -77,6 +86,15 @@ dual_strategy:
 
 # 健康检查发现的"僵尸订单"重复撤单冷却（同一 order_ref 内不再触发）
 # zombie_cancel_cooldown_sec: 300
+
+# 小节收盘守卫：T-10 禁新组开/平（原组补腿、价差再平衡仍允许）；T-1 硬停并撤在途。
+# session_close_guard:
+#   enabled: true
+#   no_new_group_before_close_sec: 600
+#   hard_stop_before_close_sec: 60
+#   include_morning_break: false   # true 时 10:15 小休也视为小节结束
+#   night_end_overrides:           # 可选，如 i/j/jm 夜盘 23:30
+#     i: "23:30"
 
 # 隔离期安全降级（默认关闭）：
 # - false：保持当前语义，隔离期全停（含平仓）
@@ -109,14 +127,37 @@ log_level: INFO
 log_noise:
   enabled: true
   throttle_window_sec: 60
+  throttle_key_mode: substring
   throttle_substrings:
     - 提升次近月为近月
     - 品种整体 VIX 无法计算
     - VIX无法计算
+    - 无法找到合适的期权组合
+    - 风控阻止开仓
+    - 单轮耗时
+    - "[健康] 交易连接断开"
+    - "[健康] 行情连接断开"
+    - 持仓追踪器超过
+    - analyze_position_imbalance 计算结果
+    - 不平衡检查:
   downgrade:
     - substring: 当前状态禁止此项操作
       to_level: WARNING
+    - substring: 配对失败
+      to_level: WARNING
+    - substring: 不允许重复报单
+      to_level: WARNING
+    - substring: 订单不在pending且查询无结果
+      to_level: WARNING
 loop_interval: 10
+round_slow_warn_sec: 60
+max_strangle_scan_sec: 600
+# 单品种扫描硬超时（秒）；0=不限制。防止单品种挂死阻塞整轮主循环。
+max_symbol_scan_sec: 120
+health_offline_log_cooldown_sec: 60
+# housekeeping 磁盘空间预检：剩余低于阈值时飞书告警（冷却见 feishu_alert_cooldown_sec）
+disk_space_check_enabled: true
+disk_space_warn_mb: 500
 # 未在 merged_config.yaml 显式设置时默认 10 万元；设为 0 且未 block 则警告（无人值守默认 block）
 global_margin_limit: 100000
 margin_recheck_interval_sec: 300
@@ -125,6 +166,28 @@ margin_recheck_interval_sec: 300
 main_loop_max_consecutive_errors: 10
 # 运行时指标日志周期（秒）：输出 quarantine / halt 次数与累计时长
 metrics_log_interval_sec: 300
+
+# 无人值守心跳：主循环每轮覆写心跳文件（外部 watchdog 查 mtime 发现进程挂死/被杀）；
+# 每天到点发一条飞书"报平安"摘要（没收到 = 程序或飞书链路整体故障的反向信号）
+heartbeat_file: data/main_loop_heartbeat.txt
+daily_heartbeat_enabled: true
+daily_heartbeat_hour: 9
+daily_heartbeat_marker_file: data/daily_heartbeat_sent.txt
+# SIGTERM 优雅关闭最大等待秒数；超时强制退出（Windows 请避免 taskkill /F）
+shutdown_timeout_sec: 15
+restart_reason_file: data/restart_reason.txt
+# 外部 watchdog（计划任务每 1–5 分钟运行 scripts/check_heartbeat_watchdog.ps1）
+heartbeat_watchdog:
+  alert_after_sec: 300
+  alert_cooldown_sec: 600
+  feishu_webhook: ""  # 留空则复用 auto_config 飞书 webhook
+# merged_config.yaml 磁盘变更但未重启 → 飞书提醒（纯可观测性，默认 600s 检查一次）
+config_drift_alert_enabled: true
+config_drift_check_interval_sec: 600
+# halt 从 True→False 时飞书通知解除（纯可观测性）
+halt_recovery_notify_enabled: true
+halt_recovery_alert_cooldown_sec: 300
+feishu_alert_cooldown_sec: 300
 
 # 无人值守 fail-fast：守卫/邻月/保证金未启用则拒绝启动（代码默认 true，此处显式写出便于核对）
 fail_fast_on_guard_install: true
@@ -150,6 +213,8 @@ max_restart_attempts: 0
 max_restart_delay: 600
 
 strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设定
+  # false=对账不一致仅记录/告警，不 set ledger.open_halted；实盘慎用
+  pause_open_on_reconcile_mismatch: true
   daily_buy_limit_yuan: 300000
   ledger_path: data/ledger_strangle.json
   order_ref_min: 500000

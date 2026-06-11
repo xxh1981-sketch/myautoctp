@@ -50,6 +50,34 @@ def get_install_error() -> Optional[str]:
     return _install_error
 
 
+def _normalize_throttle_substrings(subs: Any) -> Tuple[str, ...]:
+    """把配置里的节流子串规范为 str 元组（YAML 里 ``- 不平衡检查:`` 会变成 dict）。"""
+    if subs is None:
+        return DEFAULT_THROTTLE_SUBSTRINGS
+    if isinstance(subs, str):
+        items = [subs]
+    elif isinstance(subs, (list, tuple)):
+        items = list(subs)
+    else:
+        return DEFAULT_THROTTLE_SUBSTRINGS
+
+    out: List[str] = []
+    for item in items:
+        if isinstance(item, str):
+            s = item.strip()
+            if s:
+                out.append(s)
+        elif isinstance(item, dict):
+            # YAML: "- 不平衡检查:" → {"不平衡检查": None}
+            for key in item:
+                if key is None:
+                    continue
+                s = str(key).strip()
+                if s:
+                    out.append(s)
+    return tuple(out) if out else DEFAULT_THROTTLE_SUBSTRINGS
+
+
 def _coerce_level(value: Any, default: int = logging.WARNING) -> int:
     if isinstance(value, bool):
         return default
@@ -71,9 +99,12 @@ class LogNoiseFilter(logging.Filter):
         window_sec,
         downgrade_rules,
         max_keys: int = _MAX_KEYS,
+        throttle_key_mode: str = 'message',
     ) -> None:
         super().__init__()
-        self._subs: Tuple[str, ...] = tuple(s for s in (throttle_substrings or ()) if s)
+        self._subs: Tuple[str, ...] = _normalize_throttle_substrings(
+            throttle_substrings,
+        )
         try:
             w = float(window_sec)
         except (TypeError, ValueError):
@@ -82,14 +113,31 @@ class LogNoiseFilter(logging.Filter):
         self._downgrade: Tuple[Tuple[str, int], ...] = tuple(
             (sub, int(lvl)) for sub, lvl in (downgrade_rules or ()) if sub
         )
+        mode = (throttle_key_mode or 'message').strip().lower()
+        self._throttle_key_mode = 'substring' if mode == 'substring' else 'message'
         self._max_keys = int(max_keys) if max_keys and max_keys > 0 else _MAX_KEYS
         self._seen: Dict[str, float] = {}
         self._lock = threading.Lock()
         setattr(self, _FILTER_MARK, True)
 
+    def _throttle_key(self, msg: str) -> Optional[str]:
+        """节流键：未命中任何子串则 None；message=整句；substring=首个命中子串。"""
+        matched = None
+        for sub in self._subs:
+            if sub in msg:
+                matched = sub
+                break
+        if matched is None:
+            return None
+        if self._throttle_key_mode == 'substring':
+            return matched
+        return msg
+
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         try:
             msg = record.getMessage()
+            if not isinstance(msg, str):
+                msg = str(msg)
         except Exception:
             # 取不到文本就放行，绝不因降噪逻辑吞日志。
             return True
@@ -105,17 +153,16 @@ class LogNoiseFilter(logging.Filter):
 
         # 2) 节流：窗口内同一文本只过一次；绝不节流 ERROR 及以上（降级后的 WARNING 可被节流）。
         if self._window > 0 and self._subs and record.levelno < logging.ERROR:
-            for sub in self._subs:
-                if sub in msg:
-                    now = time.monotonic()
-                    with self._lock:
-                        last = self._seen.get(msg)
-                        if last is not None and (now - last) < self._window:
-                            return False
-                        self._seen[msg] = now
-                        if len(self._seen) > self._max_keys:
-                            self._gc_locked(now)
-                    break
+            key = self._throttle_key(msg)
+            if key is not None:
+                now = time.monotonic()
+                with self._lock:
+                    last = self._seen.get(key)
+                    if last is not None and (now - last) < self._window:
+                        return False
+                    self._seen[key] = now
+                    if len(self._seen) > self._max_keys:
+                        self._gc_locked(now)
         return True
 
     def _gc_locked(self, now: float) -> None:
@@ -137,13 +184,10 @@ def build_filter_from_config(config: Optional[dict]) -> Optional[LogNoiseFilter]
     if not cfg.get('enabled', True):
         return None
 
-    subs = cfg.get('throttle_substrings')
-    if subs is None:
-        subs = list(DEFAULT_THROTTLE_SUBSTRINGS)
-    elif isinstance(subs, str):
-        subs = [subs]
+    subs = _normalize_throttle_substrings(cfg.get('throttle_substrings'))
 
     window = cfg.get('throttle_window_sec', DEFAULT_WINDOW_SEC)
+    throttle_key_mode = cfg.get('throttle_key_mode', 'message')
 
     downgrade_cfg = cfg.get('downgrade')
     if downgrade_cfg is None:
@@ -157,7 +201,9 @@ def build_filter_from_config(config: Optional[dict]) -> Optional[LogNoiseFilter]
                 if sub:
                     downgrade_rules.append((sub, lvl))
 
-    return LogNoiseFilter(subs, window, downgrade_rules)
+    return LogNoiseFilter(
+        subs, window, downgrade_rules, throttle_key_mode=throttle_key_mode,
+    )
 
 
 def install_log_noise_filter(logger: logging.Logger, config: Optional[dict]) -> bool:

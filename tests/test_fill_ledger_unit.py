@@ -32,18 +32,22 @@ from fill_ledger import (
     sync_fill_ledger_from_trades,
     _ensure_csv_header,
 )
+from spread_ledger import SpreadLegStore
 
 
 def _cfg(tmp):
     csv_path = os.path.join(tmp, 'fills.csv')
     journal = os.path.join(tmp, 'journal.jsonl')
+    spread_journal = os.path.join(tmp, 'spread_journal.jsonl')
     return {
         'strangle': {'order_ref_min': 500000},
         'dual_strategy': {
             'spread_order_ref_max': 499999,
             'fill_ledger_csv': csv_path,
             'fill_ledger_journal': journal,
+            'spread_trade_journal': spread_journal,
             'journal_daily_shards': False,
+            'trade_replay_lookback_days': 0,
         },
     }
 
@@ -92,6 +96,7 @@ class TestFillLedgerCsv(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
             conn = MagicMock()
+            conn._runtime_state = {}
             conn.quotes = {}
             conn.option_quotes = {}
             trade = {
@@ -109,6 +114,8 @@ class TestFillLedgerCsv(unittest.TestCase):
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], FILL_LEDGER_COLUMNS)
             self.assertEqual(rows[1][7], 'strangle')
+            self.assertEqual(rows[1][8], 'unknown')
+            self.assertEqual(rows[1][9], '')
 
     def test_build_row_with_quote(self):
         conn = MagicMock()
@@ -117,6 +124,7 @@ class TestFillLedgerCsv(unittest.TestCase):
         q.ask = 100.4
         conn.quotes = {'SA609C1000': q}
         conn.option_quotes = {}
+        conn._combo_id_by_order_ref = {10: 'spread-SA-open-123'}
         cfg = {'strangle': {'order_ref_min': 500000}, 'dual_strategy': {'spread_order_ref_max': 499999}}
         row = build_fill_row(conn, {
             'order_ref': 10,
@@ -125,14 +133,20 @@ class TestFillLedgerCsv(unittest.TestCase):
             'offset': '0',
             'volume': 1,
             'price': 100.3,
+            'trade_date': '20260609',
+            'trade_time': '09:30:01',
         }, cfg)
         self.assertEqual(row['slippage_vs_mid'], '0.1000')
         self.assertEqual(row['strategy'], 'spread')
+        self.assertEqual(row['trade_date'], '20260609')
+        self.assertEqual(row['trade_time'], '09:30:01')
+        self.assertEqual(row['combo_id'], 'spread-SA-open-123')
 
     def test_sync_from_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
             conn = MagicMock()
+            conn._runtime_state = {}
             conn.quotes = {}
             conn.option_quotes = {}
             conn.query_trades_sync.return_value = [{
@@ -153,6 +167,7 @@ class TestAppendRowAtomicity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
             conn = MagicMock()
+            conn._runtime_state = {}
             conn.quotes = {}
             conn.option_quotes = {}
             for i in range(3):
@@ -217,6 +232,7 @@ class TestApplyFillRecordIdempotency(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
             conn = MagicMock()
+            conn._runtime_state = {}
             conn.quotes = {}
             conn.option_quotes = {}
             trade = {
@@ -239,6 +255,40 @@ class TestApplyFillRecordIdempotency(unittest.TestCase):
             for t in threads:
                 t.join()
             self.assertEqual(sum(1 for r in results if r), 1)
+
+
+class TestFillLedgerCsvStatus(unittest.TestCase):
+
+    def test_spread_skip_reflected_in_fill_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['spread_tradeinfo'] = [{'future': 'rb', 'month': '2610'}]
+            store = SpreadLegStore()
+            ledger = MagicMock()
+            ledger.list_leg_claims.return_value = {'rb2610C3450': 1}
+            ledger.list_unmatched_legs.return_value = []
+            conn = MagicMock()
+            conn._runtime_state = {'_strangle_ledger': ledger}
+            conn.quotes = {}
+            conn.option_quotes = {}
+            cfg['_spread_fill_conn'] = conn
+            trade = {
+                'order_ref': 892,
+                'instrument': 'rb2610C3450',
+                'direction': '1',
+                'offset': '1',
+                'volume': 1,
+                'price': 50.0,
+                'trade_id': 'RB_CLOSE',
+            }
+            from spread_fill_sync import apply_spread_trade_record
+            self.assertFalse(apply_spread_trade_record(cfg, store, trade))
+            self.assertTrue(apply_fill_record(conn, cfg, trade))
+            with open(cfg['dual_strategy']['fill_ledger_csv'], encoding='utf-8') as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(rows[1][7], 'spread')
+            self.assertEqual(rows[1][8], 'no')
+            self.assertEqual(rows[1][9], 'strangle_owned_only')
 
 
 if __name__ == '__main__':

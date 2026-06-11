@@ -114,6 +114,23 @@ def _default_pid_path() -> str:
     return os.path.join(data, 'autoctp.pid')
 
 
+def _clear_stale_lock(lock_file: str, pid_file: str, logger=None) -> bool:
+    """Remove orphan lock when the recorded PID is not alive."""
+    existing_pid = _peek_existing_pid(pid_file)
+    if existing_pid > 0 and _pid_alive(existing_pid):
+        return False
+    try:
+        if os.path.isfile(lock_file):
+            os.remove(lock_file)
+    except OSError:
+        return False
+    if logger:
+        logger.warning(
+            f'[process_guard] 已清除 stale 锁 (PID={existing_pid}, lock={lock_file})'
+        )
+    return True
+
+
 def acquire_singleton(
     pid_path: Optional[str] = None,
     logger=None,
@@ -147,14 +164,23 @@ def acquire_singleton(
     locked, hard = _try_lock(fd)
     if not locked:
         existing_pid = _peek_existing_pid(pid_file)
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise AlreadyRunningError(
-            f'另一 autoctp 实例已在运行 (PID={existing_pid}, lock={lock_file})。'
-            '禁止双进程：会破坏 journal 去重与 fill_ledger 一致性。'
-        )
+        if _clear_stale_lock(lock_file, pid_file, logger):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+            locked, hard = _try_lock(fd)
+        if not locked:
+            existing_pid = _peek_existing_pid(pid_file)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise AlreadyRunningError(
+                f'另一 autoctp 实例已在运行 (PID={existing_pid}, lock={lock_file})。'
+                '禁止双进程：会破坏 journal 去重与 fill_ledger 一致性。'
+            )
 
     if not hard:
         # 软模式：无 fcntl/msvcrt，OS 强制锁不可用，acquired 恒 True，

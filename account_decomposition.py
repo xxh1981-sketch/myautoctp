@@ -227,36 +227,51 @@ def restore_external_ack_from_file(
     return True
 
 
-def external_explains_ctp_ahead(
+def external_explains_reconcile_gap(
     inst: str, ctp_vol: int, book_vol: int, config: dict,
 ) -> bool:
     """
-    True when user acknowledged external gap and CTP-ahead equals that gap.
-    Only applies to CTP ahead (not CSV ahead).
+    True when user acknowledged external gap and signed delta matches.
+
+    ``external = CTP - book`` in account decomposition; applies to both
+    CTP-ahead and CSV-ahead (including negative external for short legs).
     """
     if not config.get('_external_positions_acknowledged'):
         return False
     ext = int(get_acknowledged_external(config).get(
         str(inst).strip().upper(), 0,
     ))
-    if ext <= 0:
-        return False
-    if ctp_vol <= book_vol and not (ctp_vol != 0 and book_vol == 0):
+    if ext == 0:
         return False
     return (int(ctp_vol) - int(book_vol)) == ext
+
+
+def external_explains_ctp_ahead(
+    inst: str, ctp_vol: int, book_vol: int, config: dict,
+) -> bool:
+    """True when acknowledged external explains a CTP-ahead mismatch."""
+    if ctp_vol == book_vol:
+        return False
+    if abs(int(ctp_vol)) <= abs(int(book_vol)) and not (
+        int(ctp_vol) != 0 and int(book_vol) == 0
+    ):
+        return False
+    return external_explains_reconcile_gap(inst, ctp_vol, book_vol, config)
 
 
 def external_explains_strangle_gap(
     inst: str, gap: int, config: dict,
 ) -> bool:
-    if gap <= 0:
+    if int(gap) == 0:
         return False
     if not config.get('_external_positions_acknowledged'):
         return False
     ext = int(get_acknowledged_external(config).get(
         str(inst).strip().upper(), 0,
     ))
-    return ext > 0 and ext == int(gap)
+    if ext == 0:
+        return False
+    return ext == int(gap)
 
 
 def _spread_keys(spread_tradeinfo: list) -> Set[Tuple[str, str]]:

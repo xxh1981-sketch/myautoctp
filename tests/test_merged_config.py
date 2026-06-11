@@ -57,6 +57,34 @@ class TestMergedConfigValidation(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(warnings, [])
 
+    def test_pause_spread_reconcile_false_warning(self):
+        cfg = {
+            'dual_strategy': {
+                'strategy_order': ['spread'],
+                'pause_spread_open_on_reconcile_mismatch': False,
+            },
+            'strangle': {'order_ref_min': 500000},
+        }
+        errors, warnings = _validate_merged_config(cfg)
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            any('pause_spread_open_on_reconcile_mismatch=false' in w for w in warnings)
+        )
+
+    def test_pause_strangle_reconcile_false_warning(self):
+        cfg = {
+            'dual_strategy': {'strategy_order': ['spread']},
+            'strangle': {
+                'order_ref_min': 500000,
+                'pause_open_on_reconcile_mismatch': False,
+            },
+        }
+        errors, warnings = _validate_merged_config(cfg)
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            any('pause_open_on_reconcile_mismatch=false' in w for w in warnings)
+        )
+
     def test_margin_zero_warning(self):
         cfg = {
             'dual_strategy': {'strategy_order': ['spread']},

@@ -182,6 +182,18 @@ def install_health_check_patch() -> bool:
             )
             for r in candidate_refs:
                 cancel_at[r] = now  # avoid hot loop next round
+            # 同步移除本地幽灵在途，避免 ensure_no_inflight 长期阻塞。
+            try:
+                with conn.lock:
+                    pending = getattr(conn, 'pending_orders', None) or {}
+                    for r in candidate_refs:
+                        pending.pop(r, None)
+                        pending.pop(str(r), None)
+                        traded = getattr(conn, 'order_traded', None)
+                        if isinstance(traded, dict):
+                            traded.pop(r, None)
+            except Exception:
+                pass
             return report
 
         try:

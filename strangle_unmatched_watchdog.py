@@ -114,7 +114,7 @@ def _send_alert(config, logger, leg_keys: List[Tuple[str, str, str, str]]) -> No
         send_feishu_message(body, config=config)
     except Exception as e:
         if logger:
-            logger.debug(f'[宽跨守护] 飞书告警失败: {e}')
+            logger.warning(f'[宽跨守护] 飞书告警失败: {e}')
 
 
 def check_unmatched_health(conn, ledger, config: dict, logger) -> None:

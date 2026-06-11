@@ -4,8 +4,12 @@ AutoCTP — 单进程双策略（价差 + 宽跨）
 不修改 D:\\autotrade、D:\\autostraggle，仅引用其代码。
 """
 
+import os
+import signal
 import sys
+import threading
 import time
+from typing import Optional
 
 import ctp_bootstrap  # noqa: F401 — 注入 autotrade / autostraggle 路径
 
@@ -24,6 +28,84 @@ from merged_startup_ack import require_startup_position_ack
 from merged_main_loop import run_merged_main_loop
 from merged_banner import log_startup_banner
 from straggle_ledger import StrangleLedger
+from unattended_heartbeat import (
+    write_restart_reason,
+    write_stopped_heartbeat,
+)
+
+_shutdown_requested = False
+_shutdown_timer: Optional[threading.Timer] = None
+_shutdown_config: Optional[dict] = None
+_shutdown_logger = None
+_shutdown_conn = None
+
+
+def _set_shutdown_conn(conn) -> None:
+    global _shutdown_conn
+    _shutdown_conn = conn
+
+
+def _cancel_shutdown_timer() -> None:
+    global _shutdown_timer
+    if _shutdown_timer is not None:
+        _shutdown_timer.cancel()
+        _shutdown_timer = None
+
+
+def _force_shutdown_exit() -> None:
+    timeout = 15.0
+    if _shutdown_config is not None:
+        timeout = float(_shutdown_config.get('shutdown_timeout_sec', 15) or 15)
+    if _shutdown_logger:
+        _shutdown_logger.error(
+            f'[退出] SIGTERM 优雅关闭超时 ({timeout:.0f}s)，强制退出',
+        )
+    conn = _shutdown_conn
+    if conn is not None:
+        try:
+            conn.release()
+        except Exception as e:
+            if _shutdown_logger:
+                _shutdown_logger.warning('[退出] 强制退出前 release 异常: %s', e)
+    try:
+        from process_guard import release_singleton
+        release_singleton()
+    except Exception:
+        pass
+    os._exit(128 + getattr(signal, 'SIGTERM', 15))
+
+
+def _install_shutdown_handlers(config: dict, logger) -> None:
+    """注册 SIGTERM → KeyboardInterrupt，复用主循环/外层 finally 清理路径。"""
+    global _shutdown_config, _shutdown_logger
+    _shutdown_config = config
+    _shutdown_logger = logger
+
+    def _on_sigterm(signum, frame):
+        global _shutdown_requested, _shutdown_timer
+        del signum, frame
+        if _shutdown_requested:
+            return
+        _shutdown_requested = True
+        logger.info('[退出] 收到 SIGTERM，开始优雅关闭…')
+        write_restart_reason(config, 'SIGTERM', logger=logger)
+        timeout = float(config.get('shutdown_timeout_sec', 15) or 0)
+        if timeout > 0 and _shutdown_timer is None:
+            _shutdown_timer = threading.Timer(timeout, _force_shutdown_exit)
+            _shutdown_timer.daemon = True
+            _shutdown_timer.start()
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (AttributeError, ValueError, OSError) as e:
+        logger.debug(f'[退出] SIGTERM 处理器未注册: {e}')
+
+
+def _graceful_shutdown(config: dict, logger, reason: str = 'USER_INTERRUPT') -> None:
+    write_restart_reason(config, reason, logger=logger)
+    write_stopped_heartbeat(config, reason=reason, logger=logger)
+    _cancel_shutdown_timer()
 
 
 def _log_banner(config, spread_info, strangle_info, logger):
@@ -216,6 +298,10 @@ def main():
     max_restart_delay = config.get('max_restart_delay', 600)
     max_restart_attempts = int(config.get('max_restart_attempts', 0) or 0)
 
+    config['_process_started_at'] = time.time()
+    _install_shutdown_handlers(config, logger)
+    write_restart_reason(config, 'STARTUP_COLD', logger=logger)
+
     while True:
         conn = None
         try:
@@ -227,14 +313,15 @@ def main():
             _log_banner(config, spread_info, strangle_info, logger)
 
             from auto_feishu import get_notifier
-            from trade_feishu_notify import install_unified_trade_feishu
+            from feishu_noise_patch import install_feishu_noise_patch
             from spread_ledger_execution import install_spread_ledger_execution
 
             get_notifier(config)
-            install_unified_trade_feishu(config)
+            install_feishu_noise_patch(config)
             install_spread_ledger_execution(config)
 
             conn = _init_conn(config, logger, combined)
+            _set_shutdown_conn(conn)
             audit_target_months(conn, config, logger, spread_info, strangle_info)
             active = _prepare_env(conn, combined, config, logger)
             from auto_utils import log_startup_min_ticks
@@ -292,19 +379,33 @@ def main():
 
             if not require_startup_position_ack(config, logger, ledger, conn):
                 time.sleep(1)
+                try:
+                    conn.release()
+                except Exception as release_err:
+                    logger.warning('启动确认取消后 release 异常: %s', release_err)
                 conn = None
+                _set_shutdown_conn(None)
                 if config.get('_startup_ack_retry', True):
+                    write_restart_reason(config, 'ACK_RESTART', logger=logger)
                     logger.error("等待持仓确认后重新启动...")
                     time.sleep(60)
                     continue
                 logger.info("已取消启动")
                 break
 
-            if not apply_startup_margin(conn, config, logger, ledger, str_cfg):
-                conn.release()
-                config['_auto_restart'] = True
-                time.sleep(60)
-                continue
+            apply_startup_margin(conn, config, logger, ledger, str_cfg)
+            if (
+                not config.get('_auto_restart')
+                and conn._runtime_state.get('_margin_halt_open')
+            ):
+                write_restart_reason(
+                    config,
+                    'MARGIN_HALT_START',
+                    detail=str(
+                        conn._runtime_state.get('_margin_halt_reason', '') or '',
+                    )[:200],
+                    logger=logger,
+                )
 
             if (
                 conn._runtime_state.get('_margin_halt_open')
@@ -324,10 +425,18 @@ def main():
             )
             break
         except KeyboardInterrupt:
-            logger.info("用户中断")
+            reason = 'SIGTERM' if _shutdown_requested else 'USER_INTERRUPT'
+            logger.info("用户中断" if reason == 'USER_INTERRUPT' else "SIGTERM 优雅关闭")
+            _graceful_shutdown(config, logger, reason=reason)
             break
         except Exception as e:
             config['_auto_restart'] = True
+            write_restart_reason(
+                config,
+                'CRASH_RESTART',
+                detail=str(e)[:200],
+                logger=logger,
+            )
             failures = int(config.get('_restart_failures', 0)) + 1
             config['_restart_failures'] = failures
             delay = min(
@@ -341,6 +450,12 @@ def main():
             if max_restart_attempts > 0 and failures >= max_restart_attempts:
                 logger.error(
                     f"已达 max_restart_attempts={max_restart_attempts}，进程退出"
+                )
+                write_restart_reason(
+                    config,
+                    'MAX_RESTART_EXIT',
+                    detail=f'failures={failures} last={e}',
+                    logger=logger,
                 )
                 try:
                     from auto_feishu import send_feishu_message
