@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 _CFFEX_INDEX = frozenset({'if', 'ih', 'ic', 'im', 'io', 'ho', 'mo'})
 _CFFEX_TREASURY = frozenset({'t', 'tf', 'ts', 'tl'})

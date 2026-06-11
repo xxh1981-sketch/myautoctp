@@ -3,7 +3,7 @@
 import time
 from datetime import date
 
-import auto_processor  # 通过模块属性访问 process_symbol，确保 spread_ledger_execution 的 patch 生效
+import auto_processor  # noqa: F401  # spread_ledger_execution patch 须保留模块引用
 from auto_initializer import manage_future_price_readiness
 
 import margin_check  # 通过模块属性访问 check_margin_status，便于测试 patch 与未来扩展

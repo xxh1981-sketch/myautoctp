@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 DEFAULT_CONFIG_DRIFT_CHECK_INTERVAL_SEC = 600.0
 DEFAULT_HALT_RECOVERY_COOLDOWN_SEC = 300.0

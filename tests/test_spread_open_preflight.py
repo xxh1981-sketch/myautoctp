@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spread_open_preflight import (  # noqa: E402
-    estimate_spread_a_headroom,
     process_spread_symbol,
     should_skip_spread_open_only_scan,
 )
