@@ -11,6 +11,7 @@ import ctp_bootstrap  # noqa: F401
 from spread_claims_guard import (
     audit_spread_claims,
     instrument_in_spread_tradeinfo,
+    instrument_in_strangle_tradeinfo,
     purge_invalid_spread_claims,
 )
 from spread_ledger import SpreadLegStore
@@ -30,6 +31,16 @@ class TestSpreadClaimsGuard(unittest.TestCase):
         )
         self.assertTrue(
             instrument_in_spread_tradeinfo('MA609C2900', conn, spread_info),
+        )
+
+    def test_strangle_tradeinfo_match(self):
+        conn = self._conn()
+        strangle_info = [{'future': 'SA', 'month': '609'}]
+        self.assertTrue(
+            instrument_in_strangle_tradeinfo('SA609C1000', conn, strangle_info),
+        )
+        self.assertFalse(
+            instrument_in_strangle_tradeinfo('MA609C2900', conn, strangle_info),
         )
 
     def test_audit_flags_orphan_and_wrong_symbol(self):

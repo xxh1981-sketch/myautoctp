@@ -8,6 +8,7 @@
 2. **fill_ledger.csv**：append-only 分析日志，无轮转；autoctp 内无读取方。
 3. **日志**：``info/*.log`` 按天命名但从不清理（轮转由 ``setup_merged_logger``
    升级的 TimedRotatingFileHandler 负责，本模块只兜底清理遗留 ``*.log*``）。
+4. **磁盘空间**：周期检查 heartbeat/marker 所在盘剩余空间，低于阈值飞书告警。
 
 本模块提供幂等、可反复安全调用的清理：启动跑一次、主循环按
 ``housekeeping_interval_sec`` 周期跑。所有操作只删除/归档"明显过期"的文件，
@@ -18,10 +19,71 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 from datetime import date, datetime, timedelta
 
 # journal 分片在 read 用 retain_days 过滤之外，多保留的安全余量（天）。
 _JOURNAL_SHARD_GRACE_DAYS = 3
+
+
+def _disk_check_path(config: dict) -> str:
+    """取 heartbeat / marker 所在盘符路径；fallback 为 cwd。"""
+    for key in ('heartbeat_file', 'daily_heartbeat_marker_file'):
+        raw = config.get(key)
+        if not raw:
+            continue
+        path = os.path.abspath(str(raw))
+        parent = os.path.dirname(path)
+        if parent:
+            return parent
+    return os.getcwd()
+
+
+def check_disk_space(config: dict, logger=None) -> bool:
+    """检查剩余磁盘空间；低于阈值时告警。返回 True=空间充足或检查跳过。"""
+    if not config.get('disk_space_check_enabled', True):
+        return True
+    min_mb = float(config.get('disk_space_warn_mb', 500) or 0)
+    if min_mb <= 0:
+        return True
+
+    path = _disk_check_path(config)
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as e:
+        if logger:
+            logger.debug(f'[housekeeping] 磁盘空间检查失败 {path}: {e}')
+        return True
+
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb >= min_mb:
+        return True
+
+    total_mb = usage.total / (1024 * 1024)
+    used_pct = (usage.used / usage.total * 100) if usage.total else 0.0
+    msg = (
+        f'⚠️ **磁盘空间不足**\n\n'
+        f'路径: `{path}`\n'
+        f'剩余: **{free_mb:.0f} MB**（阈值 {min_mb:.0f} MB）\n'
+        f'已用: {used_pct:.1f}% / 共 {total_mb:.0f} MB\n\n'
+        '心跳/CSV/journal 写入可能失败；请尽快清理磁盘。'
+    )
+    if logger:
+        logger.warning(
+            f'[housekeeping] 磁盘剩余 {free_mb:.0f}MB < {min_mb:.0f}MB ({path})'
+        )
+    try:
+        from feishu_alert_cooldown import send_message_cooldown
+        send_message_cooldown(
+            msg,
+            alert_key='disk_space_low',
+            config=config,
+            logger=logger,
+        )
+    except Exception as e:
+        if logger:
+            logger.debug(f'[housekeeping] 磁盘告警飞书发送失败: {e}')
+    return False
 
 
 def _shard_date(base_path: str, path: str):
@@ -182,8 +244,23 @@ def prune_logs(config: dict, logger=None) -> int:
 def run_housekeeping(config: dict, logger=None) -> dict:
     """运行全部清理步骤；各步独立 try/except，返回汇总。"""
     if not config.get('housekeeping_enabled', True):
-        return {'journal_shards': 0, 'fill_ledger_rotated': False, 'logs': 0}
-    result = {'journal_shards': 0, 'fill_ledger_rotated': False, 'logs': 0}
+        return {
+            'journal_shards': 0,
+            'fill_ledger_rotated': False,
+            'logs': 0,
+            'disk_space_ok': True,
+        }
+    result = {
+        'journal_shards': 0,
+        'fill_ledger_rotated': False,
+        'logs': 0,
+        'disk_space_ok': True,
+    }
+    try:
+        result['disk_space_ok'] = check_disk_space(config, logger)
+    except Exception as e:
+        if logger:
+            logger.warning(f'[housekeeping] 磁盘空间检查异常: {e}', exc_info=True)
     try:
         result['journal_shards'] = prune_journal_shards(config, logger)
     except Exception as e:

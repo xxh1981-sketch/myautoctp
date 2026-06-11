@@ -71,6 +71,9 @@ def check_margin_status(
                 time.sleep(retry)
             continue
         total, _ = sum_positions_margin_for_limit(conn, pos, config)
+        runtime = getattr(conn, '_runtime_state', None)
+        if runtime is not None:
+            runtime['_last_margin_total'] = float(total)
         if total > limit:
             reason = f'保证金超限 {total:.2f} > {limit:.2f}'
             logger.error(f'{prefix}: 超限 {total:.2f} > {limit:.2f}')

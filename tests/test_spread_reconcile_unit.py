@@ -82,15 +82,27 @@ class TestSpreadReconcilePure(unittest.TestCase):
         conn = FakeConn()
         tradeinfo = [{'future': 'SA', 'month': '609'}]
         positions = [
-            {'instrument': 'SA609C2400', 'direction': '2', 'position': 3},
+            {'instrument': 'sa609c2400', 'direction': '2', 'position': 3},
             {'instrument': 'SA609C2500', 'direction': '3', 'position': 2},
         ]
         claims = ctp_spread_signed_claims(
             conn, tradeinfo, positions,
             strangle_long_calls={'SA609C2400': 2},
         )
-        self.assertEqual(claims['SA609C2400'], 1)
+        self.assertEqual(claims['sa609c2400'], 1)
         self.assertEqual(claims['SA609C2500'], -2)
+
+    def test_ctp_claims_subtract_strangle_case_mismatch(self):
+        conn = FakeConn()
+        tradeinfo = [{'future': 'm', 'month': '2609'}]
+        positions = [
+            {'instrument': 'm2609-C-3400', 'direction': '2', 'position': 5},
+        ]
+        claims = ctp_spread_signed_claims(
+            conn, tradeinfo, positions,
+            strangle_long_calls={'M2609-C-3400': 3},
+        )
+        self.assertEqual(claims['m2609-C-3400'], 2)
 
     def test_reconcile_match_no_halt(self):
         conn = FakeConn()
@@ -138,7 +150,7 @@ class TestSpreadReconcilePure(unittest.TestCase):
         store = SpreadLegStore()
         store.set_leg_claims({'SA609C2400': 1})
         conn._runtime_state['_spread_leg_store'] = store
-        conn._runtime_state['_reconcile_grace_until'] = time.time() + 60
+        conn._runtime_state['_spread_reconcile_grace_until'] = time.time() + 60
         conn.query_positions_sync = lambda timeout=10: [
             {'instrument': 'SA609C2400', 'direction': '2', 'position': 2},
         ]

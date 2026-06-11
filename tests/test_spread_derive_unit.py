@@ -97,6 +97,34 @@ class TestSpreadDerive(unittest.TestCase):
         self.assertIsNone(claims)
         self.assertIn('失败', msg)
 
+    def test_derive_skips_fictional_short_when_strangle_over_claims(self):
+        """宽跨认领 > CTP 净多头时不写入虚构价差空头。"""
+        conn = MagicMock()
+        conn.query_positions_sync.return_value = [
+            {'instrument': 'MA609C2900', 'direction': '2', 'position': 1},
+        ]
+        ledger = FakeLedger(claims={'MA609C2900': 2})
+        claims, note = derive_spread_claims_from_ctp(conn, ledger)
+        self.assertNotIn('MA609C2900', claims)
+        self.assertIn('宽跨认领', note)
+
+    def test_apply_derived_sets_spread_grace_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, 'spread.csv')
+            cfg = {'dual_strategy': {'spread_positions_csv': csv_path}}
+            conn = MagicMock()
+            conn._runtime_state = {}
+            conn.query_positions_sync.return_value = [
+                {'instrument': 'MA609C2900', 'direction': '2', 'position': 1},
+            ]
+            store = SpreadLegStore()
+            with patch('spread_derive.sync_spread_leg_claims'):
+                apply_derived_spread_from_ctp(
+                    conn, FakeLedger(), store, cfg, logger=None,
+                )
+            self.assertIn('_spread_reconcile_grace_until', conn._runtime_state)
+            self.assertNotIn('_reconcile_grace_until', conn._runtime_state)
+
     def test_apply_derived_reloads_store_from_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = os.path.join(tmp, 'spread.csv')

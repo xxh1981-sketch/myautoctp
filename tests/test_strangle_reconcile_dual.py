@@ -149,6 +149,34 @@ class TestReconcileDual(unittest.TestCase):
         self.assertTrue(halt)
         self.assertEqual(len(issues), 1)
 
+    def test_instrument_case_mismatch_no_false_halt(self):
+        """CTP 与 CSV 合约号大小写不一致时按大写归一合并，不产生假性双向 halt
+        （与价差侧 spread_reconcile 的 normalize_inst_map 行为对齐）。"""
+        conn = _conn()
+        store = SpreadLegStore()
+        conn._runtime_state['_spread_leg_store'] = store
+        conn.query_positions_sync.return_value = [
+            {'instrument': 'sa609c1000', 'direction': '2', 'position': 2},
+        ]
+        ledger = MagicMock()
+        ledger.list_leg_claims.return_value = {'SA609C1000': 2}
+        cfg = {
+            'strangle': {'auto_sync_positions_csv': False},
+            'dual_strategy': {
+                'exclude_spread_from_strangle_reconcile': True,
+                'auto_sync_spread_positions_csv': False,
+                'use_spread_leg_claims': True,
+            },
+        }
+        with unittest.mock.patch(
+            'strangle_fill_sync.sync_csv_from_strangle_trades',
+        ):
+            halt, issues = reconcile_strangle_positions_dual(
+                conn, ledger, {'sa'}, [], None, config=cfg,
+            )
+        self.assertFalse(halt)
+        self.assertEqual(issues, [])
+
     def test_csv_ahead_halts(self):
         conn = _conn()
         store = SpreadLegStore()

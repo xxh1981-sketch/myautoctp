@@ -22,6 +22,8 @@ STRATEGY_LABELS = {
 _NOTIFY_QUEUE: Optional[queue.Queue] = None
 _NOTIFY_THREAD: Optional[threading.Thread] = None
 _NOTIFY_GUARD = threading.Lock()
+_QUEUE_DROP_COUNT = 0
+_QUEUE_DROP_WARNED = False
 
 
 def _format_time(trade: dict) -> str:
@@ -110,7 +112,7 @@ def notify_fill_trade(
         return ok
     except Exception as e:
         if logger:
-            logger.debug(f'[FillFeishu] send failed: {e}')
+            logger.warning(f'[FillFeishu] send failed: {e}')
         return False
 
 
@@ -152,14 +154,54 @@ def notify_fill_trade_async(
     try:
         _NOTIFY_QUEUE.put_nowait((conn, trade, row, config, logger))
     except queue.Full:
+        global _QUEUE_DROP_COUNT, _QUEUE_DROP_WARNED
+        _QUEUE_DROP_COUNT += 1
         if logger:
-            logger.warning('[FillFeishu] notify queue full, dropping message')
+            if not _QUEUE_DROP_WARNED:
+                _QUEUE_DROP_WARNED = True
+                logger.warning(
+                    '[FillFeishu] notify queue full, dropping message '
+                    f'(total_dropped={_QUEUE_DROP_COUNT})'
+                )
+            elif _QUEUE_DROP_COUNT % 10 == 0:
+                logger.warning(
+                    f'[FillFeishu] notify queue still full, '
+                    f'total_dropped={_QUEUE_DROP_COUNT}'
+                )
+
+
+def suppress_legacy_fill_feishu(config: dict = None) -> bool:
+    """True when unified fill replaces legacy per-leg / combo summary Feishu."""
+    config = config or {}
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('unified_fill_feishu', True):
+        return False
+    if not dual.get('fill_feishu_enabled', True):
+        return False
+    return bool(dual.get('suppress_legacy_fill_feishu', True))
+
+
+_LEGACY_ATTRS = (
+    'notify_combo_done',
+    'notify_position_closed',
+)
+_LEGACY_NOTIFIER_ATTRS = (
+    'notify_combo_done',
+    'notify_position_closed',
+)
+_SAVED_LEGACY: dict = {}
+
+
+def _save_legacy_attr(mod, name: str, prefix: str = '') -> None:
+    key = f'{prefix}{name}'
+    if key not in _SAVED_LEGACY:
+        _SAVED_LEGACY[key] = getattr(mod, name, None)
 
 
 def install_unified_trade_feishu(config: dict = None) -> None:
     """
     Route all fill Feishu alerts through fill_ledger + trade_feishu_notify.
-    Suppresses legacy spread A/B leg messages to avoid duplicates.
+    Suppresses legacy spread fill summaries to avoid duplicates with unified fills.
     """
     import logging
 
@@ -171,6 +213,30 @@ def install_unified_trade_feishu(config: dict = None) -> None:
     auto_feishu.notify_order_filled = _suppress
     auto_feishu.FeishuNotifier.notify_order_filled = _suppress
 
+    for name in _LEGACY_ATTRS:
+        _save_legacy_attr(auto_feishu, name)
+    for name in _LEGACY_NOTIFIER_ATTRS:
+        _save_legacy_attr(auto_feishu.FeishuNotifier, name, 'notifier.')
+
+    if suppress_legacy_fill_feishu(config):
+        auto_feishu.notify_combo_done = _suppress
+        auto_feishu.FeishuNotifier.notify_combo_done = _suppress
+        auto_feishu.notify_position_closed = _suppress
+        auto_feishu.FeishuNotifier.notify_position_closed = _suppress
+    else:
+        for name in _LEGACY_ATTRS:
+            saved = _SAVED_LEGACY.get(name)
+            if saved is not None:
+                setattr(auto_feishu, name, saved)
+        for name in _LEGACY_NOTIFIER_ATTRS:
+            saved = _SAVED_LEGACY.get(f'notifier.{name}')
+            if saved is not None:
+                setattr(auto_feishu.FeishuNotifier, name, saved)
+
     logging.getLogger(__name__).debug(
-        'Unified fill Feishu installed (legacy notify_order_filled suppressed)'
+        'Unified fill Feishu installed '
+        '(legacy notify_order_filled suppressed'
+        + (', combo_done/position_closed suppressed'
+           if suppress_legacy_fill_feishu(config) else '')
+        + ')'
     )

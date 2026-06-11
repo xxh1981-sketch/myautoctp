@@ -28,6 +28,7 @@ def _cfg(tmp, journal_name='journal.jsonl'):
             'strangle_positions_csv': csv_path,
             'strangle_trade_journal': journal,
             'journal_daily_shards': False,
+            'trade_replay_lookback_days': 0,
         },
     }
 
@@ -101,6 +102,58 @@ class TestStrangleFillSync(unittest.TestCase):
             ]
             self.assertEqual(len(applied), 1)
             self.assertEqual(applied[0]['order_ref'], 500010)
+
+    def test_skip_when_not_in_strangle_tradeinfo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['strangle_tradeinfo'] = [{'future': 'SA', 'month': '609'}]
+            ledger = MagicMock()
+            conn = MagicMock()
+            conn._normalize_month = MagicMock(return_value='609')
+            conn._runtime_state = {}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'MA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T3',
+            }
+            self.assertFalse(
+                apply_strangle_trade_record(cfg, ledger, trade, conn=conn),
+            )
+            ledger.set_leg_claims.assert_not_called()
+            journal = cfg['dual_strategy']['strangle_trade_journal']
+            body = open(journal, encoding='utf-8').read()
+            self.assertIn('not_in_strangle_tradeinfo', body)
+            from fill_ledger import pop_fill_csv_status
+            applied, reason = pop_fill_csv_status(conn, trade)
+            self.assertFalse(applied)
+            self.assertEqual(reason, 'not_in_strangle_tradeinfo')
+
+    def test_stash_applied_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['strangle_tradeinfo'] = [{'future': 'SA', 'month': '609'}]
+            ledger = MagicMock()
+            conn = MagicMock()
+            conn._normalize_month = MagicMock(return_value='609')
+            conn._runtime_state = {}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T4',
+            }
+            self.assertTrue(
+                apply_strangle_trade_record(cfg, ledger, trade, conn=conn),
+            )
+            from fill_ledger import pop_fill_csv_status
+            applied, reason = pop_fill_csv_status(conn, trade)
+            self.assertTrue(applied)
+            self.assertEqual(reason, '')
 
 
 class TestWireStrangleTradeRuntime(unittest.TestCase):

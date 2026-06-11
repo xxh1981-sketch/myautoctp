@@ -11,6 +11,7 @@ import ctp_bootstrap  # noqa: F401
 from account_decomposition import (
     compute_account_decomposition,
     external_explains_ctp_ahead,
+    external_explains_reconcile_gap,
     external_explains_strangle_gap,
     normalize_inst_map,
     register_acknowledged_external,
@@ -103,6 +104,27 @@ class TestAccountDecomposition(unittest.TestCase):
         )
         self.assertTrue(result['balanced'])
 
+    def test_awaiting_phase2_does_not_inflate_strangle_claim(self):
+        conn = MagicMock()
+        conn.query_positions_sync.return_value = [
+            {'instrument': 'RM609C2750', 'direction': '2', 'position': 29},
+        ]
+        conn._normalize_month = lambda sym, month: month
+        ledger = MagicMock()
+        ledger.list_leg_claims.return_value = {'RM609C2750': 29}
+        ledger.list_unmatched_legs.return_value = [{
+            'kind': 'awaiting_phase2',
+            'filled_instrument': 'RM609C2750',
+            'leg': {'inst': 'RM609P2025'},
+            'volume': 8,
+        }]
+        store = FakeStore({})
+        result = compute_account_decomposition(
+            conn, ledger, store, self._config(), None,
+        )
+        self.assertTrue(result['balanced'])
+        self.assertEqual(result['external'], {})
+
     def test_external_ack_explains_spread(self):
         cfg = {}
         register_acknowledged_external(
@@ -120,6 +142,27 @@ class TestAccountDecomposition(unittest.TestCase):
         register_acknowledged_external(cfg, {'RM609C2650': 1}, persist=False)
         self.assertTrue(external_explains_strangle_gap('rm609c2650', 1, cfg))
         self.assertFalse(external_explains_strangle_gap('rm609c2650', 2, cfg))
+
+    def test_external_ack_explains_csv_ahead_negative(self):
+        cfg = {}
+        register_acknowledged_external(
+            cfg, {'LC2609-C-198000': -5}, persist=False,
+        )
+        self.assertTrue(
+            external_explains_reconcile_gap('lc2609-C-198000', 0, 5, cfg),
+        )
+        self.assertFalse(
+            external_explains_reconcile_gap('lc2609-C-198000', 0, 4, cfg),
+        )
+
+    def test_external_ack_explains_short_ctp_ahead(self):
+        cfg = {}
+        register_acknowledged_external(
+            cfg, {'LC2609-C-228000': -2}, persist=False,
+        )
+        self.assertTrue(
+            external_explains_ctp_ahead('LC2609-C-228000', -5, -3, cfg),
+        )
 
 
 if __name__ == '__main__':

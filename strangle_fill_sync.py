@@ -24,6 +24,51 @@ from trade_journal import (
 from trade_journal_lock import journal_lock
 
 
+def _skip_strangle_fill_on_spread_owned_only(
+    config: dict,
+    conn,
+    instrument: str,
+) -> tuple:
+    """
+    宽跨段成交但合约仅由价差认领、宽跨认领为 0 → 勿写入 strangle CSV。
+
+    对称 spread_fill_sync._skip_spread_fill_on_strangle_owned_only。
+    """
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('strangle_fill_skip_spread_owned_instruments', True):
+        return False, ''
+
+    if conn is None:
+        return False, ''
+
+    from spread_ledger import store_from_conn
+    from import_strangle_positions import read_claim_volume
+
+    store = store_from_conn(conn)
+    if store is None:
+        return False, ''
+
+    key = (instrument or '').strip().upper()
+    if not key:
+        return False, ''
+
+    spread_vol = 0
+    for k, v in store.list_leg_claims().items():
+        if str(k).strip().upper() == key:
+            spread_vol = int(v)
+            break
+    if spread_vol == 0:
+        return False, ''
+
+    if read_claim_volume(config, instrument) != 0:
+        return False, ''
+
+    return True, (
+        f'价差认领 {spread_vol} 手、宽跨认领 0，'
+        '疑似价差成交误用宽跨 OrderRef'
+    )
+
+
 def _journal_path(config: dict) -> str:
     dual = config.get('dual_strategy') or {}
     path = dual.get(
@@ -41,6 +86,7 @@ def apply_strangle_trade_record(
     trade: dict,
     logger=None,
     journal_file: str = None,
+    conn=None,
 ) -> bool:
     """单笔宽跨成交写入 CSV（幂等）。返回 True 表示新写入。"""
     from auto_strategy_order_ref import is_strangle_order_ref
@@ -60,6 +106,69 @@ def apply_strangle_trade_record(
         instrument = (trade.get('instrument') or '').strip()
         volume = int(trade.get('volume') or 0)
         if not instrument or volume <= 0:
+            return False
+
+        dual = config.get('dual_strategy') or {}
+        require_match = dual.get('strangle_fill_require_tradeinfo_match', True)
+        strangle_info = config.get('strangle_tradeinfo') or []
+        if conn is None:
+            conn = config.get('_strangle_fill_conn')
+        if require_match and strangle_info:
+            from spread_claims_guard import instrument_in_strangle_tradeinfo
+            if not instrument_in_strangle_tradeinfo(
+                instrument, conn, strangle_info,
+            ):
+                if logger:
+                    logger.warning(
+                        f'[宽跨持仓] 跳过入账 OrderRef={order_ref} {instrument} '
+                        f'x{volume}：合约不在 strangle tradeinfo（品种/月份不匹配）。'
+                        '请核对 strategy_order_ref 是否把价差成交写进宽跨段。'
+                    )
+                append_journal(journal_file, {
+                    'dedupe_key': dedupe_key,
+                    'trade_id': trade.get('trade_id', ''),
+                    'order_ref': order_ref,
+                    'instrument': instrument,
+                    'direction': trade.get('direction'),
+                    'offset': trade.get('offset'),
+                    'volume': volume,
+                    'skipped': 'not_in_strangle_tradeinfo',
+                    'journal_state': 'applied',
+                    'applied_on': date.today().isoformat(),
+                }, config)
+                if conn is not None:
+                    from fill_ledger import stash_fill_csv_status
+                    stash_fill_csv_status(
+                        conn, trade, False, 'not_in_strangle_tradeinfo',
+                    )
+                return False
+
+        skip_owned, skip_reason = _skip_strangle_fill_on_spread_owned_only(
+            config, conn, instrument,
+        )
+        if skip_owned:
+            if logger:
+                logger.warning(
+                    f'[宽跨持仓] 跳过入账 OrderRef={order_ref} {instrument} '
+                    f'x{volume}：{skip_reason}。'
+                    '请确认 autotrade 已使用 strategy=spread；'
+                    '本笔仅记入 journal 不入 strangle_positions.csv。'
+                )
+            append_journal(journal_file, {
+                'dedupe_key': dedupe_key,
+                'trade_id': trade.get('trade_id', ''),
+                'order_ref': order_ref,
+                'instrument': instrument,
+                'direction': trade.get('direction'),
+                'offset': trade.get('offset'),
+                'volume': volume,
+                'skipped': 'spread_owned_only',
+                'journal_state': 'applied',
+                'applied_on': date.today().isoformat(),
+            }, config)
+            if conn is not None:
+                from fill_ledger import stash_fill_csv_status
+                stash_fill_csv_status(conn, trade, False, 'spread_owned_only')
             return False
 
         direction, offset = map_direction_offset(
@@ -109,6 +218,9 @@ def apply_strangle_trade_record(
             f'[宽跨持仓] 成交入账 OrderRef={order_ref} {instrument} '
             f'{direction}/{offset} x{volume}'
         )
+    if conn is not None:
+        from fill_ledger import stash_fill_csv_status
+        stash_fill_csv_status(conn, trade, True)
     return True
 
 
@@ -192,6 +304,9 @@ def wire_strangle_trade_runtime(conn, ledger) -> None:
     ``auto_trading_spi.OnRtnTrade``），dispatcher 会按固定顺序依次触发
     strangle / spread / fill_ledger，每个 kind 只被调用一次（幂等）。
     """
+    cfg = getattr(conn, 'config', None)
+    if isinstance(cfg, dict):
+        cfg['_strangle_fill_conn'] = conn
     conn._runtime_state['_strangle_ledger'] = ledger
 
     def _handler(c, p_trade, logger):
@@ -214,6 +329,8 @@ def handle_strangle_trade_rtn(conn, p_trade, logger, ledger=None) -> None:
         ledger = runtime.get('_strangle_ledger')
 
     config = getattr(conn, 'config', None) or {}
+    if isinstance(config, dict):
+        config['_strangle_fill_conn'] = conn
     trade = {
         'order_ref': order_ref,
         'instrument': safe_decode(p_trade.InstrumentID),
@@ -225,13 +342,16 @@ def handle_strangle_trade_rtn(conn, p_trade, logger, ledger=None) -> None:
         'trade_date': safe_decode(getattr(p_trade, 'TradeDate', '') or ''),
         'trade_time': safe_decode(getattr(p_trade, 'TradeTime', '') or ''),
     }
-    apply_strangle_trade_record(config, ledger, trade, logger)
+    from trade_replay import record_trades_to_cache
+    record_trades_to_cache([trade], config, logger=logger)
+    apply_strangle_trade_record(config, ledger, trade, logger, conn=conn)
 
 
-def _trades_from_query(conn) -> Optional[List[dict]]:
-    if not hasattr(conn, 'query_trades_sync'):
-        return None
-    return conn.query_trades_sync(timeout=12, use_cache=False)
+def _trades_from_query(conn, config: dict = None, logger=None) -> Optional[List[dict]]:
+    if config is None:
+        config = getattr(conn, 'config', None) or {}
+    from trade_replay import query_trades_for_replay
+    return query_trades_for_replay(conn, config, logger=logger)
 
 
 def sync_csv_from_strangle_trades(
@@ -249,7 +369,7 @@ def sync_csv_from_strangle_trades(
     spread/strangle/fill_ledger 三处各调一次 CTP 查询（每次 ~12s）。
     """
     if trades is None:
-        trades = _trades_from_query(conn)
+        trades = _trades_from_query(conn, config, logger)
     if trades is None:
         if logger:
             logger.debug('[宽跨持仓] 成交查询不可用或失败，跳过回放')
@@ -266,7 +386,7 @@ def sync_csv_from_strangle_trades(
         key = trade_dedupe_key(trade)
         if key in applied:
             continue
-        if apply_strangle_trade_record(config, ledger, trade, logger, journal_file):
+        if apply_strangle_trade_record(config, ledger, trade, logger, journal_file, conn=conn):
             applied.add(key)
             new_count += 1
 
@@ -301,7 +421,7 @@ def rebuild_csv_from_strangle_trades(
     for trade in sorted(trades, key=lambda t: (t.get('trade_date', ''), t.get('trade_time', ''), t.get('order_ref', 0))):
         if not is_strangle_order_ref(trade.get('order_ref'), config):
             continue
-        instrument = (trade.get('instrument') or '').strip()
+        instrument = (trade.get('instrument') or '').strip().upper()
         volume = int(trade.get('volume') or 0)
         if not instrument or volume <= 0:
             continue

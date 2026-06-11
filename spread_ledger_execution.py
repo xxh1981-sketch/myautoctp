@@ -381,6 +381,11 @@ def install_spread_ledger_execution(config: dict) -> None:
     install_spread_process_symbol_halt(config)
     install_spread_risk_check_exclusion(config)
     install_spread_rebalance_close_a_exclusion(config)
+    try:
+        from session_close_guard import install_session_close_guard
+        install_session_close_guard(config)
+    except Exception:
+        pass
     _INSTALLED = True
 
 

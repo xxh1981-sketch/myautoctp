@@ -70,7 +70,7 @@ python merged_main.py
 | 项 | 说明 |
 |----|------|
 | **禁止双进程** | 勿与独立 `auto_main.py` / `straggle_main.py` 同账户同时运行 |
-| **全局 1 在途** | 两策略共用，不会互撤抢单 |
+| **全局 1 在途** | 两策略共用；发单前 `auto_risk.ensure_no_inflight` 保证至多 1 笔在途（单进程下不会互撤抢单） |
 | **order_ref 分段** | 价差与宽跨使用不同号段（见 `merged_config.example.yaml`） |
 | **宽跨日限** | `daily_buy_limit_yuan`；达限仍允许平仓 |
 | **宽跨持仓** | 开盘前维护 `data/strangle_positions.csv` |

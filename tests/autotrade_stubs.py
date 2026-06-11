@@ -194,6 +194,24 @@ def _install_auto_feishu_command(mod):
     mod.is_trading_paused = lambda: False
 
 
+def _install_combo_id_registry(mod):
+    def lookup_combo_id(conn, order_ref):
+        if not order_ref:
+            return ''
+        mapping = getattr(conn, '_combo_id_by_order_ref', None)
+        if not isinstance(mapping, dict):
+            return ''
+        val = mapping.get(int(order_ref), '')
+        return str(val) if val else ''
+
+    mod.lookup_combo_id = lookup_combo_id
+    mod.register_order_combo_id = lambda *a, **kw: None
+    mod.begin_combo_id = lambda *a, **kw: ''
+    mod.set_active_combo_id = lambda *a, **kw: None
+    mod.get_active_combo_id = lambda conn: ''
+    mod.register_active_combo_order = lambda *a, **kw: None
+
+
 def _install_auto_scheduled_pause(mod):
     def log_main_loop_offline_skip(conn, config, logger, quarantine=False):
         if logger is None:
@@ -284,6 +302,7 @@ _STUB_BUILDERS = {
     'auto_initializer': _install_auto_initializer,
     'auto_feishu': _install_auto_feishu,
     'auto_feishu_command': _install_auto_feishu_command,
+    'combo_id_registry': _install_combo_id_registry,
     'auto_scheduled_pause': _install_auto_scheduled_pause,
     'auto_scheduled_reconnect': _install_auto_scheduled_reconnect,
     'auto_circuit_breaker': _install_auto_circuit_breaker,

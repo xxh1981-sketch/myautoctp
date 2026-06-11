@@ -24,10 +24,13 @@ if 'pairtrade.constants' not in sys.modules:
 from trade_journal import (
     active_journal_path,
     append_journal,
+    is_plausible_ctp_trade,
+    is_plausible_ctp_trade_id,
     journal_path_for_day,
     journal_retain_days,
     load_applied_keys,
     map_direction_offset,
+    scan_journal_truncated_tails,
     scan_unresolved_pending,
     trade_dedupe_key,
 )
@@ -38,6 +41,13 @@ class TestTradeJournal(unittest.TestCase):
     def test_dedupe_key_prefers_trade_id(self):
         key = trade_dedupe_key({'trade_id': 'ABC', 'instrument': 'SA609C1000'})
         self.assertEqual(key, 'SA609C1000:ABC')
+
+    def test_plausible_ctp_trade_id(self):
+        self.assertTrue(is_plausible_ctp_trade_id('103877'))
+        self.assertFalse(is_plausible_ctp_trade_id('Q1'))
+        self.assertFalse(is_plausible_ctp_trade_id(''))
+        self.assertFalse(is_plausible_ctp_trade({'trade_id': 'T1'}))
+        self.assertTrue(is_plausible_ctp_trade({'trade_id': '140490'}))
 
     def test_daily_shard_path(self):
         base = '/data/journal.jsonl'
@@ -134,6 +144,15 @@ class TestTradeJournal(unittest.TestCase):
             # load_applied_keys 也不得把未知状态当成已应用键。
             keys = load_applied_keys(base, cfg, include_pending=False)
             self.assertNotIn('k1', keys)
+
+    def test_truncated_tail_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, 'j.jsonl')
+            cfg = {'dual_strategy': {'journal_daily_shards': False}}
+            with open(base, 'w', encoding='utf-8') as f:
+                f.write(json.dumps({'dedupe_key': 'ok', 'journal_state': 'applied'}) + '\n')
+                f.write('{"dedupe_key": "bad", "journal_state": "appl\n')
+            self.assertEqual(scan_journal_truncated_tails(base, cfg), 1)
 
     def test_legacy_missing_state_still_applied(self):
         """无 journal_state 字段的旧行仍按 applied 处理（向后兼容）。"""

@@ -47,6 +47,7 @@ def _cfg(tmp, journal_name='spread_journal.jsonl'):
             'spread_positions_csv': csv_path,
             'spread_trade_journal': journal,
             'journal_daily_shards': False,
+            'trade_replay_lookback_days': 0,
         },
     }
 
@@ -130,6 +131,30 @@ class TestSpreadFillSync(unittest.TestCase):
             with open(journal, 'r', encoding='utf-8') as f:
                 body = f.read()
             self.assertIn('strangle_owned_only', body)
+
+    def test_stash_fill_csv_status_on_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            store = SpreadLegStore()
+            ledger = MagicMock()
+            ledger.list_leg_claims.return_value = {'rb2610C3450': 1}
+            ledger.list_unmatched_legs.return_value = []
+            conn = MagicMock()
+            conn._runtime_state = {'_strangle_ledger': ledger}
+            cfg['_spread_fill_conn'] = conn
+            trade = {
+                'order_ref': 892,
+                'instrument': 'rb2610C3450',
+                'direction': DIRECTION_SELL,
+                'offset': OFFSET_CLOSE,
+                'volume': 1,
+                'trade_id': 'RB_CLOSE',
+            }
+            self.assertFalse(apply_spread_trade_record(cfg, store, trade))
+            from fill_ledger import pop_fill_csv_status
+            applied, reason = pop_fill_csv_status(conn, trade)
+            self.assertFalse(applied)
+            self.assertEqual(reason, 'strangle_owned_only')
 
     def test_allow_spread_fill_when_spread_store_has_claim(self):
         with tempfile.TemporaryDirectory() as tmp:

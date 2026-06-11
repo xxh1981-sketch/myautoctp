@@ -172,6 +172,11 @@ def apply_spread_trade_record(
                     'journal_state': 'applied',
                     'applied_on': date.today().isoformat(),
                 }, config)
+                if conn is not None:
+                    from fill_ledger import stash_fill_csv_status
+                    stash_fill_csv_status(
+                        conn, trade, False, 'not_in_spread_tradeinfo',
+                    )
                 return False
 
         skip_owned, skip_reason = _skip_spread_fill_on_strangle_owned_only(
@@ -201,9 +206,10 @@ def apply_spread_trade_record(
                 'journal_state': 'applied',
                 'applied_on': date.today().isoformat(),
             }, config)
+            if conn is not None:
+                from fill_ledger import stash_fill_csv_status
+                stash_fill_csv_status(conn, trade, False, 'strangle_owned_only')
             return False
-
-        # P4: spread OrderRef 命中但合约品种不在 spread_tradeinfo 中 → 异常
         # 配置 / 跨策略 OrderRef 串号；写入仍照旧（保持账本完整性），但每个
         # 品种打一次 warning，便于排查。
         sym = _symbol_prefix(instrument)
@@ -269,6 +275,10 @@ def apply_spread_trade_record(
             f'[价差持仓] 成交入账 OrderRef={order_ref} {instrument} '
             f'{direction}/{offset} x{volume}'
         )
+    conn = config.get('_spread_fill_conn')
+    if conn is not None:
+        from fill_ledger import stash_fill_csv_status
+        stash_fill_csv_status(conn, trade, True)
     return True
 
 
@@ -318,13 +328,16 @@ def handle_spread_trade_rtn(conn, p_trade, logger, store=None) -> None:
         'trade_date': safe_decode(getattr(p_trade, 'TradeDate', '') or ''),
         'trade_time': safe_decode(getattr(p_trade, 'TradeTime', '') or ''),
     }
+    from trade_replay import record_trades_to_cache
+    record_trades_to_cache([trade], config, logger=logger)
     apply_spread_trade_record(config, store, trade, logger)
 
 
-def _trades_from_query(conn) -> Optional[List[dict]]:
-    if not hasattr(conn, 'query_trades_sync'):
-        return None
-    return conn.query_trades_sync(timeout=12, use_cache=False)
+def _trades_from_query(conn, config: dict = None, logger=None) -> Optional[List[dict]]:
+    if config is None:
+        config = getattr(conn, 'config', None) or {}
+    from trade_replay import query_trades_for_replay
+    return query_trades_for_replay(conn, config, logger=logger)
 
 
 def sync_csv_from_spread_trades(
@@ -340,7 +353,7 @@ def sync_csv_from_spread_trades(
     ``query_trades_sync`` for the round, sparing the CTP another full query.
     """
     if trades is None:
-        trades = _trades_from_query(conn)
+        trades = _trades_from_query(conn, config, logger)
     if trades is None:
         if logger:
             logger.debug('[价差持仓] 成交查询不可用或失败，跳过回放')

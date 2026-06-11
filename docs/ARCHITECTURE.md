@@ -29,7 +29,7 @@ flowchart LR
 | 项 | 说明 |
 |----|------|
 | 禁止双进程 | 勿与 `auto_main.py` / `straggle_main.py` 同账户并行 |
-| 全局 1 在途 | 两策略共用，互不抢撤单 |
+| 全局 1 在途 | 两策略共用；由 autotrade `auto_risk.ensure_no_inflight` 在**发单层**保证（宽跨经 `pre_trade_inflight`），非 `merged_main_loop` 编排门闸 |
 | OrderRef 分段 | 价差 `1…spread_order_ref_max`；宽跨 `≥ order_ref_min`（默认 500000） |
 | 持仓认领 | `data/spread_positions.csv`（signed）、`data/strangle_positions.csv`（多头） |
 | 飞书暂停 | **人工全停**（含平仓），非缺陷 |
@@ -53,7 +53,7 @@ flowchart LR
 
 ## 主循环顺序
 
-`dual_strategy.strategy_order` 默认 `[spread, strangle]`：每轮先扫价差品种，再扫宽跨。
+`dual_strategy.strategy_order` 默认 `[spread, strangle]`：每轮先扫价差品种，再扫宽跨。串行扫描决定**轮内顺序**，不等于在途互斥；在途互斥见上表（`ensure_no_inflight`）。
 
 ## 对账与入账
 

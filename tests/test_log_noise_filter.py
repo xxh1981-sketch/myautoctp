@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from log_noise_filter import (  # noqa: E402
     LogNoiseFilter,
+    _normalize_throttle_substrings,
     build_filter_from_config,
     install_log_noise_filter,
 )
@@ -42,6 +43,27 @@ def _make_logger(name, flt):
     return logger, cap
 
 
+class TestNormalizeSubstrings(unittest.TestCase):
+
+    def test_yaml_mapping_item_becomes_key_string(self):
+        subs = _normalize_throttle_substrings(
+            ['提升次近月为近月', {'不平衡检查': None}],
+        )
+        self.assertIn('提升次近月为近月', subs)
+        self.assertIn('不平衡检查', subs)
+
+    def test_dict_only_item_not_passed_to_filter_crash(self):
+        flt = LogNoiseFilter(
+            [{'不平衡检查': None}],
+            window_sec=60,
+            downgrade_rules=(),
+        )
+        logger, cap = _make_logger('test.noise.yaml_dict', flt)
+        for _ in range(5):
+            logger.info('[m] 不平衡检查: is_imbalanced=False')
+        self.assertEqual(len(cap.messages), 1)
+
+
 class TestThrottle(unittest.TestCase):
 
     def test_identical_message_throttled_within_window(self):
@@ -67,6 +89,20 @@ class TestThrottle(unittest.TestCase):
 
         self.assertEqual(cap.messages.count(rm), 1)
         self.assertEqual(cap.messages.count(m), 1)
+
+    def test_substring_mode_collapses_cross_symbol(self):
+        flt = LogNoiseFilter(
+            ['品种整体 VIX 无法计算'],
+            window_sec=60,
+            downgrade_rules=(),
+            throttle_key_mode='substring',
+        )
+        logger, cap = _make_logger('test.noise.substring', flt)
+
+        for sym in ('LC', 'SA', 'MA', 'rb'):
+            logger.info(f'[{sym}] 品种整体 VIX 无法计算（tradeinfo 月 2609）')
+
+        self.assertEqual(len(cap.messages), 1)
 
     def test_non_matching_message_never_throttled(self):
         flt = LogNoiseFilter(['提升次近月为近月'], window_sec=60, downgrade_rules=())

@@ -176,7 +176,9 @@ def process_close_from_spread_ledger(
                     logger.warning(
                         f'[{symbol}] 价差账本 A 已平完但 B 仍有 {b_cur} 手残留，需人工检查'
                     )
-                    _notify_spread_close_residual(conn, config, logger, symbol, a_cur, b_cur)
+                    _notify_spread_close_residual(
+                        conn, config, logger, symbol, a_cur, b_cur,
+                    )
                     return False
                 logger.info(
                     f'[{symbol}] 价差账本残留 B={b_cur} 但 CTP 已清零，'
@@ -188,15 +190,9 @@ def process_close_from_spread_ledger(
                     logger.warning(
                         f'[{symbol}] 价差账本 A 仍有 {a_cur} 手但 B 已清零，需关注'
                     )
-                    try:
-                        from auto_feishu import safe_notify
-                        safe_notify(
-                            'send_feishu_message',
-                            f'⚠️ [{symbol}] 价差账本平仓后 A 残留 {a_cur} 手, B=0, 需人工检查',
-                            config=config,
-                        )
-                    except Exception:
-                        pass
+                    _notify_spread_a_residual(
+                        conn, config, logger, symbol, a_cur,
+                    )
                     return False
                 logger.info(
                     f'[{symbol}] 价差账本残留 A={a_cur} 但 CTP 已清零，'
@@ -259,18 +255,31 @@ def _ctp_still_has_residual(conn, symbol: str, month: str, logger) -> bool:
 
 
 def _notify_spread_close_residual(conn, config, logger, symbol, a_cur, b_cur) -> None:
-    try:
-        from auto_feishu import send_feishu_message
-        send_feishu_message(
-            f'⚠️ **价差平仓不完整（账本）**\n\n'
-            f'**品种**: {symbol}\n'
-            f'**A 认领**: {a_cur}\n'
-            f'**B 认领**: {b_cur}\n'
-            f'请人工检查 spread_positions.csv 与 CTP 持仓。',
-            config=config,
-        )
-    except Exception as e:
-        logger.debug(f'[{symbol}] 价差平仓残留飞书通知失败: {e}')
+    from feishu_alert_cooldown import send_message_cooldown
+
+    send_message_cooldown(
+        f'⚠️ **价差平仓不完整（账本）**\n\n'
+        f'**品种**: {symbol}\n'
+        f'**A 认领**: {a_cur}\n'
+        f'**B 认领**: {b_cur}\n'
+        f'请人工检查 spread_positions.csv 与 CTP 持仓。',
+        alert_key=f'spread_close_residual:{symbol.lower()}',
+        config=config,
+        conn=conn,
+        logger=logger,
+    )
+
+
+def _notify_spread_a_residual(conn, config, logger, symbol, a_cur) -> None:
+    from feishu_alert_cooldown import send_message_cooldown
+
+    send_message_cooldown(
+        f'⚠️ [{symbol}] 价差账本平仓后 A 残留 {a_cur} 手, B=0, 需人工检查',
+        alert_key=f'spread_close_a_residual:{symbol.lower()}',
+        config=config,
+        conn=conn,
+        logger=logger,
+    )
 
 
 def install_spread_close_from_ledger(config: dict) -> None:

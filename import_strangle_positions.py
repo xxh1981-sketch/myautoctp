@@ -111,6 +111,15 @@ def read_claim_volume(config: dict, instrument: str) -> int:
     return int(claims.get(inst, 0))
 
 
+def _normalize_strangle_claim_keys(claims: Dict[str, int]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for k, v in (claims or {}).items():
+        uk = str(k).strip().upper()
+        if uk:
+            out[uk] = out.get(uk, 0) + int(v)
+    return out
+
+
 def apply_fill_to_csv(
     config: dict,
     instrument: str,
@@ -130,14 +139,14 @@ def apply_fill_to_csv(
         # 读已有认领失败时绝不能用空表续写——那会把其它合约的认领整表抹掉。
         # 抛出让上层流水停在 pending（触发 journal_halt 止血），原 CSV 原样保留。
         try:
-            claims = load_positions_csv(path)
+            claims = _normalize_strangle_claim_keys(load_positions_csv(path))
         except Exception as e:
             if logger:
                 logger.error(
                     f"[宽跨持仓] 读取 CSV 失败，拒绝重建以保护既有认领: {e} ({path})"
                 )
             raise
-    inst = str(instrument).strip()
+    inst = str(instrument).strip().upper()
     new_vol = int(claims.get(inst, 0)) + delta
     if new_vol <= 0:
         claims.pop(inst, None)

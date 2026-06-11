@@ -53,7 +53,17 @@ def ctp_spread_signed_claims(
     if not keys:
         return out
 
-    sub = {str(k): int(v) for k, v in (strangle_long_calls or {}).items() if int(v) > 0}
+    sub: Dict[str, int] = {}
+    for k, v in (strangle_long_calls or {}).items():
+        try:
+            vol = int(v)
+        except (TypeError, ValueError):
+            continue
+        if vol <= 0:
+            continue
+        key = str(k).strip().upper()
+        if key:
+            sub[key] = sub.get(key, 0) + vol
 
     for sym, month in keys:
         try:
@@ -71,10 +81,11 @@ def ctp_spread_signed_claims(
                 continue
             if extract_strike_from_instrument(inst, normalized_month, option_type='C') is None:
                 continue
-            if signed > 0 and sub.get(inst, 0) > 0:
-                deduct = min(signed, sub[inst])
+            inst_key = inst.strip().upper()
+            if signed > 0 and sub.get(inst_key, 0) > 0:
+                deduct = min(signed, sub[inst_key])
                 signed -= deduct
-                sub[inst] -= deduct
+                sub[inst_key] -= deduct
                 if signed == 0:
                     continue
             out[inst] = out.get(inst, 0) + signed
@@ -227,7 +238,7 @@ def _in_grace_window(conn) -> bool:
     import time as _time
 
     runtime = getattr(conn, '_runtime_state', None) or {}
-    until = runtime.get('_reconcile_grace_until') or 0.0
+    until = runtime.get('_spread_reconcile_grace_until') or 0.0
     try:
         return _time.time() < float(until)
     except (TypeError, ValueError):
@@ -291,7 +302,11 @@ def reconcile_spread_positions(
             '[spread-reconcile]',
         )
 
-    from account_decomposition import external_explains_ctp_ahead, normalize_inst_map
+    from account_decomposition import (
+        external_explains_ctp_ahead,
+        external_explains_reconcile_gap,
+        normalize_inst_map,
+    )
 
     book = normalize_inst_map(
         ledger_spread_signed_claims(conn, store, spread_tradeinfo),
@@ -326,6 +341,12 @@ def reconcile_spread_positions(
             halt = True
         else:
             msg = f'{inst}: CSV={book_vol} CTP={ctp_vol} (CSV ahead)'
+            if external_explains_reconcile_gap(inst, ctp_vol, book_vol, config):
+                msg += ' [已确认外部仓，不 halt]'
+                if logger:
+                    logger.info(f'[spread-reconcile] {msg}')
+                issues.append(msg)
+                continue
             halt = True
         issues.append(msg)
         if logger:
