@@ -17,6 +17,7 @@ import autotrade_stubs
 autotrade_stubs.ensure_autotrade_stubs([
     'auto_strategy_order_ref',
     'auto_connection_utils',
+    'combo_id_registry',
 ])
 
 from fill_ledger import (
