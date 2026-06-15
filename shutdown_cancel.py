@@ -133,7 +133,7 @@ def install_shutdown_send_guard() -> bool:
         return True
     try:
         import auto_order_manager as aom
-    except ImportError as e:
+    except ImportError:
         return False
 
     original = aom.OrderManager.send_order

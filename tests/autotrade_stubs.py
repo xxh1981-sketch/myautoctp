@@ -100,6 +100,11 @@ def _install_strategy_order_ref(mod):
 
 def _install_auto_order_manager(mod):
     class OrderManager:
+        def __init__(self, conn, config=None, logger=None):
+            self.conn = conn
+            self.config = config
+            self.logger = logger
+
         def send_order(
             self,
             instrument,
@@ -273,6 +278,12 @@ def _install_straggle_execution(mod):
 
         def run_rebalance(self, *a, **kw):
             return None
+
+        def execute_open(self, *a, **kw):
+            return False
+
+        def execute_close(self, *a, **kw):
+            return False
 
     mod.StrangleExecutor = StrangleExecutor
 

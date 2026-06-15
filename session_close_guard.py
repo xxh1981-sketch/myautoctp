@@ -550,40 +550,42 @@ def _install_strangle_guards() -> None:
     sp.process_strangle_symbol = _patch_once(orig_ps, patched_process_strangle_symbol)
 
     cls = se.StrangleExecutor
-    orig_open = cls.execute_open
+    if hasattr(cls, 'execute_open'):
+        orig_open = cls.execute_open
 
-    def patched_execute_open(self, item, *a, **kw):
-        symbol = item['future']
-        config = getattr(self.conn, 'config', None) or {}
-        phase = get_session_phase(symbol, config)
-        if phase == 't10':
-            _maybe_log_throttled(
-                self.conn, f't10_st_open:{symbol.lower()}',
-                getattr(self, 'logger', None), 'info',
-                f'[{symbol}] 收盘 T-10：禁止宽跨新组开仓',
-            )
-            return False
-        if phase == 't1':
-            return False
-        return orig_open(self, item, *a, **kw)
+        def patched_execute_open(self, item, *a, **kw):
+            symbol = item['future']
+            config = getattr(self.conn, 'config', None) or {}
+            phase = get_session_phase(symbol, config)
+            if phase == 't10':
+                _maybe_log_throttled(
+                    self.conn, f't10_st_open:{symbol.lower()}',
+                    getattr(self, 'logger', None), 'info',
+                    f'[{symbol}] 收盘 T-10：禁止宽跨新组开仓',
+                )
+                return False
+            if phase == 't1':
+                return False
+            return orig_open(self, item, *a, **kw)
 
-    cls.execute_open = _patch_once(orig_open, patched_execute_open)
+        cls.execute_open = _patch_once(orig_open, patched_execute_open)
 
-    orig_close = cls.execute_close
+    if hasattr(cls, 'execute_close'):
+        orig_close = cls.execute_close
 
-    def patched_execute_close(self, position, item, *, urgent: bool = False):
-        symbol = item['future']
-        config = getattr(self.conn, 'config', None) or {}
-        phase = get_session_phase(symbol, config)
-        if phase == 't1':
-            return False
-        if phase == 't10' and (position or {}).get('status') == 'open':
-            _maybe_log_throttled(
-                self.conn, f't10_st_close:{symbol.lower()}',
-                getattr(self, 'logger', None), 'info',
-                f'[{symbol}] 收盘 T-10：禁止宽跨新组平仓',
-            )
-            return False
-        return orig_close(self, position, item, urgent=urgent)
+        def patched_execute_close(self, position, item, *, urgent: bool = False):
+            symbol = item['future']
+            config = getattr(self.conn, 'config', None) or {}
+            phase = get_session_phase(symbol, config)
+            if phase == 't1':
+                return False
+            if phase == 't10' and (position or {}).get('status') == 'open':
+                _maybe_log_throttled(
+                    self.conn, f't10_st_close:{symbol.lower()}',
+                    getattr(self, 'logger', None), 'info',
+                    f'[{symbol}] 收盘 T-10：禁止宽跨新组平仓',
+                )
+                return False
+            return orig_close(self, position, item, urgent=urgent)
 
-    cls.execute_close = _patch_once(orig_close, patched_execute_close)
+        cls.execute_close = _patch_once(orig_close, patched_execute_close)

@@ -29,7 +29,6 @@ from fill_ledger import (
     detect_bilateral_orderref_suspicious,
     fill_ledger_csv_path,
     fill_ledger_journal_path,
-    pop_fill_csv_status,
     resolve_fill_side,
     resolve_strategy,
     slippage_vs_mid,
