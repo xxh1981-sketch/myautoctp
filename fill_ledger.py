@@ -6,12 +6,14 @@ import csv
 import io
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from atomic_io import atomic_write_text
 from trade_journal import (
     append_journal,
     load_applied_keys,
+    map_direction_offset,
     trade_dedupe_key,
 )
 from trade_journal_lock import journal_lock
@@ -39,6 +41,8 @@ _FILL_SIDE_VALUES = frozenset({
 })
 
 _write_lock = threading.Lock()
+_BILATERAL_ORDERREF_STATE_KEY = '_fill_ledger_bilateral_orderref_seen'
+_BILATERAL_ORDERREF_LAST_ALERT_KEY = '_fill_ledger_bilateral_orderref_last_alert'
 
 
 def _project_dir() -> str:
@@ -68,7 +72,13 @@ def fill_ledger_journal_path(config: dict) -> str:
 
 
 
-def resolve_fill_side(direction: str, offset: str) -> str:
+def resolve_fill_side(
+    direction: str,
+    offset: str,
+    logger=None,
+    context: str = '',
+    warn_unknown: bool = True,
+) -> str:
     """Map CTP direction/offset to buy_open | sell_open | buy_close | sell_close."""
     d = str(direction or '').strip()
     o = str(offset or '').strip()
@@ -76,8 +86,15 @@ def resolve_fill_side(direction: str, offset: str) -> str:
         o = '0'
     if len(o) > 1:
         o = o[0]
-    is_buy = d in ('0', 'buy', 'Buy', 'BUY')
-    is_open = o in ('0', 'open', 'Open', 'OPEN')
+    direction_out, offset_out = map_direction_offset(
+        d,
+        o,
+        logger=logger,
+        context=context,
+        warn_unknown=warn_unknown,
+    )
+    is_buy = direction_out == '0'
+    is_open = offset_out == '0'
     if is_buy and is_open:
         return 'buy_open'
     if is_buy and not is_open:
@@ -140,10 +157,20 @@ def resolve_position_csv_fields(conn, trade: dict, config: dict, strategy: str) 
 
 
 def _lookup_quote(conn, instrument: str):
-    from auto_connection_utils import contract_case_variants
-
     inst = (instrument or '').strip()
     if not inst:
+        return None
+    for store_name in ('quotes', 'option_quotes'):
+        store = getattr(conn, store_name, None)
+        if not store:
+            continue
+        for key in (inst, inst.upper(), inst.lower()):
+            quote = store.get(key)
+            if quote is not None:
+                return quote
+    try:
+        from auto_connection_utils import contract_case_variants
+    except Exception:
         return None
     for store_name in ('quotes', 'option_quotes'):
         store = getattr(conn, store_name, None)
@@ -235,14 +262,43 @@ def append_fill_row(csv_path: str, row: Dict[str, Any]) -> None:
                 pass
 
 
-def build_fill_row(conn, trade: dict, config: dict) -> Optional[Dict[str, Any]]:
+def build_fill_row(
+    conn,
+    trade: dict,
+    config: dict,
+    logger=None,
+) -> Optional[Dict[str, Any]]:
     instrument = (trade.get('instrument') or '').strip()
-    volume = int(trade.get('volume') or 0)
-    fill_price = float(trade.get('price') or 0)
+    try:
+        volume = int(trade.get('volume') or 0)
+    except (TypeError, ValueError):
+        if logger:
+            logger.warning(
+                f'[FillLedger] 无效 volume，跳过: {trade.get("volume")!r} '
+                f'order_ref={trade.get("order_ref")}'
+            )
+        return None
+    try:
+        fill_price = float(trade.get('price') or 0)
+    except (TypeError, ValueError):
+        if logger:
+            logger.warning(
+                f'[FillLedger] 无效 price，跳过: {trade.get("price")!r} '
+                f'order_ref={trade.get("order_ref")}'
+            )
+        return None
     if not instrument or volume <= 0 or fill_price <= 0:
         return None
 
-    fill_side = resolve_fill_side(trade.get('direction'), trade.get('offset'))
+    dual = config.get('dual_strategy') or {}
+    context = f"order_ref={trade.get('order_ref')} instrument={instrument}"
+    fill_side = resolve_fill_side(
+        trade.get('direction'),
+        trade.get('offset'),
+        logger=logger,
+        context=context,
+        warn_unknown=bool(dual.get('ctp_unknown_direction_warn', True)),
+    )
     if fill_side not in _FILL_SIDE_VALUES:
         return None
 
@@ -295,7 +351,7 @@ def apply_fill_record(
     ):
         return False
 
-    row = build_fill_row(conn, trade, config)
+    row = build_fill_row(conn, trade, config, logger=logger)
     if row is None:
         return False
 
@@ -351,6 +407,116 @@ def apply_fill_record(
     return True
 
 
+def _fill_side_family(fill_side: str) -> Optional[str]:
+    if not fill_side:
+        return None
+    if fill_side.startswith('buy'):
+        return 'buy'
+    if fill_side.startswith('sell'):
+        return 'sell'
+    return None
+
+
+def detect_bilateral_orderref_suspicious(
+    trades: List[dict],
+    config: dict = None,
+    logger=None,
+    runtime: dict = None,
+) -> List[Dict[str, Any]]:
+    """Detect same order_ref+instrument seeing both buy and sell fills."""
+    config = config or {}
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('orderref_bilateral_nonzero_alert', True):
+        return []
+    if runtime is None:
+        runtime = {}
+    seen = runtime.setdefault(_BILATERAL_ORDERREF_STATE_KEY, {})
+    now = time.time()
+    suspicious: List[Dict[str, Any]] = []
+
+    for trade in trades or []:
+        if not isinstance(trade, dict):
+            continue
+        try:
+            volume = int(trade.get('volume') or 0)
+            order_ref = int(trade.get('order_ref') or 0)
+        except (TypeError, ValueError):
+            continue
+        if volume <= 0 or order_ref == 0:
+            continue
+        instrument = str(trade.get('instrument') or '').strip().upper()
+        if not instrument:
+            continue
+        fill_side = str(trade.get('fill_side') or '')
+        if not fill_side:
+            fill_side = resolve_fill_side(
+                trade.get('direction'),
+                trade.get('offset'),
+                logger=logger,
+                context=f'order_ref={order_ref} instrument={instrument}',
+                warn_unknown=bool(dual.get('ctp_unknown_direction_warn', True)),
+            )
+        family = _fill_side_family(fill_side)
+        if family is None:
+            continue
+
+        key = (order_ref, instrument)
+        first = seen.get(key)
+        if first and first.get('family') != family:
+            suspicious.append({
+                'order_ref': order_ref,
+                'instrument': instrument,
+                'first_side': first.get('fill_side'),
+                'second_side': fill_side,
+                'first_volume': first.get('volume'),
+                'second_volume': volume,
+                'first_trade_id': first.get('trade_id'),
+                'second_trade_id': trade.get('trade_id'),
+            })
+            continue
+        if first is None:
+            seen[key] = {
+                'family': family,
+                'fill_side': fill_side,
+                'volume': volume,
+                'trade_id': trade.get('trade_id', ''),
+                'seen_at': now,
+            }
+
+    return suspicious
+
+
+def _warn_bilateral_orderref_suspicious(
+    suspicious: List[Dict[str, Any]],
+    config: dict,
+    logger,
+    runtime: dict,
+) -> None:
+    if not suspicious or logger is None:
+        return
+    dual = config.get('dual_strategy') or {}
+    if not dual.get('orderref_bilateral_nonzero_alert', True):
+        return
+    if runtime is None:
+        runtime = {}
+    cooldown = float(
+        dual.get('orderref_bilateral_nonzero_alert_cooldown_sec', 1800) or 0,
+    )
+    now = time.time()
+    last_alerted = runtime.setdefault(_BILATERAL_ORDERREF_LAST_ALERT_KEY, {})
+    for item in suspicious:
+        key = (int(item.get('order_ref') or 0), str(item.get('instrument') or '').upper())
+        last_ts = float(last_alerted.get(key, 0.0) or 0.0)
+        if now - last_ts < cooldown:
+            continue
+        last_alerted[key] = now
+        logger.warning(
+            '[FillLedger] 同 OrderRef+合约出现买卖双边成交: '
+            f"order_ref={item.get('order_ref')} instrument={item.get('instrument')} "
+            f"first={item.get('first_side')} second={item.get('second_side')}"
+        )
+
+
 def handle_fill_rtn(conn, p_trade, logger=None) -> None:
     from pairtrade.models import safe_decode
 
@@ -371,9 +537,24 @@ def handle_fill_rtn(conn, p_trade, logger=None) -> None:
         'trade_time': safe_decode(getattr(p_trade, 'TradeTime', '') or ''),
     }
     config = getattr(conn, 'config', None) or {}
+    runtime = getattr(conn, '_runtime_state', None)
+    if not isinstance(runtime, dict):
+        runtime = {}
+        setattr(conn, '_runtime_state', runtime)
     from trade_replay import record_trades_to_cache
     record_trades_to_cache([trade], config, logger=logger)
     apply_fill_record(conn, config, trade, logger)
+    _warn_bilateral_orderref_suspicious(
+        detect_bilateral_orderref_suspicious(
+            [trade],
+            config=config,
+            logger=logger,
+            runtime=runtime,
+        ),
+        config,
+        logger,
+        runtime,
+    )
 
 
 _WIRE_KIND_FILL_LEDGER = 'fill_ledger'
@@ -417,12 +598,29 @@ def sync_fill_ledger_from_trades(
         return 0
 
     journal_file = fill_ledger_journal_path(config)
+    runtime = getattr(conn, '_runtime_state', None)
+    if not isinstance(runtime, dict):
+        runtime = {}
+        setattr(conn, '_runtime_state', runtime)
     applied = load_applied_keys(journal_file, config, include_pending=True)
+    pending_trades = [
+        trade for trade in (trades or [])
+        if trade_dedupe_key(trade) not in applied
+    ]
+    _warn_bilateral_orderref_suspicious(
+        detect_bilateral_orderref_suspicious(
+            pending_trades,
+            config=config,
+            logger=logger,
+            runtime=runtime,
+        ),
+        config,
+        logger,
+        runtime,
+    )
     new_count = 0
-    for trade in trades:
+    for trade in pending_trades:
         key = trade_dedupe_key(trade)
-        if key in applied:
-            continue
         if apply_fill_record(conn, config, trade, logger, journal_file):
             applied.add(key)
             new_count += 1

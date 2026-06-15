@@ -100,6 +100,11 @@ def _install_strategy_order_ref(mod):
 
 def _install_auto_order_manager(mod):
     class OrderManager:
+        def __init__(self, conn, config=None, logger=None):
+            self.conn = conn
+            self.config = config
+            self.logger = logger
+
         def send_order(
             self,
             instrument,
@@ -138,6 +143,16 @@ def _install_auto_closer_plan(mod):
 
 
 def _install_auto_closer_executor(mod):
+    def _send_and_wait(
+        conn, instrument, direction, volume, price, offset,
+        timeout, config, logger, symbol,
+        base_future_price=None,
+        price_change_threshold=None,
+        strategy='spread',
+    ):
+        return False, 0, 0.0
+
+    mod._send_and_wait = _send_and_wait
     mod.execute_close_orders_with_limit = lambda *a, **kw: (False, 0)
 
 
@@ -263,6 +278,12 @@ def _install_straggle_execution(mod):
 
         def run_rebalance(self, *a, **kw):
             return None
+
+        def execute_open(self, *a, **kw):
+            return False
+
+        def execute_close(self, *a, **kw):
+            return False
 
     mod.StrangleExecutor = StrangleExecutor
 

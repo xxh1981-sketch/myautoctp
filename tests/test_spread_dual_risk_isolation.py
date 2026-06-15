@@ -44,6 +44,7 @@ class TestSpreadRiskCheckExcludesStrangle(unittest.TestCase):
 
         conn = MagicMock()
         conn._runtime_state = {}
+        conn._active_executor = None
         conn._normalize_month = lambda symbol, month: month
         store = SpreadLegStore()
         store.set_leg_claims(claims)
@@ -146,6 +147,7 @@ class TestRebalanceCloseAExcludesStrangle(unittest.TestCase):
 
         conn = MagicMock()
         conn._runtime_state = {}
+        conn._active_executor = None
         conn._normalize_month = lambda symbol, month: month
         store = SpreadLegStore()
         store.set_leg_claims({'MA609C3500': 5})

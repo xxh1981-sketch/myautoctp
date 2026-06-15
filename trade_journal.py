@@ -269,13 +269,48 @@ def append_journal(journal_base: str, row: dict, config: dict = None) -> str:
     return path
 
 
-def map_direction_offset(direction: str, offset: str) -> tuple:
+def _warn_unknown_ctp_field(logger, field: str, raw_value: str, fallback: str, context: str) -> None:
+    if logger is None:
+        return
+    ctx = f'；context={context}' if context else ''
+    logger.warning(f'[CTP字段] 未知 {field}={raw_value!r}，已按 {fallback} 处理{ctx}')
+
+
+def map_direction_offset(
+    direction: str,
+    offset: str,
+    logger=None,
+    context: str = '',
+    warn_unknown: bool = True,
+) -> tuple:
+    import pairtrade.constants as pt_const
     from pairtrade.constants import DIRECTION_BUY, DIRECTION_SELL, OFFSET_CLOSE, OFFSET_OPEN
+
+    OFFSET_CLOSE_TODAY = getattr(pt_const, 'OFFSET_CLOSE_TODAY', '3')
+    OFFSET_CLOSE_YESTERDAY = getattr(pt_const, 'OFFSET_CLOSE_YESTERDAY', '4')
 
     d = str(direction or '').strip()
     o = str(offset or '').strip()
     if not o or o == '?':
         o = OFFSET_OPEN
-    direction_out = DIRECTION_BUY if d in ('0', DIRECTION_BUY) else DIRECTION_SELL
-    offset_out = OFFSET_OPEN if o in ('0', OFFSET_OPEN) else OFFSET_CLOSE
+    direction_aliases = {
+        '0', 'buy', 'Buy', 'BUY',
+        DIRECTION_BUY, DIRECTION_BUY.lower(), DIRECTION_BUY.upper(),
+    }
+    offset_open_values = {'0', OFFSET_OPEN}
+    offset_close_values = {
+        '1', OFFSET_CLOSE,
+        '3', OFFSET_CLOSE_TODAY,
+        '4', OFFSET_CLOSE_YESTERDAY,
+    }
+    direction_out = DIRECTION_BUY if d in direction_aliases else DIRECTION_SELL
+    offset_out = OFFSET_OPEN if o in offset_open_values else OFFSET_CLOSE
+    if warn_unknown:
+        if d not in direction_aliases | {
+            '1', 'sell', 'Sell', 'SELL',
+            DIRECTION_SELL, DIRECTION_SELL.lower(), DIRECTION_SELL.upper(),
+        }:
+            _warn_unknown_ctp_field(logger, 'Direction', direction, 'sell', context)
+        if o not in offset_open_values | offset_close_values:
+            _warn_unknown_ctp_field(logger, 'Offset', offset, 'close', context)
     return direction_out, offset_out

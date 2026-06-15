@@ -16,7 +16,10 @@ autotrade_stubs.ensure_auto_feishu_stub()
 from strangle_unmatched_watchdog import (
     STATE_FIRST_SEEN,
     STATE_LAST_ALERTED,
+    STATE_METADATA_LAST_ALERTED,
+    _b_max,
     check_unmatched_health,
+    validate_unmatched_leg_metadata,
 )
 
 
@@ -107,6 +110,42 @@ class TestUnmatchedWatchdog(unittest.TestCase):
             check_unmatched_health(conn, led_empty, cfg, None)
         self.assertEqual(conn._runtime_state[STATE_FIRST_SEEN], {})
         self.assertEqual(conn._runtime_state[STATE_LAST_ALERTED], {})
+
+    def test_validate_unmatched_leg_metadata(self):
+        bad = validate_unmatched_leg_metadata([
+            _leg(retry=10),
+            {'symbol': 'sa', 'month': '609', 'kind': 'close_chp_pending', 'leg': {}},
+            {'symbol': 'sa', 'month': '609', 'kind': 'close_chp_pending', 'leg': {'inst': 'SA609C2400'}, 'b_retry_count': 'bad'},
+        ])
+        self.assertEqual(len(bad), 2)
+        missing_by_index = {item['index']: item['missing'] for item in bad}
+        self.assertIn('leg.inst or filled_instrument', missing_by_index[1])
+        self.assertIn('b_retry_count', missing_by_index[2])
+
+    def test_metadata_alert_cooldown(self):
+        conn = FakeConn()
+        led = FakeLedger([{'symbol': 'sa', 'month': '609', 'kind': 'close_chp_pending', 'leg': {}}])
+        cfg = {'strangle': {'unmatched_leg_metadata_alert': True, 'unmatched_leg_metadata_alert_cooldown_sec': 60}}
+        with patch('auto_feishu.send_feishu_message') as mock_send:
+            check_unmatched_health(conn, led, cfg, None)
+            check_unmatched_health(conn, led, cfg, None)
+        self.assertEqual(mock_send.call_count, 1)
+        self.assertIn(STATE_METADATA_LAST_ALERTED, conn._runtime_state)
+
+    def test_metadata_alert_can_be_disabled(self):
+        conn = FakeConn()
+        led = FakeLedger([{'symbol': 'sa', 'month': '609', 'kind': 'close_chp_pending', 'leg': {}}])
+        cfg = {'strangle': {'unmatched_leg_metadata_alert': False}}
+        with patch('auto_feishu.send_feishu_message') as mock_send:
+            check_unmatched_health(conn, led, cfg, None)
+        mock_send.assert_not_called()
+
+    def test_b_max_falls_back_on_bad_config(self):
+        self.assertEqual(_b_max({'B_max_retries': 'bad', 'strangle': {}}), 10)
+        self.assertEqual(
+            _b_max({'strangle': {'phase2_max_retries': 'bad'}}),
+            10,
+        )
 
 
 if __name__ == '__main__':

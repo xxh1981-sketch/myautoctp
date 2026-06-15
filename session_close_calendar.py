@@ -71,8 +71,12 @@ def _weekday_allows_trading(now: datetime, current_minutes: int) -> bool:
     return True
 
 
-def _in_segment(current_minutes: int, start: int, end: int) -> bool:
-    return start <= current_minutes <= end
+def _in_segment(elapsed_minutes: float, start: int, end: int) -> bool:
+    return start <= elapsed_minutes <= end
+
+
+def _elapsed_minutes(now: datetime) -> float:
+    return now.hour * 60 + now.minute + now.second / 60.0 + now.microsecond / 6e7
 
 
 def _segments_for_symbol(
@@ -104,17 +108,23 @@ def _segments_for_symbol(
 
 
 def is_trading_time_at(symbol: str, now: Optional[datetime] = None, config: Optional[dict] = None) -> bool:
-    """Same semantics as ``auto_processor.is_trading_time`` but with explicit *now*."""
+    """Same semantics as ``auto_processor.is_trading_time`` but with explicit *now*.
+
+    Uses sub-minute precision so segment end (e.g. 15:00:00) aligns with
+    ``seconds_to_segment_end`` / ``get_session_phase`` — minute-only checks
+    would leave a dead zone where ``is_trading_time`` is true but phase is off.
+    """
     now = now or datetime.now()
     current_minutes = now.hour * 60 + now.minute
     if not _weekday_allows_trading(now, current_minutes):
         return False
 
+    elapsed = _elapsed_minutes(now)
     for start, end, cross in _segments_for_symbol(symbol, config):
         if cross:
-            if current_minutes >= start or current_minutes <= end:
+            if elapsed >= start or elapsed <= end:
                 return True
-        elif _in_segment(current_minutes, start, end):
+        elif _in_segment(elapsed, start, end):
             return True
     return False
 
@@ -129,8 +139,7 @@ def seconds_to_segment_end(
     if not is_trading_time_at(symbol, now, config):
         return None
 
-    current_minutes = now.hour * 60 + now.minute
-    elapsed_in_min = current_minutes + now.second / 60.0 + now.microsecond / 6e7
+    elapsed_in_min = _elapsed_minutes(now)
 
     best: Optional[float] = None
     for start, end, cross in _segments_for_symbol(symbol, config):

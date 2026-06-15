@@ -43,6 +43,28 @@ class TestRuntimeRiskAlerts(unittest.TestCase):
         self.assertFalse(mock_send.called)
 
     @patch('runtime_risk_alerts._send_feishu')
+    def test_feishu_pause_no_alert_without_exposure(self, mock_send):
+        conn = self._conn()
+        ledger = MagicMock()
+        ledger.list_unmatched_legs.return_value = []
+        notify_feishu_pause_exposure(
+            conn, ledger, {'risk_alert_cooldown_sec': 0}, None, paused=True,
+        )
+        mock_send.assert_not_called()
+
+    @patch('runtime_risk_alerts._send_feishu')
+    def test_feishu_pause_unpause_does_not_alert(self, mock_send):
+        conn = self._conn()
+        ledger = MagicMock()
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'sa', 'month': '2608', 'kind': 'awaiting_phase2', 'leg': {}},
+        ]
+        notify_feishu_pause_exposure(
+            conn, ledger, {'risk_alert_cooldown_sec': 0}, None, paused=False,
+        )
+        mock_send.assert_not_called()
+
+    @patch('runtime_risk_alerts._send_feishu')
     def test_margin_unknown_streak(self, mock_send):
         conn = self._conn()
         cfg = {

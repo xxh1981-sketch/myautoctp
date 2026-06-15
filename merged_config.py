@@ -20,6 +20,8 @@ STRANGLE_DEFAULTS = {
     'order_ref_min': 500000,
     'pause_open_on_reconcile_mismatch': True,
     'rebalance_max_per_round': 12,
+    'unmatched_leg_metadata_alert': True,
+    'unmatched_leg_metadata_alert_cooldown_sec': 1800,
 }
 
 
@@ -40,6 +42,22 @@ def _merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
         else:
             out[key] = value
     return out
+
+
+def _as_non_negative_float(value: Any) -> Tuple[bool, float]:
+    try:
+        out = float(value)
+    except Exception:
+        return False, 0.0
+    return out >= 0, out
+
+
+def _as_non_negative_int(value: Any) -> Tuple[bool, int]:
+    try:
+        out = int(value)
+    except Exception:
+        return False, 0
+    return out >= 0, out
 
 
 DUAL_STRATEGY_DEFAULTS = {
@@ -79,6 +97,12 @@ DUAL_STRATEGY_DEFAULTS = {
     'spread_purge_invalid_claims_on_startup': True,
     'spread_reconcile_fallback_heuristic': False,
     'auto_sync_spread_positions_csv': True,
+    'reconcile_diagnostic_snapshot_enabled': True,
+    'reconcile_diagnostic_issue_limit': 8,
+    'ctp_unknown_direction_warn': True,
+    'strangle_store_unavailable_fallback': 'skip_fill',
+    'orderref_bilateral_nonzero_alert': True,
+    'orderref_bilateral_nonzero_alert_cooldown_sec': 1800,
 
     'unified_fill_feishu': True,
     'fill_feishu_enabled': True,
@@ -142,8 +166,14 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     'daily_heartbeat_enabled': True,
     'daily_heartbeat_hour': 9,
     'daily_heartbeat_marker_file': 'data/daily_heartbeat_sent.txt',
-    # SIGTERM 优雅关闭最大等待秒数；超时 os._exit（仅计划内关停路径）。
-    'shutdown_timeout_sec': 15,
+    # SIGTERM 优雅关闭最大等待秒数；超时 os._exit（含短连+双轮撤单，默认 45s）。
+    'shutdown_timeout_sec': 45,
+    # 退出前等待品种扫描后台线程（秒）；无法强杀时靠发单守卫 + 双轮撤单兜底。
+    'shutdown_scan_drain_sec': 5,
+    'shutdown_cancel_passes': 2,
+    'shutdown_cancel_pass_pause_sec': 1.0,
+    'shutdown_cancel_confirm_timeout': 15,
+    'shutdown_cancel_login_timeout': 30,
     # 最近一次启动/重启/退出原因（纯可观测性）。
     'restart_reason_file': 'data/restart_reason.txt',
     # 外部 watchdog（scripts/check_heartbeat_watchdog.*）读取的配置。
@@ -158,6 +188,13 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     # 各类 halt 从 True→False 时飞书通知解除（纯可观测性，不改 halt 语义）。
     'halt_recovery_notify_enabled': True,
     'halt_recovery_alert_cooldown_sec': 300,
+    # 运维维护模式：继续监控/对账/告警，禁止一切自动发单与撤单（见 maintenance_mode.py）
+    'maintenance_mode': False,
+    'maintenance_mode_file': 'data/maintenance_mode.flag',
+    # 持仓 CSV 完整性：空表合法；损坏 → position_csv_halt（禁新开）
+    'position_csv_integrity_enabled': True,
+    'position_csv_check_interval_sec': 3600,
+    'fail_fast_on_position_csv_corrupt': False,
     # 保证金连续 unknown（持仓查询失败）达到该次数后，即使上一轮非 halt 也
     # 保守暂停新开，消除"长期查询失败 → 真实超限无法发现仍可新开"的盲区。
     # 0 表示禁用该升级（仅沿用上轮状态，回到旧行为）。
@@ -242,6 +279,53 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
             '宽跨对账不一致时不 set ledger.open_halted，新开照常；'
             '仅审计告警模式，实盘慎用'
         )
+
+    for key in (
+        'reconcile_diagnostic_snapshot_enabled',
+        'ctp_unknown_direction_warn',
+        'orderref_bilateral_nonzero_alert',
+    ):
+        if key in dual and not isinstance(dual.get(key), bool):
+            errors.append(f'dual_strategy.{key} 必须为布尔值')
+
+    if 'reconcile_diagnostic_issue_limit' in dual:
+        ok, _value = _as_non_negative_int(dual.get('reconcile_diagnostic_issue_limit'))
+        if not ok:
+            errors.append('dual_strategy.reconcile_diagnostic_issue_limit 必须为整数')
+
+    if 'orderref_bilateral_nonzero_alert_cooldown_sec' in dual:
+        ok, _value = _as_non_negative_float(
+            dual.get('orderref_bilateral_nonzero_alert_cooldown_sec'),
+        )
+        if not ok:
+            errors.append('dual_strategy.orderref_bilateral_nonzero_alert_cooldown_sec 必须为数字')
+
+    fallback_values = {'allow', 'skip_fill'}
+    if 'strangle_store_unavailable_fallback' in dual:
+        fallback = dual.get('strangle_store_unavailable_fallback')
+        if not isinstance(fallback, str) or fallback not in fallback_values:
+            errors.append(
+                'dual_strategy.strangle_store_unavailable_fallback 必须为 '
+                f'{sorted(fallback_values)}'
+            )
+        elif fallback == 'allow':
+            warnings.append(
+                'dual_strategy.strangle_store_unavailable_fallback=allow：'
+                'SpreadLegStore 不可用时宽跨成交会继续入账（fail-open）；'
+                '无人值守默认 skip_fill'
+            )
+
+    if 'unmatched_leg_metadata_alert' in str_cfg and not isinstance(
+        str_cfg.get('unmatched_leg_metadata_alert'), bool,
+    ):
+        errors.append('strangle.unmatched_leg_metadata_alert 必须为布尔值')
+
+    if 'unmatched_leg_metadata_alert_cooldown_sec' in str_cfg:
+        ok, _value = _as_non_negative_float(
+            str_cfg.get('unmatched_leg_metadata_alert_cooldown_sec'),
+        )
+        if not ok:
+            errors.append('strangle.unmatched_leg_metadata_alert_cooldown_sec 必须为数字')
 
     if 'global_margin_limit' not in config:
         return errors, warnings
@@ -386,3 +470,12 @@ def prepare_merged_connection(conn, config: Dict[str, Any]) -> None:
     from auto_strategy_order_ref import init_order_ref_sequences
     init_order_ref_sequences(conn, config)
     config['_spread_fill_conn'] = conn
+    try:
+        from maintenance_mode import (
+            install_maintenance_guard,
+            wrap_connection_cancel_guard,
+        )
+        install_maintenance_guard(config)
+        wrap_connection_cancel_guard(conn, config)
+    except Exception:
+        pass

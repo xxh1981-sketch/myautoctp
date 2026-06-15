@@ -68,9 +68,18 @@ def _prefetch_round_data(conn, logger) -> tuple:
     positions = None
     trades = None
     config = getattr(conn, 'config', None) or {}
+    runtime = getattr(conn, '_runtime_state', None) or {}
+    positions_err = ''
     try:
         positions = conn.query_positions_sync(timeout=10) or []
+        runtime['_health_last_ctp_positions_ok'] = True
+        runtime['_health_last_ctp_positions_ts'] = time.time()
+        runtime['_health_last_ctp_positions_err'] = ''
     except Exception as e:
+        positions_err = str(e)
+        runtime['_health_last_ctp_positions_ok'] = False
+        runtime['_health_last_ctp_positions_ts'] = time.time()
+        runtime['_health_last_ctp_positions_err'] = positions_err
         if logger:
             logger.debug(f'[reconcile] positions prefetch failed: {e}')
     try:
@@ -182,12 +191,18 @@ def _sync_strangle_open_halt(conn, ledger, str_cfg: dict) -> None:
     margin_reason = runtime.get('_margin_halt_reason') or '保证金超限，暂停新开'
     journal_halt = bool(runtime.get('_journal_halt_open', False))
     journal_reason = runtime.get('_journal_halt_reason') or 'journal存在未完成入账，暂停新开'
+    position_csv_halt = bool(runtime.get('_position_csv_halt_open', False))
+    position_csv_reason = (
+        runtime.get('_position_csv_halt_reason') or '持仓 CSV 损坏，暂停新开'
+    )
 
-    target_halt = recon_halt or margin_halt or journal_halt
+    target_halt = recon_halt or margin_halt or journal_halt or position_csv_halt
     if recon_halt:
         target_reason = '; '.join(recon_issues[:5])
     elif journal_halt:
         target_reason = journal_reason
+    elif position_csv_halt:
+        target_reason = position_csv_reason
     elif margin_halt:
         target_reason = margin_reason
     else:
@@ -201,6 +216,44 @@ def _sync_strangle_open_halt(conn, ledger, str_cfg: dict) -> None:
     if current_halt == target_halt and current_reason == target_reason:
         return
     ledger.set_open_halt(target_halt, target_reason)
+
+
+def _skip_round_on_feishu_pause(
+    conn,
+    config: dict,
+    logger,
+    ledger,
+    loop_interval: float,
+) -> bool:
+    """飞书暂停 = 零自动动作（含 T-1 撤单、隔离 close-only、策略扫描）。
+
+    调用方应在本轮可观测性（心跳/drift/CSV 检查）之后、任何交易动作之前调用。
+    """
+    from auto_feishu_command import is_trading_paused
+
+    if not is_trading_paused():
+        return False
+    try:
+        from runtime_risk_alerts import notify_feishu_pause_exposure
+        notify_feishu_pause_exposure(
+            conn, ledger, config, logger, paused=True,
+        )
+    except Exception as e:
+        logger.warning(f'[风控告警] feishu pause: {e}')
+    with conn._executor_lock:
+        ex = conn._active_executor
+        if ex:
+            try:
+                ex.stop_all_threads.set()
+                ex.cleanup()
+            except Exception:
+                pass
+            conn._active_executor = None
+            logger.info(
+                '[飞书暂停] 已清理在途执行器，跳过本轮（含平仓扫描）'
+            )
+    time.sleep(loop_interval)
+    return True
 
 
 def _quarantine_close_only_enabled(config: dict) -> bool:
@@ -412,6 +465,7 @@ def run_merged_main_loop(
                     logger,
                     conn=conn,
                     process_started_at=config.get('_process_started_at'),
+                    ledger=ledger,
                 )
                 maybe_send_daily_heartbeat(conn, config, logger, ledger=ledger)
                 try:
@@ -419,9 +473,39 @@ def run_merged_main_loop(
                     maybe_alert_config_drift(conn, config, logger)
                 except Exception as e:
                     logger.debug(f'[配置] drift 检查异常: {e}')
+                try:
+                    from maintenance_mode import maybe_notify_maintenance_enabled
+                    maybe_notify_maintenance_enabled(conn, config, logger)
+                except Exception as e:
+                    logger.debug(f'[维护模式] 通知异常: {e}')
+                try:
+                    from position_csv_integrity import (
+                        apply_position_csv_integrity_halt,
+                        maybe_check_position_csv_integrity,
+                    )
+                    if not conn._runtime_state.get('_position_csv_startup_checked'):
+                        apply_position_csv_integrity_halt(
+                            conn, config, logger, context='启动',
+                        )
+                        conn._runtime_state['_position_csv_startup_checked'] = True
+                    else:
+                        maybe_check_position_csv_integrity(conn, config, logger)
+                except Exception as e:
+                    logger.debug(f'[CSV完整性] 检查异常: {e}')
+                else:
+                    try:
+                        if str_cfg.get('pause_open_on_reconcile_mismatch', True):
+                            _sync_strangle_open_halt(conn, ledger, str_cfg)
+                    except Exception as e:
+                        logger.debug(f'[CSV完整性] 同步宽跨 open_halt 异常: {e}')
                 sync_connection_suspend_state(conn, config, logger)
                 if check_scheduled_full_recovery(conn, config, logger):
                     time.sleep(loop_interval)
+                    continue
+
+                if _skip_round_on_feishu_pause(
+                    conn, config, logger, ledger, loop_interval,
+                ):
                     continue
 
                 try:
@@ -534,29 +618,6 @@ def run_merged_main_loop(
                         sync_fill_ledger_from_trades(conn, config, logger)
                     except Exception as e:
                         logger.debug(f'[FillLedger] post-reconnect replay: {e}')
-
-                if is_trading_paused():
-                    try:
-                        from runtime_risk_alerts import notify_feishu_pause_exposure
-                        notify_feishu_pause_exposure(
-                            conn, ledger, config, logger, paused=True,
-                        )
-                    except Exception as e:
-                        logger.warning(f'[风控告警] feishu pause: {e}')
-                    with conn._executor_lock:
-                        ex = conn._active_executor
-                        if ex:
-                            try:
-                                ex.stop_all_threads.set()
-                                ex.cleanup()
-                            except Exception:
-                                pass
-                            conn._active_executor = None
-                            logger.info(
-                                '[飞书暂停] 已清理在途执行器，跳过本轮（含平仓扫描）'
-                            )
-                    time.sleep(loop_interval)
-                    continue
 
                 manage_future_price_readiness(
                     conn, combined_tradeinfo, logger, conn._runtime_state, fp_interval,
@@ -689,6 +750,10 @@ def run_merged_main_loop(
                                 f'[journal] 检测到 {malformed} 行损坏记录（已忽略），'
                                 '请关注磁盘/断电风险'
                             )
+                        runtime['_health_last_ledger_write_ok'] = not bool(
+                            runtime.get('_journal_halt_open'),
+                        )
+                        runtime['_health_last_ledger_write_ts'] = time.time()
                     except Exception as e:
                         logger.warning(f'[journal] 健康检查异常，保守暂停新开: {e}')
                         conn._runtime_state['_journal_halt_open'] = True
@@ -848,6 +913,23 @@ def run_merged_main_loop(
                         conn._runtime_state['_journal_spread_warn_reason'] = j_reason
                 else:
                     conn._runtime_state.pop('_journal_spread_warn_reason', None)
+
+                if conn._runtime_state.get('_position_csv_halt_open', False):
+                    spread_open_ok = False
+                    pc_reason = str(
+                        conn._runtime_state.get('_position_csv_halt_reason') or '',
+                    )
+                    last_pc_warn = str(
+                        conn._runtime_state.get('_position_csv_spread_warn_reason') or '',
+                    )
+                    if pc_reason and pc_reason != last_pc_warn:
+                        spread_logger.warning(
+                            '持仓 CSV 损坏，暂停价差新开（平仓不受影响）: '
+                            + pc_reason,
+                        )
+                        conn._runtime_state['_position_csv_spread_warn_reason'] = pc_reason
+                else:
+                    conn._runtime_state.pop('_position_csv_spread_warn_reason', None)
 
                 from spread_fill_sync import count_spread_filled_open_orders
                 from spread_daily_limit import resolve_spread_daily_limit
@@ -1044,11 +1126,15 @@ def run_merged_main_loop(
                     journal_halt_open = bool(
                         conn._runtime_state.get('_journal_halt_open', False)
                     )
+                    position_csv_halt_open = bool(
+                        conn._runtime_state.get('_position_csv_halt_open', False)
+                    )
                     if (
                         not skip_rebal
                         and not _margin_halt_open
                         and not strangle_reconcile_halt
                         and not journal_halt_open
+                        and not position_csv_halt_open
                         and strangle_open_ok
                     ):
                         str_executor.run_rebalance(tradeinfo_by_key)
@@ -1141,7 +1227,22 @@ def run_merged_main_loop(
                 except Exception as e:
                     logger.debug(f'[状态快照] 构建失败: {e}')
 
+                try:
+                    from runtime_health_summary import build_runtime_health_summary
+                    conn._runtime_state['_runtime_health_summary'] = (
+                        build_runtime_health_summary(
+                            conn,
+                            config,
+                            ledger=ledger,
+                            feishu_paused=is_trading_paused(),
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(f'[健康摘要] 构建失败: {e}')
+
                 round_elapsed = time.time() - round_t0
+                conn._runtime_state['_metric_last_round_sec'] = round_elapsed
+                conn._runtime_state['_health_last_scan_end_ts'] = time.time()
                 logger.debug(
                     f'[主循环] 本轮 {round_elapsed:.1f}s | '
                     f'价差日限 {spread_filled}/{spread_daily_limit} | '
@@ -1200,9 +1301,10 @@ def run_merged_main_loop(
     except KeyboardInterrupt:
         logger.info("用户中断")
     finally:
-        stop_command_receiver()
         try:
-            conn.cancel_all_pending_orders(
-                timeout=conn.config.get('CANCEL_ALL_TIMEOUT', 5))
+            from shutdown_cancel import cancel_pending_on_shutdown
+
+            cancel_pending_on_shutdown(conn, config, logger)
         except Exception as e:
-            logger.error(f"退出撤单: {e}")
+            logger.error(f'[退出] 撤单: {e}')
+        stop_command_receiver()

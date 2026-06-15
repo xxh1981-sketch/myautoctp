@@ -125,6 +125,8 @@ class TestDailyLimitDoesNotSkipClose(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -184,6 +186,8 @@ class TestFillCountExceptionStillScansClose(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -249,6 +253,8 @@ class TestSpreadFilledRefreshFailureConservative(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -412,6 +418,8 @@ class TestDailyLimitWarningOnlyOnRealLimit(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -550,9 +558,279 @@ class TestMarginUnknownPreservesPrevState(unittest.TestCase):
         )
 
 
+class TestFeishuPauseZeroAction(unittest.TestCase):
+
+    def setUp(self):
+        import shutdown_cancel as sc
+        sc._CANCEL_STARTED = False
+
+    def tearDown(self):
+        import shutdown_cancel as sc
+        sc._CANCEL_STARTED = False
+
+    @patch('auto_feishu_command.is_trading_paused', return_value=True)
+    @patch('auto_processor.process_symbol')
+    @patch('straggle_processor.process_strangle_symbol')
+    @patch('merged_main_loop._run_reconcile')
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_pause_skips_reconcile_and_strategy_scans(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_reconcile,
+        mock_strangle_process,
+        mock_spread_process,
+        mock_paused,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('time.sleep', side_effect=KeyboardInterrupt), \
+             patch('runtime_risk_alerts.notify_feishu_pause_exposure') as mock_notify:
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        mock_paused.assert_called()
+        mock_notify.assert_called_once()
+        mock_reconcile.assert_not_called()
+        mock_spread_process.assert_not_called()
+        mock_strangle_process.assert_not_called()
+        # 循环内不撤单；仅 finally 退出路径撤单
+        self.assertEqual(conn.cancel_all_pending_orders.call_count, 1)
+
+    @patch('auto_feishu_command.is_trading_paused', return_value=True)
+    @patch('session_close_guard.maybe_run_pre_close_cancel_sweep')
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_pause_skips_t1_cancel_sweep(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_sweep,
+        mock_paused,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('time.sleep', side_effect=KeyboardInterrupt), \
+             patch('runtime_risk_alerts.notify_feishu_pause_exposure'):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                    'dual_strategy': {},
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        mock_sweep.assert_not_called()
+
+    @patch('auto_feishu_command.is_trading_paused', return_value=True)
+    @patch('merged_main_loop._run_quarantine_close_only_round')
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_pause_skips_quarantine_close_only(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_close_only,
+        mock_paused,
+    ):
+        conn = _make_conn()
+        conn._reconnect_quarantine = True
+        conn.code_table_loaded = True
+        conn.pending_orders = {}
+        logger = FakeLogger()
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('time.sleep', side_effect=KeyboardInterrupt), \
+             patch('runtime_risk_alerts.notify_feishu_pause_exposure'):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                    'reconnect_quarantine': {'close_only_enabled': True},
+                    'dual_strategy': {},
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        mock_close_only.assert_not_called()
+
+    @patch('margin_check.check_margin_status', return_value=('unknown', '查询失败'))
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_unknown_threshold_zero_keeps_open_allowed(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_process,
+        mock_status,
+    ):
+        conn = _make_conn()
+        conn._runtime_state['_margin_halt_open'] = False
+        conn._runtime_state['_margin_halt_reason'] = ''
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('spread_fill_sync.count_spread_filled_open_orders', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[{'future': 'SA', 'month': '609'}],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                    'global_margin_limit': 100000,
+                    'margin_unknown_halt_after': 0,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        self.assertFalse(conn._runtime_state['_margin_halt_open'])
+        self.assertEqual(conn._runtime_state['_margin_halt_reason'], '')
+        self.assertEqual(conn._runtime_state.get('_margin_unknown_streak'), 1)
+
+
+class TestMainLoopExitCancel(unittest.TestCase):
+    """Leaving run_merged_main_loop must cancel pending orders (incl. inner Ctrl+C)."""
+
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_keyboard_interrupt_in_loop_cancels_pending(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = []
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('time.sleep', side_effect=KeyboardInterrupt):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'dual_strategy': {'reconcile_interval_sec': 9999},
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        conn.cancel_all_pending_orders.assert_called()
+        self.assertTrue(conn._runtime_state.get('_shutdown_cancel'))
+
+
 class TestSyncStrangleOpenHalt(unittest.TestCase):
     """`_sync_strangle_open_halt` is the single source of truth for ledger
-    open_halted given (reconcile halt, margin halt, journal halt)."""
+    open_halted given (reconcile halt, margin halt, journal halt, position CSV halt)."""
 
     def _fake_ledger(self, halted=False, reason=''):
         ledger = MagicMock()
@@ -629,6 +907,16 @@ class TestSyncStrangleOpenHalt(unittest.TestCase):
         _sync_strangle_open_halt(conn, ledger, {})
         self.assertTrue(state['halted'])
         self.assertIn('journal', state['reason'].lower())
+
+    def test_position_csv_halt_sets_ledger_with_reason(self):
+        from merged_main_loop import _sync_strangle_open_halt
+        conn = _make_conn()
+        conn._runtime_state['_position_csv_halt_open'] = True
+        conn._runtime_state['_position_csv_halt_reason'] = 'spread_positions: bad row'
+        ledger, state = self._fake_ledger()
+        _sync_strangle_open_halt(conn, ledger, {})
+        self.assertTrue(state['halted'])
+        self.assertIn('spread_positions', state['reason'])
 
     def test_reconcile_reason_wins_over_journal(self):
         from merged_main_loop import _sync_strangle_open_halt
@@ -1141,6 +1429,8 @@ class TestJournalHaltMainLoop(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -1215,6 +1505,8 @@ class TestJournalHaltMainLoop(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,
@@ -1293,6 +1585,8 @@ class TestSpreadLimitNotifiedResetsAcrossDay(unittest.TestCase):
                 vix_engine=MagicMock(),
                 config={
                     **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
                     'dual_strategy': {
                         'reconcile_interval_sec': 0,
                         'journal_daily_shards': False,

@@ -22,36 +22,63 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 STATE_FIRST_SEEN = '_strangle_stuck_first_seen'
 STATE_LAST_ALERTED = '_strangle_stuck_last_alerted'
+STATE_METADATA_LAST_ALERTED = '_strangle_unmatched_metadata_last_alerted'
 
 DEFAULT_STUCK_ALERT_AGE_SEC = 600
 DEFAULT_ALERT_COOLDOWN_SEC = 1800
+DEFAULT_METADATA_ALERT_COOLDOWN_SEC = 1800
+
+
+def _safe_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _b_max(config: dict) -> int:
     str_cfg = (config.get('strangle') or {}) if config else {}
-    return int(
-        config.get(
-            'B_max_retries',
-            str_cfg.get('phase2_max_retries', 10),
-        )
-    )
+    default = _safe_int(str_cfg.get('phase2_max_retries', 10), 10)
+    return _safe_int(config.get('B_max_retries', default), default)
 
 
 def _watchdog_cfg(config: dict) -> Tuple[float, float]:
     str_cfg = (config.get('strangle') or {}) if config else {}
-    age = float(
+    age = _safe_float(
         str_cfg.get(
             'unmatched_stuck_alert_age_sec',
             DEFAULT_STUCK_ALERT_AGE_SEC,
-        )
+        ),
+        DEFAULT_STUCK_ALERT_AGE_SEC,
     )
-    cooldown = float(
+    cooldown = _safe_float(
         str_cfg.get(
             'unmatched_stuck_alert_cooldown_sec',
             DEFAULT_ALERT_COOLDOWN_SEC,
-        )
+        ),
+        DEFAULT_ALERT_COOLDOWN_SEC,
     )
     return age, cooldown
+
+
+def _metadata_alert_cfg(config: dict) -> Tuple[bool, float]:
+    str_cfg = (config.get('strangle') or {}) if config else {}
+    enabled = bool(str_cfg.get('unmatched_leg_metadata_alert', True))
+    cooldown = _safe_float(
+        str_cfg.get(
+            'unmatched_leg_metadata_alert_cooldown_sec',
+            DEFAULT_METADATA_ALERT_COOLDOWN_SEC,
+        ),
+        DEFAULT_METADATA_ALERT_COOLDOWN_SEC,
+    )
+    return enabled, cooldown
 
 
 def _leg_key(item: dict) -> Tuple[str, str, str, str]:
@@ -65,6 +92,76 @@ def _leg_key(item: dict) -> Tuple[str, str, str, str]:
         # 导致告警合并失真。
         inst = f'<unknown:{id(item)}>'
     return (sym, month, kind, inst)
+
+
+def _metadata_key(index: int, item: dict) -> Tuple[Any, ...]:
+    try:
+        return _leg_key(item)
+    except Exception:
+        return (index, '<invalid>')
+
+
+def validate_unmatched_leg_metadata(items: Iterable[dict]) -> List[Dict[str, Any]]:
+    """Return unmatched leg items whose metadata may break downstream consumers."""
+    bad: List[Dict[str, Any]] = []
+    for index, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            bad.append({'index': index, 'missing': ['item'], 'item': item})
+            continue
+        missing: List[str] = []
+        for field in ('symbol', 'month', 'kind'):
+            if not str(item.get(field) or '').strip():
+                missing.append(field)
+        leg = item.get('leg')
+        if leg is not None and not isinstance(leg, dict):
+            missing.append('leg must be dict')
+        leg_inst = ''
+        if isinstance(leg, dict):
+            leg_inst = str(leg.get('inst') or '').strip()
+        filled_inst = str(item.get('filled_instrument') or '').strip()
+        if not leg_inst and not filled_inst:
+            missing.append('leg.inst or filled_instrument')
+        try:
+            int(item.get('b_retry_count', 0))
+        except Exception:
+            missing.append('b_retry_count')
+        if missing:
+            bad.append({
+                'index': index,
+                'missing': missing,
+                'key': _metadata_key(index, item),
+                'item': item,
+            })
+    return bad
+
+
+def _format_metadata_issue(issue: Dict[str, Any]) -> str:
+    key = issue.get('key')
+    missing = issue.get('missing') or []
+    return f"index={issue.get('index')} key={key} missing={missing}"
+
+
+def _send_metadata_alert(config, logger, bad_items: List[Dict[str, Any]]) -> None:
+    try:
+        from auto_feishu import send_feishu_message
+    except Exception:
+        send_feishu_message = None  # type: ignore
+
+    lines = [_format_metadata_issue(item) for item in bad_items[:20]]
+    body = (
+        '⚠️ **宽跨未配对腿 metadata 异常**\n\n'
+        f'发现 {len(bad_items)} 条 unmatched_legs 缺少关键字段，可能影响 close-only / holdback / 告警去重。\n\n'
+        + '\n'.join(lines)
+    )
+    if logger:
+        logger.warning(f'[宽跨守护] 检测到 {len(bad_items)} 条 unmatched_legs metadata 异常')
+    if send_feishu_message is None:
+        return
+    try:
+        send_feishu_message(body, config=config)
+    except Exception as e:
+        if logger:
+            logger.warning(f'[宽跨守护] 飞书告警失败: {e}')
 
 
 def _runtime_state(conn) -> dict:
@@ -132,6 +229,15 @@ def check_unmatched_health(conn, ledger, config: dict, logger) -> None:
         return
 
     runtime = _runtime_state(conn)
+    enabled, cooldown = _metadata_alert_cfg(config)
+    if enabled:
+        bad_metadata = validate_unmatched_leg_metadata(items)
+        last_alerted = runtime.setdefault(STATE_METADATA_LAST_ALERTED, {})
+        now = time.time()
+        if bad_metadata and now - float(last_alerted.get('all', 0.0) or 0.0) >= cooldown:
+            last_alerted['all'] = now
+            _send_metadata_alert(config, logger, bad_metadata)
+
     first_seen: Dict[Any, float] = runtime.setdefault(STATE_FIRST_SEEN, {})
     last_alerted: Dict[Any, float] = runtime.setdefault(STATE_LAST_ALERTED, {})
 

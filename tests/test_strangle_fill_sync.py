@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
 from pairtrade.constants import DIRECTION_BUY, OFFSET_OPEN
+from spread_ledger import SpreadLegStore
 from strangle_fill_sync import (
     apply_strangle_trade_record,
     sync_csv_from_strangle_trades,
@@ -29,6 +30,7 @@ def _cfg(tmp, journal_name='journal.jsonl'):
             'strangle_trade_journal': journal,
             'journal_daily_shards': False,
             'trade_replay_lookback_days': 0,
+            'strangle_store_unavailable_fallback': 'allow',
         },
     }
 
@@ -154,6 +156,121 @@ class TestStrangleFillSync(unittest.TestCase):
             applied, reason = pop_fill_csv_status(conn, trade)
             self.assertTrue(applied)
             self.assertEqual(reason, '')
+
+    def test_store_unavailable_default_is_skip_fill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['dual_strategy'].pop('strangle_store_unavailable_fallback', None)
+            ledger = MagicMock()
+            conn = MagicMock()
+            conn._runtime_state = {}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T5b',
+            }
+            self.assertFalse(apply_strangle_trade_record(cfg, ledger, trade, conn=conn))
+            ledger.set_leg_claims.assert_not_called()
+
+    def test_store_unavailable_allow_keeps_legacy_behavior_and_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['dual_strategy']['strangle_store_unavailable_fallback'] = 'allow'
+            ledger = MagicMock()
+            conn = MagicMock()
+            conn._runtime_state = {}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T5',
+            }
+            logger = MagicMock()
+            self.assertTrue(apply_strangle_trade_record(cfg, ledger, trade, logger=logger, conn=conn))
+            logger.warning.assert_called()
+            self.assertIn('SpreadLegStore 不可用', logger.warning.call_args.args[0])
+
+    def test_store_unavailable_skip_fill_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['dual_strategy']['strangle_store_unavailable_fallback'] = 'skip_fill'
+            ledger = MagicMock()
+            conn = MagicMock()
+            conn._runtime_state = {}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T6',
+            }
+            self.assertFalse(apply_strangle_trade_record(cfg, ledger, trade, conn=conn))
+            ledger.set_leg_claims.assert_not_called()
+            journal = cfg['dual_strategy']['strangle_trade_journal']
+            body = open(journal, encoding='utf-8').read()
+            self.assertIn('spread_store_unavailable', body)
+            from fill_ledger import pop_fill_csv_status
+            applied, reason = pop_fill_csv_status(conn, trade)
+            self.assertFalse(applied)
+            self.assertEqual(reason, 'spread_store_unavailable')
+
+    def test_spread_owned_skip_reason_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            ledger = MagicMock()
+            spread_store = SpreadLegStore()
+            spread_store.set_leg_claims({'SA609C1000': 1})
+            conn = MagicMock()
+            conn._runtime_state = {'_spread_leg_store': spread_store}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T7',
+            }
+            self.assertFalse(apply_strangle_trade_record(cfg, ledger, trade, conn=conn))
+            ledger.set_leg_claims.assert_not_called()
+            journal = cfg['dual_strategy']['strangle_trade_journal']
+            body = open(journal, encoding='utf-8').read()
+            self.assertIn('"skipped": "spread_owned_only"', body)
+            from fill_ledger import pop_fill_csv_status
+            applied, reason = pop_fill_csv_status(conn, trade)
+            self.assertFalse(applied)
+            self.assertEqual(reason, 'spread_owned_only')
+
+    def test_spread_owned_bad_claim_volume_treated_as_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            ledger = MagicMock()
+            spread_store = SpreadLegStore()
+            spread_store.list_leg_claims = lambda: {'SA609C1000': 'abc'}
+            conn = MagicMock()
+            conn._runtime_state = {'_spread_leg_store': spread_store}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T8',
+            }
+            logger = MagicMock()
+            self.assertTrue(
+                apply_strangle_trade_record(
+                    cfg, ledger, trade, logger=logger, conn=conn,
+                ),
+            )
+            logger.warning.assert_called()
+            self.assertIn('claim', logger.warning.call_args.args[0])
+            self.assertIn('无效', logger.warning.call_args.args[0])
 
 
 class TestWireStrangleTradeRuntime(unittest.TestCase):

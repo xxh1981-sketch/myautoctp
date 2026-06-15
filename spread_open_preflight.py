@@ -79,11 +79,15 @@ def estimate_spread_a_headroom(
     month = item['month']
     vol = int(item.get('vol_of_combo', 1) or 1)
     a_limit = vol * int(config.get('A_POSITION_LIMIT_RATIO', 1) or 1)
-    planned = vol * int(config.get('A_TARGET_VOLUME', 1) or 1)
+    try:
+        from open_clip import spread_open_planned_a_hands
+        cap = spread_open_planned_a_hands(config, vol)
+    except ImportError:
+        cap = vol * int(config.get('A_TARGET_VOLUME', 1) or 1)
 
     tracker = getattr(conn, 'position_tracker', None)
     if tracker is None:
-        return 0, a_limit, planned
+        return 0, a_limit, cap
     try:
         normalized_month = conn._normalize_month(symbol, month)
         positions = tracker.get_positions_for_symbol(
@@ -92,6 +96,8 @@ def estimate_spread_a_headroom(
     except Exception:
         positions = []
     a_current = _count_a_from_positions(conn, positions, symbol, month, config)
+    headroom = max(0, a_limit - a_current)
+    planned = min(cap, headroom) if headroom > 0 else cap
     return a_current, a_limit, planned
 
 
