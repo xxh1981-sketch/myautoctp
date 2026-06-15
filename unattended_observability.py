@@ -18,6 +18,7 @@ _HALT_TRACKERS = (
     ('journal', '_journal_halt_open', 'journal halt'),
     ('spread_reconcile', '_spread_reconcile_halt', '价差对账 halt'),
     ('strangle_reconcile', '_strangle_reconcile_halt', '宽跨对账 halt'),
+    ('position_csv', '_position_csv_halt_open', '持仓 CSV 损坏 halt'),
 )
 
 
@@ -114,6 +115,8 @@ def maybe_alert_config_drift(conn, config: dict, logger=None) -> bool:
 
     if ok:
         runtime['_config_drift_last_notified_mtime'] = current_mtime
+        runtime['_config_drift_last_detected_at'] = now
+        runtime['_config_drift_last_detected_mtime'] = current_mtime
         if logger:
             logger.warning('[配置] merged_config.yaml 已变更，已发送未重启提醒')
         return True

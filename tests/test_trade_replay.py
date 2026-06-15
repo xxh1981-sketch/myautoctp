@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,14 @@ def _cfg(tmp):
     }
 
 
+def _today():
+    return date.today().strftime('%Y%m%d')
+
+
+def _yesterday():
+    return (date.today() - timedelta(days=1)).strftime('%Y%m%d')
+
+
 class TestTradeReplay(unittest.TestCase):
 
     def test_record_and_merge_dedupes(self):
@@ -39,7 +48,7 @@ class TestTradeReplay(unittest.TestCase):
                 'volume': 1,
                 'price': 100.0,
                 'trade_id': '900001',
-                'trade_date': '20260610',
+                'trade_date': _yesterday(),
             }
             self.assertEqual(record_trades_to_cache([t1], cfg), 1)
             self.assertEqual(record_trades_to_cache([t1], cfg), 0)
@@ -59,7 +68,7 @@ class TestTradeReplay(unittest.TestCase):
                 'volume': 2,
                 'price': 50.0,
                 'trade_id': '900002',
-                'trade_date': '20260610',
+                'trade_date': _yesterday(),
             }
             new = {
                 'order_ref': 3,
@@ -69,7 +78,7 @@ class TestTradeReplay(unittest.TestCase):
                 'volume': 1,
                 'price': 60.0,
                 'trade_id': '900003',
-                'trade_date': '20260611',
+                'trade_date': _today(),
             }
             record_trades_to_cache([old], cfg)
             merged = merge_trades_for_replay([new], cfg)
@@ -89,7 +98,7 @@ class TestTradeReplay(unittest.TestCase):
                 'volume': 1,
                 'price': 1.0,
                 'trade_id': '900004',
-                'trade_date': '20260610',
+                'trade_date': _yesterday(),
             }
             self.assertEqual(record_trades_to_cache([t], cfg), 0)
             self.assertEqual(load_cached_trades(cfg), [])
@@ -104,7 +113,7 @@ class TestTradeReplay(unittest.TestCase):
                 'offset': '0',
                 'volume': 99,
                 'trade_id': 'Q2',
-                'trade_date': '20260611',
+                'trade_date': _today(),
             }
             self.assertEqual(record_trades_to_cache([bogus], cfg), 0)
             self.assertEqual(load_cached_trades(cfg), [])
@@ -119,14 +128,14 @@ class TestTradeReplay(unittest.TestCase):
                     'instrument': 'IO2604-C-4000',
                     'trade_id': 'Q1',
                     'dedupe_key': 'IO2604-C-4000:Q1',
-                    'trade_date': '20260611',
+                    'trade_date': _today(),
                 }) + '\n')
                 f.write(json.dumps({
                     'order_ref': 6,
                     'instrument': 'm2609-C-3000',
                     'trade_id': '103877',
                     'dedupe_key': 'M2609-C-3000:103877',
-                    'trade_date': '20260611',
+                    'trade_date': _today(),
                 }) + '\n')
             removed = purge_invalid_cache_entries(cfg)
             self.assertEqual(removed, 1)

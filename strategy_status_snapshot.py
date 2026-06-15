@@ -645,6 +645,50 @@ def build_strangle_symbol_rows(
     return rows
 
 
+def _runtime_reconcile_diagnostics(conn, config: dict) -> Dict[str, Any]:
+    """Runtime-only reconcile diagnostics for Feishu status snapshots."""
+    runtime = getattr(conn, "_runtime_state", None) or {}
+    dual = config.get("dual_strategy") or {}
+    try:
+        issue_limit = int(dual.get("reconcile_diagnostic_issue_limit", 8) or 8)
+    except Exception:
+        issue_limit = 8
+    issue_limit = max(0, issue_limit)
+
+    def issues(name: str) -> List[str]:
+        rows = list(runtime.get(name) or [])
+        return [str(i) for i in rows[:issue_limit]]
+
+    spread_store_available = False
+    try:
+        from spread_ledger import store_from_conn  # type: ignore
+
+        spread_store_available = store_from_conn(conn) is not None
+    except Exception:
+        spread_store_available = False
+
+    return {
+        "enabled": True,
+        "spread": {
+            "halt": bool(runtime.get("_spread_reconcile_halt", False)),
+            "issue_count": len(runtime.get("_spread_reconcile_issues") or []),
+            "issues": issues("_spread_reconcile_issues"),
+            "store_available": spread_store_available,
+        },
+        "strangle": {
+            "halt": bool(runtime.get("_strangle_reconcile_halt", False)),
+            "issue_count": len(runtime.get("_strangle_reconcile_issues") or []),
+            "issues": issues("_strangle_reconcile_issues"),
+        },
+        "config": {
+            "reconcile_interval_sec": dual.get("reconcile_interval_sec", 60),
+            "spread_reconcile_fallback_heuristic": bool(
+                dual.get("spread_reconcile_fallback_heuristic", False),
+            ),
+        },
+    }
+
+
 def build_strategy_status_snapshot(
     conn,
     ledger,
@@ -696,7 +740,7 @@ def build_strategy_status_snapshot(
         logger=logger,
     )
 
-    return {
+    snapshot = {
         "ts": time.time(),
         "summary": {
             "spread_current_groups": _sum_current(spread_rows),
@@ -709,6 +753,27 @@ def build_strategy_status_snapshot(
         "spread": {"by_symbol": spread_rows},
         "strangle": {"by_symbol": strangle_rows},
     }
+    try:
+        from runtime_health_summary import (
+            build_runtime_health_summary,
+            format_runtime_health_text,
+        )
+        health = build_runtime_health_summary(
+            conn,
+            config,
+            ledger=ledger,
+            feishu_paused=feishu_paused,
+        )
+        snapshot["health"] = health
+        snapshot["health_text"] = format_runtime_health_text(health, compact=True)
+    except Exception:
+        pass
+    dual = config.get("dual_strategy") or {}
+    if dual.get("reconcile_diagnostic_snapshot_enabled", True):
+        snapshot["diagnostics"] = {
+            "reconcile": _runtime_reconcile_diagnostics(conn, config),
+        }
+    return snapshot
 
 
 def _format_symbol_row(r: Dict[str, Any], *, strategy: str) -> List[str]:
@@ -757,6 +822,12 @@ def format_strategy_status_message(
             lines.append(f"时间：{_t.strftime('%H:%M:%S', _t.localtime(float(ts)))}")
         except Exception:
             pass
+    health_text = snapshot.get("health_text")
+    if health_text:
+        lines.append("")
+        lines.append("【运行健康】")
+        for line in str(health_text).splitlines():
+            lines.append(line)
     lines.append("")
     lines.append(
         "总览："
@@ -768,6 +839,17 @@ def format_strategy_status_message(
     if summary.get("journal_halt_open"):
         reason = summary.get("journal_halt_reason") or "journal未完成入账"
         lines.append(f"journal_halt：开启（{reason}）")
+
+    diagnostics = (snapshot.get("diagnostics") or {}).get("reconcile") or {}
+    if diagnostics:
+        spread = diagnostics.get("spread") or {}
+        strangle = diagnostics.get("strangle") or {}
+        store = "可用" if spread.get("store_available") else "不可用"
+        lines.append(
+            "对账诊断："
+            f"Spread halt={spread.get('halt')} issues={spread.get('issue_count', 0)} Store={store}；"
+            f"Strangle halt={strangle.get('halt')} issues={strangle.get('issue_count', 0)}"
+        )
     lines.append("")
 
     cmd_lower = (command_text or "").lower()

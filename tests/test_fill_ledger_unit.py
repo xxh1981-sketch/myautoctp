@@ -22,11 +22,14 @@ autotrade_stubs.ensure_autotrade_stubs([
 
 from fill_ledger import (
     FILL_LEDGER_COLUMNS,
+    _warn_bilateral_orderref_suspicious,
     append_fill_row,
     apply_fill_record,
     build_fill_row,
+    detect_bilateral_orderref_suspicious,
     fill_ledger_csv_path,
     fill_ledger_journal_path,
+    pop_fill_csv_status,
     resolve_fill_side,
     resolve_strategy,
     slippage_vs_mid,
@@ -34,6 +37,7 @@ from fill_ledger import (
     _ensure_csv_header,
 )
 from spread_ledger import SpreadLegStore
+from trade_journal import trade_dedupe_key
 
 
 def _cfg(tmp):
@@ -73,6 +77,23 @@ class TestFillSide(unittest.TestCase):
     def test_buy_close_multi_char_offset(self):
         self.assertEqual(resolve_fill_side('0', '31'), 'buy_close')
 
+    def test_legacy_direction_aliases_still_buy(self):
+        self.assertEqual(resolve_fill_side('Buy', '0'), 'buy_open')
+
+    def test_unknown_direction_warns_but_keeps_legacy_mapping(self):
+        logger = MagicMock()
+        self.assertEqual(
+            resolve_fill_side('bad', '0', logger=logger, context='ctx'),
+            'sell_open',
+        )
+        logger.warning.assert_called_once()
+        self.assertIn('未知 Direction', logger.warning.call_args.args[0])
+
+    def test_unknown_field_warning_can_be_disabled(self):
+        logger = MagicMock()
+        self.assertEqual(resolve_fill_side('bad', 'bad', logger=logger, warn_unknown=False), 'sell_close')
+        logger.warning.assert_not_called()
+
 
 class TestSlippage(unittest.TestCase):
 
@@ -89,6 +110,93 @@ class TestStrategy(unittest.TestCase):
         self.assertEqual(resolve_strategy(100, cfg), 'spread')
         self.assertEqual(resolve_strategy(500000, cfg), 'strangle')
         self.assertEqual(resolve_strategy(0, cfg), 'other')
+
+
+class TestBilateralOrderRefDetector(unittest.TestCase):
+
+    def test_same_order_ref_and_instrument_buy_then_sell_is_suspicious(self):
+        runtime = {}
+        cfg = {'dual_strategy': {'orderref_bilateral_nonzero_alert': True}}
+        suspicious = detect_bilateral_orderref_suspicious([
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 1, 'trade_id': 'B1'},
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '1', 'offset': '0', 'volume': 1, 'trade_id': 'S1'},
+        ], config=cfg, runtime=runtime)
+        self.assertEqual(len(suspicious), 1)
+        self.assertEqual(suspicious[0]['order_ref'], 500001)
+        self.assertEqual(suspicious[0]['instrument'], 'SA609C1000')
+
+    def test_different_instrument_is_not_suspicious(self):
+        suspicious = detect_bilateral_orderref_suspicious([
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 1},
+            {'order_ref': 500001, 'instrument': 'SA609C1100', 'direction': '1', 'offset': '0', 'volume': 1},
+        ], config={'dual_strategy': {'orderref_bilateral_nonzero_alert': True}})
+        self.assertEqual(suspicious, [])
+
+    def test_different_order_ref_is_not_suspicious(self):
+        suspicious = detect_bilateral_orderref_suspicious([
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 1},
+            {'order_ref': 500002, 'instrument': 'SA609C1000', 'direction': '1', 'offset': '0', 'volume': 1},
+        ], config={'dual_strategy': {'orderref_bilateral_nonzero_alert': True}})
+        self.assertEqual(suspicious, [])
+
+    def test_zero_volume_is_ignored(self):
+        suspicious = detect_bilateral_orderref_suspicious([
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 0},
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '1', 'offset': '0', 'volume': 1},
+        ], config={'dual_strategy': {'orderref_bilateral_nonzero_alert': True}})
+        self.assertEqual(suspicious, [])
+
+    def test_detector_can_be_disabled(self):
+        suspicious = detect_bilateral_orderref_suspicious([
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 1},
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '1', 'offset': '0', 'volume': 1},
+        ], config={'dual_strategy': {'orderref_bilateral_nonzero_alert': False}})
+        self.assertEqual(suspicious, [])
+
+    def test_cooldown_blocks_repeated_alerts(self):
+        runtime = {'_margin_halt_open': False}
+        cfg = {'dual_strategy': {'orderref_bilateral_nonzero_alert_cooldown_sec': 60}}
+        logger = MagicMock()
+        trades = [
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '0', 'offset': '0', 'volume': 1, 'trade_id': 'B1'},
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'direction': '1', 'offset': '0', 'volume': 1, 'trade_id': 'S1'},
+        ]
+        first = detect_bilateral_orderref_suspicious(trades, cfg, logger, runtime)
+        self.assertEqual(len(first), 1)
+        _warn_bilateral_orderref_suspicious(first, cfg, logger, runtime)
+        logger.warning.assert_called_once()
+
+        second = detect_bilateral_orderref_suspicious(trades, cfg, logger, runtime)
+        self.assertEqual(len(second), 1)
+        _warn_bilateral_orderref_suspicious(second, cfg, logger, runtime)
+        logger.warning.assert_called_once()
+
+    def test_seen_persists_across_calls_on_runtime(self):
+        runtime = {'_margin_halt_open': False}
+        cfg = {'dual_strategy': {'orderref_bilateral_nonzero_alert': True}}
+        buy = {
+            'order_ref': 500001, 'instrument': 'SA609C1000',
+            'fill_side': 'buy_open', 'volume': 1, 'trade_id': 'B1',
+        }
+        sell = {
+            'order_ref': 500001, 'instrument': 'SA609C1000',
+            'fill_side': 'sell_open', 'volume': 1, 'trade_id': 'S1',
+        }
+        self.assertEqual(detect_bilateral_orderref_suspicious([buy], cfg, runtime=runtime), [])
+        suspicious = detect_bilateral_orderref_suspicious([sell], cfg, runtime=runtime)
+        self.assertEqual(len(suspicious), 1)
+
+    def test_warn_logs_with_nonempty_runtime(self):
+        runtime = {'_margin_halt_open': False}
+        cfg = {'dual_strategy': {'orderref_bilateral_nonzero_alert': True}}
+        logger = MagicMock()
+        trades = [
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'fill_side': 'buy_open', 'volume': 1, 'trade_id': 'B1'},
+            {'order_ref': 500001, 'instrument': 'SA609C1000', 'fill_side': 'sell_open', 'volume': 1, 'trade_id': 'S1'},
+        ]
+        suspicious = detect_bilateral_orderref_suspicious(trades, cfg, logger, runtime)
+        _warn_bilateral_orderref_suspicious(suspicious, cfg, logger, runtime)
+        logger.warning.assert_called_once()
 
 
 class TestFillLedgerCsv(unittest.TestCase):
@@ -143,6 +251,61 @@ class TestFillLedgerCsv(unittest.TestCase):
         self.assertEqual(row['trade_time'], '09:30:01')
         self.assertEqual(row['combo_id'], 'spread-SA-open-123')
 
+    def test_build_row_warns_on_unknown_direction(self):
+        conn = MagicMock()
+        conn.quotes = {}
+        conn.option_quotes = {}
+        logger = MagicMock()
+        cfg = {'strangle': {'order_ref_min': 500000}, 'dual_strategy': {'spread_order_ref_max': 499999}}
+        row = build_fill_row(conn, {
+            'order_ref': 10,
+            'instrument': 'SA609C1000',
+            'direction': 'bad',
+            'offset': '0',
+            'volume': 1,
+            'price': 100.3,
+        }, cfg, logger=logger)
+        self.assertEqual(row['fill_side'], 'sell_open')
+        logger.warning.assert_called_once()
+
+    def test_build_row_skips_bad_volume_and_price(self):
+        conn = MagicMock()
+        conn.quotes = {}
+        conn.option_quotes = {}
+        logger = MagicMock()
+        cfg = {'strangle': {'order_ref_min': 500000}, 'dual_strategy': {}}
+        self.assertIsNone(build_fill_row(conn, {
+            'order_ref': 10,
+            'instrument': 'SA609C1000',
+            'direction': '0',
+            'offset': '0',
+            'volume': 'abc',
+            'price': 100.3,
+        }, cfg, logger=logger))
+        self.assertIsNone(build_fill_row(conn, {
+            'order_ref': 10,
+            'instrument': 'SA609C1000',
+            'direction': '0',
+            'offset': '0',
+            'volume': 1,
+            'price': 'bad',
+        }, cfg, logger=logger))
+        self.assertEqual(logger.warning.call_count, 2)
+
+    def test_detect_bilateral_skips_non_dict_trades(self):
+        cfg = {'dual_strategy': {'orderref_bilateral_nonzero_alert': True}}
+        suspicious = detect_bilateral_orderref_suspicious(
+            [None, 'bad', {
+                'order_ref': 1,
+                'instrument': 'SA609C1000',
+                'volume': 1,
+                'direction': '0',
+                'offset': '0',
+            }],
+            cfg,
+        )
+        self.assertEqual(suspicious, [])
+
     def test_sync_from_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
@@ -160,6 +323,47 @@ class TestFillLedgerCsv(unittest.TestCase):
                 'trade_id': 'Q1',
             }]
             self.assertEqual(sync_fill_ledger_from_trades(conn, cfg), 1)
+
+    def test_sync_skips_bilateral_alert_for_applied_trades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            conn = MagicMock()
+            conn._runtime_state = {}
+            conn.quotes = {}
+            conn.option_quotes = {}
+            logger = MagicMock()
+            trades = [
+                {
+                    'order_ref': 50,
+                    'instrument': 'IO2604-C-4000',
+                    'direction': '0',
+                    'offset': '0',
+                    'volume': 1,
+                    'price': 12.5,
+                    'trade_id': 'Q1',
+                },
+                {
+                    'order_ref': 50,
+                    'instrument': 'IO2604-C-4000',
+                    'direction': '1',
+                    'offset': '1',
+                    'volume': 1,
+                    'price': 12.6,
+                    'trade_id': 'Q2',
+                },
+            ]
+            applied_keys = {
+                trade_dedupe_key(trades[0]),
+                trade_dedupe_key(trades[1]),
+            }
+            with patch('fill_ledger.load_applied_keys', return_value=applied_keys), \
+                 patch('fill_ledger.apply_fill_record') as mock_apply:
+                self.assertEqual(
+                    sync_fill_ledger_from_trades(conn, cfg, logger=logger, trades=trades),
+                    0,
+                )
+            logger.warning.assert_not_called()
+            mock_apply.assert_not_called()
 
 
 class TestAppendRowAtomicity(unittest.TestCase):

@@ -34,6 +34,7 @@ from unattended_heartbeat import (
 )
 
 _shutdown_requested = False
+_user_shutdown = False
 _shutdown_timer: Optional[threading.Timer] = None
 _shutdown_config: Optional[dict] = None
 _shutdown_logger = None
@@ -61,7 +62,15 @@ def _force_shutdown_exit() -> None:
             f'[退出] SIGTERM 优雅关闭超时 ({timeout:.0f}s)，强制退出',
         )
     conn = _shutdown_conn
+    config = _shutdown_config if isinstance(_shutdown_config, dict) else {}
     if conn is not None:
+        try:
+            from shutdown_cancel import cancel_pending_on_shutdown
+
+            cancel_pending_on_shutdown(conn, config, _shutdown_logger)
+        except Exception as e:
+            if _shutdown_logger:
+                _shutdown_logger.warning('[退出] 强制退出前撤单异常: %s', e)
         try:
             conn.release()
         except Exception as e:
@@ -152,6 +161,19 @@ def main():
         print(f"启动失败: {e}")
         sys.exit(1)
 
+    try:
+        from maintenance_mode import install_maintenance_guard
+        install_maintenance_guard(config)
+    except Exception as e:
+        logger.warning('[启动自检] 维护模式守卫安装异常: %s', e)
+
+    try:
+        from position_csv_integrity import run_startup_position_csv_check
+        run_startup_position_csv_check(config, logger)
+    except ValueError as e:
+        logger.error('[启动自检] %s', e)
+        sys.exit(5)
+
     # P6: 单实例守护——双进程会破坏 fill_ledger / journal 的 in-process 去重，
     # 这里在加载完 config 之后、动任何 CTP/账本前先抢锁；冲突直接退出。
     # 可通过 config['singleton_pid_path'] 自定义路径；默认 data/autoctp.pid。
@@ -189,6 +211,10 @@ def main():
     from order_whitelist_guard import (
         install_send_order_month_guard,
         get_install_error as _whitelist_install_error,
+    )
+    from shutdown_cancel import (
+        install_shutdown_fast_fail_guards,
+        install_shutdown_send_guard,
     )
     from ctp_heartbeat_guard import (
         install_heartbeat_warning,
@@ -249,6 +275,12 @@ def main():
         if config.get('fail_fast_on_guard_install', False):
             logger.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
             sys.exit(4)
+    if not install_shutdown_send_guard():
+        logger.warning('[启动自检] 退出发单守卫未安装（退出时竞态防护减弱）')
+    if not install_shutdown_fast_fail_guards():
+        logger.warning(
+            '[启动自检] 退出查询快速失败守卫未安装（Ctrl+C 后后台线程可能 60s 空等）',
+        )
     # 三个 CTP 补丁是断线重连/僵尸单/死链早检的关键加固，安装失败必须显式告警
     # （否则会静默回退到 autotrade 原版较弱语义：码表超时仍清隔离、健康检查无确认即撤单等）。
     _patch_install_errors: list = []
@@ -425,6 +457,8 @@ def main():
             )
             break
         except KeyboardInterrupt:
+            global _user_shutdown
+            _user_shutdown = True
             reason = 'SIGTERM' if _shutdown_requested else 'USER_INTERRUPT'
             logger.info("用户中断" if reason == 'USER_INTERRUPT' else "SIGTERM 优雅关闭")
             _graceful_shutdown(config, logger, reason=reason)
@@ -475,6 +509,13 @@ def main():
             time.sleep(delay)
         finally:
             if conn:
+                if _user_shutdown or _shutdown_requested:
+                    try:
+                        from shutdown_cancel import cancel_pending_on_shutdown
+
+                        cancel_pending_on_shutdown(conn, config, logger)
+                    except Exception as cancel_err:
+                        logger.error('退出撤单异常: %s', cancel_err, exc_info=True)
                 try:
                     conn.release()
                 except Exception as release_err:

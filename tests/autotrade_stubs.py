@@ -138,6 +138,16 @@ def _install_auto_closer_plan(mod):
 
 
 def _install_auto_closer_executor(mod):
+    def _send_and_wait(
+        conn, instrument, direction, volume, price, offset,
+        timeout, config, logger, symbol,
+        base_future_price=None,
+        price_change_threshold=None,
+        strategy='spread',
+    ):
+        return False, 0, 0.0
+
+    mod._send_and_wait = _send_and_wait
     mod.execute_close_orders_with_limit = lambda *a, **kw: (False, 0)
 
 

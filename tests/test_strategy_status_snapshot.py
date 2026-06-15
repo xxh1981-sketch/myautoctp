@@ -7,8 +7,10 @@ from strategy_status_snapshot import (
     STATUS_OPEN,
     STATUS_OTHER,
     _resolve_spread_status,
+    build_strategy_status_snapshot,
     format_strategy_status_message,
 )
+from spread_ledger import SpreadLegStore
 
 
 class TestStrategyStatusSnapshot(unittest.TestCase):
@@ -86,6 +88,50 @@ class TestStrategyStatusSnapshot(unittest.TestCase):
         )
         self.assertEqual(status, STATUS_OTHER)
         self.assertIn("飞书", reason)
+
+    def test_reconcile_diagnostics_in_snapshot_and_message(self):
+        conn = MagicMock()
+        conn._runtime_state = {
+            "_spread_reconcile_halt": True,
+            "_spread_reconcile_issues": ["AG2608: CTP=1 CSV=0 CTP ahead"],
+            "_strangle_reconcile_halt": False,
+            "_strangle_reconcile_issues": [],
+            "_spread_leg_store": SpreadLegStore(),
+        }
+        conn.query_positions_sync.return_value = []
+        conn._reconnect_quarantine = False
+        conn.td_logined = True
+        conn.md_logined = True
+        conn.futures_prices = {}
+        ledger = MagicMock()
+        ledger.list_positions.return_value = []
+        cfg = {"dual_strategy": {"reconcile_diagnostic_snapshot_enabled": True}}
+        snap = build_strategy_status_snapshot(
+            conn,
+            ledger,
+            cfg,
+            [],
+            [],
+            None,
+            spread_halt=True,
+            strangle_reconcile_halt=False,
+            margin_halt_open=False,
+            spread_open_ok=False,
+            spread_filled=0,
+            spread_daily_limit=100,
+            strangle_buy_spent=0,
+            strangle_buy_limit=0,
+            feishu_paused=False,
+            logger=MagicMock(),
+        )
+        diag = snap["diagnostics"]["reconcile"]
+        self.assertTrue(diag["spread"]["halt"])
+        self.assertEqual(diag["spread"]["issue_count"], 1)
+        self.assertTrue(diag["spread"]["store_available"])
+        self.assertFalse(diag["strangle"]["halt"])
+        text = format_strategy_status_message(snap)
+        self.assertIn("对账诊断", text)
+        self.assertIn("Spread halt=True", text)
 
 
 if __name__ == "__main__":

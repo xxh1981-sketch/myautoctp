@@ -64,6 +64,30 @@ class TestShouldSkipSpreadOpenOnlyScan(unittest.TestCase):
             ),
         )
 
+    @patch('spread_open_preflight._spread_has_ledger_claims', return_value=False)
+    @patch('spread_open_preflight._count_a_from_positions', return_value=9)
+    def test_open_clip_headroom_allows_one_combo(self, _a, _claims):
+        """vol_of_combo=10 但仅剩 1 手 A 额度时，应按 headroom 计 1 而非 10。"""
+        conn = MagicMock()
+        conn._normalize_month = MagicMock(return_value='2609')
+        conn.position_tracker = MagicMock()
+        conn.position_tracker.get_positions_for_symbol.return_value = []
+        config = {
+            'dual_strategy': {'exclude_strangle_from_spread_positions': True},
+            'open_clip': {'enabled': True, 'max_groups': 8},
+            'A_POSITION_LIMIT_RATIO': 1,
+            'A_target_volume_per_combo': 1,
+        }
+        item = {'future': 'sc', 'month': '2609', 'vol_of_combo': 10}
+        from spread_open_preflight import estimate_spread_a_headroom, should_skip_spread_open_only_scan
+        a_cur, a_lim, planned = estimate_spread_a_headroom(conn, item, config)
+        self.assertEqual(a_cur, 9)
+        self.assertEqual(a_lim, 10)
+        self.assertEqual(planned, 1)
+        self.assertFalse(should_skip_spread_open_only_scan(
+            conn, item, config, spread_open_ok=True,
+        ))
+
 
 class TestProcessSpreadSymbol(unittest.TestCase):
 

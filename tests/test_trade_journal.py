@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import MagicMock
 from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,6 +119,29 @@ class TestTradeJournal(unittest.TestCase):
             self.assertIn('k_applied', keys_with_pending)
             self.assertIn('k_pending', keys_with_pending)
 
+    def test_unknown_direction_warns_but_keeps_legacy_mapping(self):
+        logger = MagicMock()
+        self.assertEqual(map_direction_offset('bad', '0', logger=logger, context='ctx'), ('1', '0'))
+        logger.warning.assert_called_once()
+        self.assertIn('未知 Direction', logger.warning.call_args.args[0])
+
+    def test_unknown_offset_warns_but_keeps_legacy_mapping(self):
+        logger = MagicMock()
+        self.assertEqual(map_direction_offset('0', 'bad', logger=logger, context='ctx'), ('0', '1'))
+        logger.warning.assert_called_once()
+        self.assertIn('未知 Offset', logger.warning.call_args.args[0])
+
+    def test_close_today_yesterday_offsets_do_not_warn(self):
+        logger = MagicMock()
+        self.assertEqual(map_direction_offset('0', '3', logger=logger), ('0', '1'))
+        self.assertEqual(map_direction_offset('0', '4', logger=logger), ('0', '1'))
+        logger.warning.assert_not_called()
+
+    def test_unknown_field_warning_can_be_disabled(self):
+        logger = MagicMock()
+        self.assertEqual(map_direction_offset('bad', 'bad', logger=logger, warn_unknown=False), ('1', '1'))
+        logger.warning.assert_not_called()
+
     def test_scan_unresolved_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, 'j.jsonl')
@@ -169,6 +193,8 @@ class TestTradeJournal(unittest.TestCase):
         self.assertEqual((d, o), ('0', '0'))
         d, o = map_direction_offset('1', '1')
         self.assertEqual((d, o), ('1', '1'))
+        d, o = map_direction_offset('Buy', '0')
+        self.assertEqual((d, o), ('0', '0'))
 
 
 if __name__ == '__main__':

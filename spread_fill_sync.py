@@ -229,7 +229,11 @@ def apply_spread_trade_record(
                     )
 
         direction, offset = map_direction_offset(
-            trade.get('direction'), trade.get('offset'),
+            trade.get('direction'),
+            trade.get('offset'),
+            logger=logger,
+            context=f'spread OrderRef={order_ref} {instrument}',
+            warn_unknown=bool(dual.get('ctp_unknown_direction_warn', True)),
         )
         # 记录 pre/post（on-disk signed claim 与应用后净额），供自愈器在崩溃后
         # 幂等判断 CSV 是否已体现本笔（cur==post 已应用；cur==pre 未应用）。

@@ -8,9 +8,10 @@ T-10 (default 600s before segment end):
     ``run_rebalance``.
 
 T-1 (default 60s before segment end):
-  - Block all new sends (``send_order`` wrapper backstop).
+  - Block all new sends (``send_order`` + ``auto_closer_executor._send_and_wait`` backstop).
   - Skip spread / strangle symbol scans and rebalance.
   - Cancel pending orders for affected symbols (only while in session).
+  - Set per-symbol T-1 abort flag so in-progress spread close retries stop sending.
   - Prune local ``pending_orders`` ghosts via exchange order query.
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import List, Optional, Set, Tuple
 
 from session_close_calendar import (
@@ -34,7 +36,9 @@ _INSTALL_ERROR: Optional[str] = None
 
 _PENDING_STATUS = frozenset({'1', '3', 'a', 'b', 'c'})
 _T1_CANCEL_PREFIX = '_session_t1_cancel_at'
+_T1_ABORT_PREFIX = '_session_t1_abort_at'
 _T10_LOG_PREFIX = '_session_t10_log_at'
+_SPREAD_CLOSE_ACTIVE_PREFIX = '_spread_close_active'
 _LOG_COOLDOWN = 300.0
 
 OPEN_INCOMPLETE_KINDS = frozenset({'awaiting_phase2'})
@@ -90,19 +94,49 @@ def strangle_has_incomplete_close(ledger, symbol: str) -> bool:
 
 
 def spread_combo_in_progress(conn, symbol: str) -> bool:
+    """True only when *this symbol* has an in-flight spread open/close combo."""
     sym = symbol.lower()
     ex = getattr(conn, '_active_executor', None)
     if ex is not None:
         ex_sym = getattr(ex, 'symbol', None) or getattr(ex, '_symbol', None) or ''
         if str(ex_sym).lower() == sym:
             return True
-    lock = getattr(conn, '_closing_lock', None)
-    if lock is not None:
-        try:
-            if lock.locked():
-                return True
-        except Exception:
-            pass
+    runtime = getattr(conn, '_runtime_state', None) or {}
+    active = int(runtime.get(f'{_SPREAD_CLOSE_ACTIVE_PREFIX}:{sym}', 0) or 0)
+    if active > 0:
+        return True
+    holder = getattr(conn, '_closing_lock_symbol', None)
+    if holder and str(holder).lower() == sym:
+        lock = getattr(conn, '_closing_lock', None)
+        if lock is not None:
+            try:
+                if lock.locked():
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def should_block_send(
+    conn,
+    symbol: str,
+    config: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Block sends during T-1, after T-1 abort sweep, or outside trading hours."""
+    if not guard_enabled(config):
+        return False
+    sym = (symbol or '').lower()
+    if not sym:
+        return False
+    if get_session_phase(sym, config, now) == 't1':
+        return True
+    runtime = getattr(conn, '_runtime_state', None) or {}
+    seg_id = segment_end_id(sym, config=config, now=now)
+    if seg_id and runtime.get(f'{_T1_ABORT_PREFIX}:{sym}:{seg_id}'):
+        return True
+    if not is_trading_time_at(sym, now, config):
+        return True
     return False
 
 
@@ -247,6 +281,7 @@ def maybe_run_pre_close_cancel_sweep(
 
         count = _cancel_symbol_pending(conn, symbol, logger, config)
         runtime[dedupe_key] = time.time()
+        runtime[f'{_T1_ABORT_PREFIX}:{sym}:{seg_id}'] = time.time()
         sec = seconds_to_segment_end(symbol, config=config)
         if logger:
             logger.warning(
@@ -287,12 +322,11 @@ def install_session_close_guard(config: dict = None) -> bool:
 
     cfg = config or {}
     if not guard_enabled(cfg):
-        _INSTALLED = True
-        _INSTALL_ERROR = None
         return True
 
     try:
         _install_send_order_guard()
+        _install_close_executor_guard()
         _install_spread_guards()
         _install_strangle_guards()
     except Exception as e:
@@ -309,20 +343,90 @@ def _install_send_order_guard() -> None:
     import auto_order_manager as aom
 
     original = aom.OrderManager.send_order
+    if getattr(original, '_session_close_wrapped', False):
+        return
 
     def guarded_send_order(self, instrument, *args, **kwargs):
         conn = self.conn
         config = getattr(conn, 'config', None) or {}
         sym = _extract_symbol_from_instrument(instrument)
-        if sym and guard_enabled(config) and get_session_phase(sym, config) == 't1':
+        if sym and should_block_send(conn, sym, config):
             _maybe_log_throttled(
                 conn, f't1_send:{sym}', self.logger, 'info',
-                f'[收盘守卫] {sym} T-1 禁止发单: {instrument}',
+                f'[收盘守卫] {sym} 禁止发单: {instrument}',
             )
             return None, None
         return original(self, instrument, *args, **kwargs)
 
+    guarded_send_order._session_close_wrapped = True  # type: ignore[attr-defined]
     aom.OrderManager.send_order = guarded_send_order
+
+
+def _install_close_executor_guard() -> None:
+    try:
+        import auto_closer_executor as ace
+    except ImportError:
+        _log.info('[收盘守卫] auto_closer_executor 不可用，跳过平仓发单补丁')
+        return
+
+    orig_send = ace._send_and_wait
+    if not getattr(orig_send, '_session_close_wrapped', False):
+
+        def guarded_send_and_wait(
+            conn, instrument, direction, volume, price, offset,
+            timeout, config, logger, symbol,
+            base_future_price: float = None,
+            price_change_threshold: float = None,
+            strategy: str = 'spread',
+        ):
+            if should_block_send(conn, symbol, config):
+                _maybe_log_throttled(
+                    conn, f't1_send:{symbol.lower()}', logger, 'info',
+                    f'[收盘守卫] {symbol} 禁止发单: {instrument}',
+                )
+                return False, 0, 0.0
+            return orig_send(
+                conn, instrument, direction, volume, price, offset,
+                timeout, config, logger, symbol,
+                base_future_price=base_future_price,
+                price_change_threshold=price_change_threshold,
+                strategy=strategy,
+            )
+
+        guarded_send_and_wait._session_close_wrapped = True  # type: ignore[attr-defined]
+        ace._send_and_wait = guarded_send_and_wait
+
+    orig_execute = ace.execute_close_orders_with_limit
+    if getattr(orig_execute, '_session_close_wrapped', False):
+        return
+
+    def guarded_execute_close(conn, plan, symbol, month, min_tick, config, logger,
+                              urgency='urgent'):
+        sym = (symbol or '').lower()
+        runtime = getattr(conn, '_runtime_state', None)
+        if runtime is None:
+            runtime = {}
+            conn._runtime_state = runtime
+        active_key = f'{_SPREAD_CLOSE_ACTIVE_PREFIX}:{sym}'
+        runtime[active_key] = int(runtime.get(active_key, 0) or 0) + 1
+        conn._closing_lock_symbol = sym
+        try:
+            return orig_execute(
+                conn, plan, symbol, month, min_tick, config, logger,
+                urgency=urgency,
+            )
+        finally:
+            runtime[active_key] = max(0, int(runtime.get(active_key, 1) or 1) - 1)
+            if runtime.get(active_key, 0) <= 0:
+                runtime.pop(active_key, None)
+            if getattr(conn, '_closing_lock_symbol', None) == sym:
+                try:
+                    delattr(conn, '_closing_lock_symbol')
+                except Exception:
+                    conn._closing_lock_symbol = None
+
+    guarded_execute_close._session_close_wrapped = True  # type: ignore[attr-defined]
+    ace.execute_close_orders_with_limit = guarded_execute_close
 
 
 def _patch_once(fn, patched):
@@ -348,6 +452,8 @@ def _install_spread_guards() -> None:
                 f'[{symbol}] 收盘 T-1 硬停，跳过价差扫描',
             )
             return False
+        if not is_trading_time_at(symbol, config=config):
+            return False
         return orig_process(
             conn, item, vix_engine, config, logger,
             remaining_limit=remaining_limit,
@@ -361,6 +467,12 @@ def _install_spread_guards() -> None:
         symbol = item['future']
         phase = get_session_phase(symbol, config)
         if phase == 't1':
+            return False
+        if not is_trading_time_at(symbol, config=config):
+            _maybe_log_throttled(
+                conn, f'off_close:{symbol.lower()}', logger, 'info',
+                f'[{symbol}] 非交易时段，跳过价差平仓',
+            )
             return False
         if phase == 't10' and not spread_combo_in_progress(conn, symbol):
             _maybe_log_throttled(

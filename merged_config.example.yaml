@@ -39,6 +39,16 @@ dual_strategy:
   spread_positions_csv: data/spread_positions.csv
   spread_trade_journal: data/spread_trade_journal.jsonl
   spread_reconcile_fallback_heuristic: false
+  # true：持仓查询飞书摘要额外展示对账 halt/issues/SpreadLegStore 状态（纯可观测性）
+  reconcile_diagnostic_snapshot_enabled: true
+  reconcile_diagnostic_issue_limit: 8
+  # true：未知 CTP Direction/Offset 保持旧映射，同时打 warning（便于发现字段异常）
+  ctp_unknown_direction_warn: true
+  # allow=SpreadLegStore 不可用时仍入账（fail-open）；skip_fill=跳过入账（无人值守默认）
+  strangle_store_unavailable_fallback: skip_fill
+  # 同 OrderRef+合约出现买卖双边成交时告警（不改变入账语义）
+  orderref_bilateral_nonzero_alert: true
+  orderref_bilateral_nonzero_alert_cooldown_sec: 1800
   tradeinfo_path: tradeinfo
   spread_sheet: spread
   strangle_sheet: strangle
@@ -106,10 +116,10 @@ reconnect_quarantine:
 # 发单白名单拦截飞书冷却（同 conn + 拦截原因键，默认 300s；0=不冷却）
 # whitelist_feishu_cooldown_sec: 300
 
-# 价差日开仓笔数粗节流（非核心风控，可放大如 200～500）
-# daily_trade_limit: 200  # 继承 autotrade auto_config.yaml，此处可覆盖
+# 价差日开仓笔数粗节流（非核心风控；继承 autotrade 时本账户建议保持 100）
+# daily_trade_limit: 100  # 继承 autotrade auto_config.yaml，此处可覆盖
 
-# 动态开仓 clip：单次 combo 组数（市值 + L1 参与率，不写进 tradeinfo）
+# 动态 clip：价差/宽跨 建仓·平仓·再平衡共用（名义金额 + L1 参与率）
 open_clip:
   enabled: true
   target_yuan: 20000
@@ -173,8 +183,14 @@ heartbeat_file: data/main_loop_heartbeat.txt
 daily_heartbeat_enabled: true
 daily_heartbeat_hour: 9
 daily_heartbeat_marker_file: data/daily_heartbeat_sent.txt
-# SIGTERM 优雅关闭最大等待秒数；超时强制退出（Windows 请避免 taskkill /F）
-shutdown_timeout_sec: 15
+# SIGTERM 优雅关闭最大等待秒数；超时强制退出（含短连+双轮撤单，Windows 请避免 taskkill /F）
+shutdown_timeout_sec: 45
+# 退出前等待品种扫描后台线程（秒）；配合 shutdown_cancel 发单守卫 + 双轮撤单
+shutdown_scan_drain_sec: 5
+shutdown_cancel_passes: 2
+shutdown_cancel_pass_pause_sec: 1.0
+shutdown_cancel_confirm_timeout: 15
+shutdown_cancel_login_timeout: 30
 restart_reason_file: data/restart_reason.txt
 # 外部 watchdog（计划任务每 1–5 分钟运行 scripts/check_heartbeat_watchdog.ps1）
 heartbeat_watchdog:
@@ -187,6 +203,13 @@ config_drift_check_interval_sec: 600
 # halt 从 True→False 时飞书通知解除（纯可观测性）
 halt_recovery_notify_enabled: true
 halt_recovery_alert_cooldown_sec: 300
+# 运维维护模式：继续监控/对账/告警，禁止一切自动发单与撤单（与飞书暂停不同）
+maintenance_mode: false
+maintenance_mode_file: data/maintenance_mode.flag
+# 持仓 CSV 完整性：空表合法；损坏 → position_csv_halt（禁新开，不自动平仓）
+position_csv_integrity_enabled: true
+position_csv_check_interval_sec: 3600
+fail_fast_on_position_csv_corrupt: false
 feishu_alert_cooldown_sec: 300
 
 # 无人值守 fail-fast：守卫/邻月/保证金未启用则拒绝启动（代码默认 true，此处显式写出便于核对）
@@ -219,4 +242,7 @@ strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设�
   ledger_path: data/ledger_strangle.json
   order_ref_min: 500000
   auto_sync_positions_csv: true
+  # 未配对腿 metadata 异常时飞书告警（不改账本）
+  unmatched_leg_metadata_alert: true
+  unmatched_leg_metadata_alert_cooldown_sec: 1800
   phase2_timeout: 15  # 便宜腿单笔等待（秒）；勿与价差 B_timeout 混用顶层 B_timeout

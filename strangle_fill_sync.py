@@ -28,6 +28,7 @@ def _skip_strangle_fill_on_spread_owned_only(
     config: dict,
     conn,
     instrument: str,
+    logger=None,
 ) -> tuple:
     """
     宽跨段成交但合约仅由价差认领、宽跨认领为 0 → 勿写入 strangle CSV。
@@ -36,34 +37,54 @@ def _skip_strangle_fill_on_spread_owned_only(
     """
     dual = config.get('dual_strategy') or {}
     if not dual.get('strangle_fill_skip_spread_owned_instruments', True):
-        return False, ''
+        return False, '', ''
 
     if conn is None:
-        return False, ''
+        return False, '', ''
 
     from spread_ledger import store_from_conn
     from import_strangle_positions import read_claim_volume
 
     store = store_from_conn(conn)
     if store is None:
-        return False, ''
+        policy = dual.get('strangle_store_unavailable_fallback', 'skip_fill')
+        if policy == 'skip_fill':
+            return (
+                True,
+                'spread_store_unavailable',
+                'SpreadLegStore 不可用，按配置 fail-closed 跳过本笔宽跨入账',
+            )
+        if logger:
+            logger.warning(
+                '[宽跨持仓] SpreadLegStore 不可用，跳过价差认领保护；'
+                'strangle_store_unavailable_fallback=allow。'
+                '请确认启动顺序和 wire_spread_trade_runtime 已安装。'
+            )
+        return False, '', ''
 
     key = (instrument or '').strip().upper()
     if not key:
-        return False, ''
+        return False, '', ''
 
     spread_vol = 0
     for k, v in store.list_leg_claims().items():
         if str(k).strip().upper() == key:
-            spread_vol = int(v)
+            try:
+                spread_vol = int(v)
+            except (TypeError, ValueError):
+                if logger:
+                    logger.warning(
+                        f'[宽跨持仓] SpreadLegStore claim 无效 {k}={v!r}，按 0 处理'
+                    )
+                spread_vol = 0
             break
     if spread_vol == 0:
-        return False, ''
+        return False, '', ''
 
     if read_claim_volume(config, instrument) != 0:
-        return False, ''
+        return False, '', ''
 
-    return True, (
+    return True, 'spread_owned_only', (
         f'价差认领 {spread_vol} 手、宽跨认领 0，'
         '疑似价差成交误用宽跨 OrderRef'
     )
@@ -143,8 +164,8 @@ def apply_strangle_trade_record(
                     )
                 return False
 
-        skip_owned, skip_reason = _skip_strangle_fill_on_spread_owned_only(
-            config, conn, instrument,
+        skip_owned, skip_reason_key, skip_reason = _skip_strangle_fill_on_spread_owned_only(
+            config, conn, instrument, logger=logger,
         )
         if skip_owned:
             if logger:
@@ -162,17 +183,21 @@ def apply_strangle_trade_record(
                 'direction': trade.get('direction'),
                 'offset': trade.get('offset'),
                 'volume': volume,
-                'skipped': 'spread_owned_only',
+                'skipped': skip_reason_key,
                 'journal_state': 'applied',
                 'applied_on': date.today().isoformat(),
             }, config)
             if conn is not None:
                 from fill_ledger import stash_fill_csv_status
-                stash_fill_csv_status(conn, trade, False, 'spread_owned_only')
+                stash_fill_csv_status(conn, trade, False, skip_reason_key)
             return False
 
         direction, offset = map_direction_offset(
-            trade.get('direction'), trade.get('offset'),
+            trade.get('direction'),
+            trade.get('offset'),
+            logger=logger,
+            context=f'strangle OrderRef={order_ref} {instrument}',
+            warn_unknown=bool(dual.get('ctp_unknown_direction_warn', True)),
         )
         # 记录 pre/post（on-disk 认领手数与应用后净额），供自愈器在崩溃后幂等
         # 判断 CSV 是否已体现本笔（cur==post 已应用；cur==pre 未应用）。读 CSV
@@ -417,6 +442,7 @@ def rebuild_csv_from_strangle_trades(
         return load_positions_csv(positions_csv_path(config)) if os.path.isfile(
             positions_csv_path(config)) else {}
 
+    dual = config.get('dual_strategy') or {}
     claims: Dict[str, int] = {}
     for trade in sorted(trades, key=lambda t: (t.get('trade_date', ''), t.get('trade_time', ''), t.get('order_ref', 0))):
         if not is_strangle_order_ref(trade.get('order_ref'), config):
@@ -425,7 +451,13 @@ def rebuild_csv_from_strangle_trades(
         volume = int(trade.get('volume') or 0)
         if not instrument or volume <= 0:
             continue
-        direction, offset = map_direction_offset(trade.get('direction'), trade.get('offset'))
+        direction, offset = map_direction_offset(
+            trade.get('direction'),
+            trade.get('offset'),
+            logger=logger,
+            context=f'strangle rebuild OrderRef={trade.get("order_ref")} {instrument}',
+            warn_unknown=bool(dual.get('ctp_unknown_direction_warn', True)),
+        )
         delta = _fill_volume_delta(direction, offset, volume)
         if delta == 0:
             continue
