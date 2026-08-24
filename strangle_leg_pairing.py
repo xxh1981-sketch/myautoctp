@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from spread_contract_utils import (
     extract_month_from_contract,

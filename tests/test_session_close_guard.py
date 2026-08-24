@@ -173,7 +173,6 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
             {'symbol': 'm', 'month': '2701', 'kind': 'inferred_single'},
         ]
         cfg = {'session_close_guard': {'enabled': True}}
-        off = datetime(2026, 7, 6, 23, 22, 21)
         with patch('session_close_guard.get_session_phase', return_value='off'):
             skip, reason = scg.should_skip_strangle_rebalance(
                 conn, cfg, ledger=ledger,

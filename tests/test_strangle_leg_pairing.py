@@ -361,7 +361,7 @@ class SyncInferredTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ledger = StrangleLedger(os.path.join(td, 'l.json'))
             ledger.set_leg_claims({'MA609C3650': 10, 'MA609P1900': 10})
-            pos = ledger.create_position(
+            ledger.create_position(
                 'ma', '609', 'MA609C3650', 'MA609P1900',
                 3650.0, 1900.0, 0.01, groups=6,
             )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Set
+from typing import Dict, Set
 
 from spread_contract_utils import (
     extract_month_from_contract,
