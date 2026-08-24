@@ -3,7 +3,7 @@
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,6 +44,92 @@ class TestSpreadLedgerExecution(unittest.TestCase):
         self.assertTrue(callable(sle.install_spread_ledger_execution))
         self.assertTrue(callable(sle._rebind_analyze_consumers))
         self.assertTrue(callable(sle._rebind_module_attr))
+
+    def test_leg_pairing_failure_leaves_not_installed(self):
+        """只验证 leg pairing 分支；前置 install_spread_* 补丁 patch 掉
+        （unit stub 环境下它们依赖 autotrade 真实模块属性）。"""
+        import spread_ledger_execution as sle
+
+        orig_installed = sle._INSTALLED
+        sle._INSTALLED = False
+        try:
+            with patch.object(sle, 'install_spread_analyze_from_ledger'), \
+                 patch.object(sle, 'install_spread_close_from_ledger'), \
+                 patch.object(sle, 'install_spread_rebalance_from_ledger'), \
+                 patch.object(sle, 'install_spread_process_symbol_halt'), \
+                 patch.object(sle, 'install_spread_risk_check_exclusion'), \
+                 patch.object(sle, 'install_spread_rebalance_close_a_exclusion'), \
+                 patch(
+                     'session_close_guard.install_session_close_guard',
+                     return_value=True,
+                 ), patch(
+                     'strangle_leg_pairing.install_strangle_leg_pairing_patch',
+                     return_value=False,
+                 ), patch.object(sle, '_surface_leg_pairing_install_failure'):
+                sle.install_spread_ledger_execution(
+                    {'fail_fast_on_guard_install': False},
+                )
+            self.assertFalse(sle._INSTALLED)
+        finally:
+            sle._INSTALLED = orig_installed
+
+    def test_session_close_guard_failure_surfaces(self):
+        """收盘守卫安装失败不得静默：须走 surface（error+飞书+可 fail-fast）。
+
+        前置的 install_spread_* 与 leg_pairing 均 patch 掉，只验证收盘守卫分支
+        （unit stub 环境下前置补丁依赖 autotrade 真实模块属性）。
+        """
+        import spread_ledger_execution as sle
+
+        orig_installed = sle._INSTALLED
+        sle._INSTALLED = False
+        try:
+            with patch.object(sle, 'install_spread_analyze_from_ledger'), \
+                 patch.object(sle, 'install_spread_close_from_ledger'), \
+                 patch.object(sle, 'install_spread_rebalance_from_ledger'), \
+                 patch.object(sle, 'install_spread_process_symbol_halt'), \
+                 patch.object(sle, 'install_spread_risk_check_exclusion'), \
+                 patch.object(sle, 'install_spread_rebalance_close_a_exclusion'), \
+                 patch(
+                     'strangle_leg_pairing.install_strangle_leg_pairing_patch',
+                     return_value=True,
+                 ), patch(
+                     'session_close_guard.install_session_close_guard',
+                     return_value=False,
+                 ), patch(
+                     'session_close_guard.get_install_error',
+                     return_value='patch 失败',
+                 ), patch.object(
+                     sle, '_surface_session_close_guard_install_failure',
+                 ) as surface:
+                sle.install_spread_ledger_execution(
+                    {'fail_fast_on_guard_install': False},
+                )
+            surface.assert_called_once()
+            self.assertIn('patch 失败', surface.call_args.args[1])
+        finally:
+            sle._INSTALLED = orig_installed
+
+    def test_session_close_guard_surface_fail_fast_exits(self):
+        """fail_fast_on_guard_install=true 时收盘守卫失败应拒绝启动（exit 4）。"""
+        import spread_ledger_execution as sle
+
+        with patch('auto_feishu.send_feishu_message', return_value=True):
+            with self.assertRaises(SystemExit) as ctx:
+                sle._surface_session_close_guard_install_failure(
+                    {'fail_fast_on_guard_install': True}, '模拟失败',
+                )
+        self.assertEqual(ctx.exception.code, 4)
+
+    def test_session_close_guard_surface_non_fatal_by_default(self):
+        import spread_ledger_execution as sle
+
+        with patch('auto_feishu.send_feishu_message', return_value=True) as m:
+            sle._surface_session_close_guard_install_failure(
+                {'fail_fast_on_guard_install': False}, '模拟失败',
+            )
+        m.assert_called_once()
+        self.assertIn('收盘守卫', m.call_args.args[0])
 
 
 class TestProcessSymbolPatchReachesMainLoop(unittest.TestCase):

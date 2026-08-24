@@ -21,6 +21,9 @@ def merge_strangle_owned_volumes(ledger) -> Dict[str, int]:
 
     ``awaiting_phase2`` 的 Phase1 成交在登记未配对前已写入 ``leg_claims``（CSV），
     不得再把 ``filled_instrument`` 与 CSV 相加（否则账户分解会出现虚假「外部差额」）。
+
+    ``inferred_from_claims`` 的 ``inferred_single`` / ``inferred_complete`` 同理：
+    它们是从 ``leg_claims`` 配对推断出的队列项，物理手数已在 CSV 中，不得再叠加。
     """
     if ledger is None:
         return {}
@@ -31,6 +34,8 @@ def merge_strangle_owned_volumes(ledger) -> Dict[str, int]:
             vols[key] = vols.get(key, 0) + int(v)
     for item in ledger.list_unmatched_legs():
         if item.get('kind') == 'awaiting_phase2':
+            continue
+        if item.get('inferred_from_claims'):
             continue
         inst = (
             item.get('filled_instrument')

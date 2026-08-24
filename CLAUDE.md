@@ -6,7 +6,8 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **AutoCTP** — single-process, single-CTP-connection orchestration for **Call Spread** (autotrade) + **Long Strangle** (autostraggle). Strategy logic lives in private sibling repos; this repo handles path injection, merged main loop, reconcile, ledger, and halt routing.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for halt paths and position claiming.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for halt paths and position claiming.  
+Design review: [docs/INVARIANTS_REVIEW_CHECKLIST.md](docs/INVARIANTS_REVIEW_CHECKLIST.md).
 
 ## Commands
 
@@ -27,6 +28,7 @@ Design rules and audit conclusions are **mirrored in three places** — keep the
 | Location | Role |
 |----------|------|
 | `docs/AI_PROJECT_MEMORY.md` | Human-readable combined reference |
+| `docs/INVARIANTS_REVIEW_CHECKLIST.md` | Main-loop invariants & review checklist |
 | `.cursor/rules/*.mdc` | Cursor (`alwaysApply: true`) |
 | `.claude/rules/*.md` | Claude Code project rules |
 

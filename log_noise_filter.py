@@ -34,10 +34,15 @@ DEFAULT_THROTTLE_SUBSTRINGS: Tuple[str, ...] = (
     '提升次近月为近月',
     '品种整体 VIX 无法计算',
     'VIX无法计算',
+    # 宽跨平仓锁竞争：本轮放弃、下轮重试的预期背压，高频重复无诊断价值。
+    '获取平仓锁超时',
 )
 # (子串, 目标级别)
 DEFAULT_DOWNGRADE: Tuple[Tuple[str, int], ...] = (
     ('当前状态禁止此项操作', logging.WARNING),
+    # 宽跨平仓未抢到互斥锁→中止本轮平仓、下轮重试，是单在途串行化的预期背压，
+    # 非交易级故障，从 ERROR 降为 WARNING 以免淹没真实错误。
+    ('获取平仓锁超时', logging.WARNING),
 )
 DEFAULT_WINDOW_SEC = 60.0
 _MAX_KEYS = 4096

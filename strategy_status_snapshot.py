@@ -377,12 +377,19 @@ def _resolve_strangle_status(
     try:
         from straggle_signals import check_exit  # type: ignore
 
+        vol_basis = item.get("vol_basis")
         for pos in ledger.list_positions(symbol, month):
             if pos.get("status") != "open":
                 continue
-            should_close, reason, _extra = check_exit(
-                conn, pos, vix_engine, config, logger,
-            )
+            try:
+                should_close, reason, _extra = check_exit(
+                    conn, pos, vix_engine, config, logger,
+                    vol_basis=vol_basis,
+                )
+            except TypeError:
+                should_close, reason, _extra = check_exit(
+                    conn, pos, vix_engine, config, logger,
+                )
             if should_close:
                 return STATUS_CLOSE, reason
     except Exception:
@@ -549,10 +556,7 @@ def build_strangle_symbol_rows(
     feishu_paused: bool,
     logger,
 ) -> List[dict]:
-    try:
-        from strangle_rebalance_close_only import CLOSE_KINDS  # type: ignore
-    except Exception:
-        CLOSE_KINDS = {"close_chp_pending"}
+    from strangle_leg_pairing import is_close_unmatched_item
 
     rows: List[dict] = []
     try:
@@ -573,8 +577,7 @@ def build_strangle_symbol_rows(
     um_close: Dict[tuple, int] = {}
     for u in unmatched:
         k = ((u.get("symbol") or "").upper(), str(u.get("month") or ""))
-        kind = str(u.get("kind") or "")
-        if kind in CLOSE_KINDS:
+        if is_close_unmatched_item(u):
             um_close[k] = um_close.get(k, 0) + 1
         else:
             um_open[k] = um_open.get(k, 0) + 1

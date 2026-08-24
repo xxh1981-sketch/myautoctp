@@ -7,19 +7,21 @@ but it does not protect against:
 * CSV / ledger tampering pointing to a neighbouring month (e.g. SA2608 when
   tradeinfo only targets SA2607). The symbol still matches so the legacy
   guard waves it through.
-* Logic bugs that accidentally hand a future contract (``SA2607``) to the
-  order layer.
+* Logic bugs that accidentally hand a future contract (``SA2607`` / ``P2705`` /
+  ``C2701``) to the order layer.
 
 We install a one-time wrapper that:
 
+* remaps ledger/CSV case (``C2701-C-2340``) to the CTP quotes key
+  (``c2701-C-2340``) before ``ReqOrderInsert`` — DCE is case-sensitive;
+* **hard-rejects non-option instruments** via ``looks_like_option_instrument``
+  (futures such as ``P2705`` / ``C2701`` / ``SA2608`` never reach CTP);
 * extracts the instrument month via ``extract_month_from_contract``;
 * compares it (raw + ``_normalize_month``) against ``conn.target_months``;
-* rejects the request and fires a feishu alert on mismatch;
-* also rejects "no-month" instruments (futures contracts), because the
-  dual-strategy program is option-only.
+* rejects the request and fires a feishu alert on mismatch.
 
 The wrapper is *additive* — it runs before the original ``send_order`` and
-delegates to it on pass.
+delegates to it on pass. Dual-strategy AutoCTP is option-only at the wire.
 """
 
 from __future__ import annotations
@@ -151,11 +153,39 @@ def audit_target_months_coverage(
     return sorted(missing)
 
 
+def _canonical_send_instrument(conn, instrument: str) -> str:
+    """Map ledger/CSV case to the CTP wire id (quotes / 码表 / 交易所前缀规则)."""
+    from ctp_instrument import canonical_ctp_instrument
+
+    return canonical_ctp_instrument(conn, instrument)
+
+
 def _is_option_like(instrument: str) -> bool:
-    """Heuristic: option contracts contain a C/P strike marker; futures do not."""
+    """True only for option contracts; futures must never pass.
+
+    Prefers autotrade ``looks_like_option_instrument`` (shared with margin /
+    instrument manager). Local fallback uses the same rules so C/P product
+    futures (``P2705``, ``C2701``) are not mistaken for options — the old
+    ``[CP]\\d`` heuristic falsely accepted those underlyings.
+    """
+    try:
+        from auto_connection_utils import looks_like_option_instrument
+        return bool(looks_like_option_instrument(instrument))
+    except Exception:
+        pass
+
     import re
 
-    return bool(re.search(r'[-]?[CP][-]?\d', (instrument or '').upper()))
+    upper = (instrument or '').strip().upper()
+    if not upper:
+        return False
+    # CFFEX / DCE dash form: IO2604-C-4000, c2701-C-2320, c2701-MS-C-2320
+    if re.search(r'-[CP]-', upper):
+        return True
+    # Compact commodity: ag2606C6000 / SA2608C2400 / SR601C6000
+    if re.search(r'[A-Z]+\d+[CP]\d+', upper):
+        return True
+    return False
 
 
 def install_send_order_month_guard() -> bool:
@@ -232,8 +262,8 @@ def install_send_order_month_guard() -> bool:
 
         if not _is_option_like(instrument):
             msg = (
-                f'[发单白名单] 拒绝非期权合约下单: {instrument} '
-                f'(strategy={strategy}, 双策略程序仅交易期权)'
+                f'[发单白名单] 拒绝非期权/期货合约下单: {instrument} '
+                f'(strategy={strategy}, AutoCTP 物理禁发期货，仅交易期权)'
             )
             self.logger.error(msg)
             sym = ''
@@ -249,6 +279,13 @@ def install_send_order_month_guard() -> bool:
                 alert_key=f'not_option:{sym.lower()}',
             )
             return None, None
+
+        canonical = _canonical_send_instrument(conn, instrument)
+        if canonical and canonical != instrument:
+            self.logger.info(
+                f'[发单] 合约代码按行情键归一: {instrument} → {canonical}'
+            )
+            instrument = canonical
 
         from auto_connection import extract_symbol_prefix
 

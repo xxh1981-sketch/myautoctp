@@ -1,9 +1,11 @@
 """Trading-session calendar helpers for T-10 / T-1 close guards.
 
-Mirrors ``auto_processor.is_trading_time`` segment boundaries (day / night /
-CFFEX) with an injectable ``now`` for tests.  Do not use for order routing
-outside session-close guard — keep ``auto_processor.is_trading_time`` as the
-runtime trading gate elsewhere.
+``is_trading_time_at`` mirrors ``auto_processor.is_trading_time`` (exchange
+order acceptance; commodity 10:15-10:30 rest only — CFFEX continuous).
+
+``seconds_to_segment_end`` / ``get_session_phase`` use *close-guard* segment
+boundaries: by default the morning micro-break is **not** a segment end, so
+T-10/T-1 only apply before 11:30 / 15:00 / night close — not before 10:15.
 """
 
 from __future__ import annotations
@@ -17,13 +19,34 @@ _CFFEX_TREASURY = frozenset({'t', 'tf', 'ts', 'tl'})
 _SHFE_LONG_NIGHT = frozenset({'au', 'ag', 'cu', 'al', 'zn', 'pb', 'ni', 'sn'})
 _INE_LONG_NIGHT = frozenset({'sc', 'bc'})
 
-# Commodity micro-break (optional segment end).
 _MORNING_BREAK_END_MIN = 10 * 60 + 30  # 10:30
+_MORNING_BREAK_START_MIN = 10 * 60 + 15  # 10:15
 
 
 def _extract_product(symbol: str) -> str:
     m = re.match(r'([a-zA-Z]+)', str(symbol or ''))
     return m.group(1).lower() if m else ''
+
+
+def _fallback_exchange(symbol: str) -> str:
+    """pairtrade.exchange 不可用时按内置品种集合判断（勿一律当 DCE：
+    会给 CFFEX 金融品种套上商品 10:15-10:30 小休，io/tf 在 10:20 误判 off）。"""
+    product = _extract_product(symbol)
+    if product in _CFFEX_INDEX or product in _CFFEX_TREASURY:
+        return 'CFFEX'
+    if product in _SHFE_LONG_NIGHT:
+        return 'SHFE'
+    if product in _INE_LONG_NIGHT:
+        return 'INE'
+    return 'DCE'
+
+
+def _exchange_for(symbol: str) -> str:
+    try:
+        from pairtrade.exchange import get_exchange_type
+        return get_exchange_type(symbol)
+    except Exception:
+        return _fallback_exchange(symbol)
 
 
 def _night_end_minutes(product: str, exchange: str, overrides: Dict[str, str]) -> Tuple[int, bool]:
@@ -42,7 +65,8 @@ def _night_end_minutes(product: str, exchange: str, overrides: Dict[str, str]) -
     return (23 * 60, False)
 
 
-def _cffex_day_segments(product: str) -> List[Tuple[int, int]]:
+def _cffex_day_trading_segments(product: str) -> List[Tuple[int, int]]:
+    """Exchange order-acceptance windows (CFFEX continuous through 10:15-10:30)."""
     if product in _CFFEX_TREASURY:
         return [(9 * 60 + 15, 11 * 60 + 30), (13 * 60, 15 * 60 + 15)]
     if product in _CFFEX_INDEX:
@@ -50,13 +74,26 @@ def _cffex_day_segments(product: str) -> List[Tuple[int, int]]:
     return [(9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60)]
 
 
-def _commodity_day_segments(include_morning_break: bool) -> List[Tuple[int, int]]:
+def _cffex_day_close_guard_segments(product: str) -> List[Tuple[int, int]]:
+    """T-10/T-1 segment ends — morning micro-break is not a close-guard boundary."""
+    if product in _CFFEX_TREASURY:
+        return [(9 * 60 + 15, 11 * 60 + 30), (13 * 60, 15 * 60 + 15)]
+    if product in _CFFEX_INDEX:
+        return [(9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60)]
+    return [(9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60)]
+
+
+def _commodity_day_trading_segments() -> List[Tuple[int, int]]:
+    return [
+        (9 * 60, _MORNING_BREAK_START_MIN),
+        (_MORNING_BREAK_END_MIN, 11 * 60 + 30),
+        (13 * 60 + 30, 15 * 60),
+    ]
+
+
+def _commodity_day_close_guard_segments(include_morning_break: bool) -> List[Tuple[int, int]]:
     if include_morning_break:
-        return [
-            (9 * 60, 10 * 60 + 15),
-            (_MORNING_BREAK_END_MIN, 11 * 60 + 30),
-            (13 * 60 + 30, 15 * 60),
-        ]
+        return _commodity_day_trading_segments()
     return [(9 * 60, 11 * 60 + 30), (13 * 60 + 30, 15 * 60)]
 
 
@@ -79,48 +116,59 @@ def _elapsed_minutes(now: datetime) -> float:
     return now.hour * 60 + now.minute + now.second / 60.0 + now.microsecond / 6e7
 
 
-def _segments_for_symbol(
+def _trading_segments_for_symbol(
     symbol: str,
     config: Optional[dict],
 ) -> List[Tuple[int, int, bool]]:
-    """List of (start_min, end_min, cross_midnight) segments for *today*."""
-    try:
-        from pairtrade.exchange import get_exchange_type
-    except Exception:
-        get_exchange_type = lambda s: 'DCE'  # noqa: E731
-
+    """Segments when the exchange accepts orders."""
     product = _extract_product(symbol)
-    exchange = get_exchange_type(symbol)
+    exchange = _exchange_for(symbol)
+    overrides = ((config or {}).get('session_close_guard') or {}).get('night_end_overrides') or {}
+
+    if exchange == 'CFFEX':
+        # CFFEX 无夜盘。
+        return [(a, b, False) for a, b in _cffex_day_trading_segments(product)]
+
+    day_segs = _commodity_day_trading_segments()
+    night_end, cross = _night_end_minutes(product, exchange, overrides)
+    night_start = 21 * 60
+    if cross:
+        return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, True)]
+    return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, False)]
+
+
+def _close_guard_segments_for_symbol(
+    symbol: str,
+    config: Optional[dict],
+) -> List[Tuple[int, int, bool]]:
+    """Segments whose *end* triggers T-10/T-1 (morning break excluded by default)."""
+    product = _extract_product(symbol)
+    exchange = _exchange_for(symbol)
     cfg = (config or {}).get('session_close_guard') or {}
     include_break = bool(cfg.get('include_morning_break', False))
     overrides = cfg.get('night_end_overrides') or {}
 
     if exchange == 'CFFEX':
-        return [(a, b, False) for a, b in _cffex_day_segments(product)]
+        # CFFEX 无夜盘。
+        return [(a, b, False) for a, b in _cffex_day_close_guard_segments(product)]
 
-    day_segs = _commodity_day_segments(include_break)
+    day_segs = _commodity_day_close_guard_segments(include_break)
     night_end, cross = _night_end_minutes(product, exchange, overrides)
     night_start = 21 * 60
     if cross:
-        # Represent as (21:00, 02:30) with cross_midnight flag.
         return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, True)]
     return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, False)]
 
 
 def is_trading_time_at(symbol: str, now: Optional[datetime] = None, config: Optional[dict] = None) -> bool:
-    """Same semantics as ``auto_processor.is_trading_time`` but with explicit *now*.
-
-    Uses sub-minute precision so segment end (e.g. 15:00:00) aligns with
-    ``seconds_to_segment_end`` / ``get_session_phase`` — minute-only checks
-    would leave a dead zone where ``is_trading_time`` is true but phase is off.
-    """
+    """Same semantics as ``auto_processor.is_trading_time`` but with explicit *now*."""
     now = now or datetime.now()
     current_minutes = now.hour * 60 + now.minute
     if not _weekday_allows_trading(now, current_minutes):
         return False
 
     elapsed = _elapsed_minutes(now)
-    for start, end, cross in _segments_for_symbol(symbol, config):
+    for start, end, cross in _trading_segments_for_symbol(symbol, config):
         if cross:
             if elapsed >= start or elapsed <= end:
                 return True
@@ -134,7 +182,7 @@ def seconds_to_segment_end(
     now: Optional[datetime] = None,
     config: Optional[dict] = None,
 ) -> Optional[float]:
-    """Seconds until the current session segment ends; None if not in session."""
+    """Seconds until the close-guard segment ends; None if not in session."""
     now = now or datetime.now()
     if not is_trading_time_at(symbol, now, config):
         return None
@@ -142,7 +190,7 @@ def seconds_to_segment_end(
     elapsed_in_min = _elapsed_minutes(now)
 
     best: Optional[float] = None
-    for start, end, cross in _segments_for_symbol(symbol, config):
+    for start, end, cross in _close_guard_segments_for_symbol(symbol, config):
         in_seg = False
         if cross:
             in_seg = elapsed_in_min >= start or elapsed_in_min <= end
@@ -153,7 +201,6 @@ def seconds_to_segment_end(
 
         if cross:
             if elapsed_in_min >= start:
-                # Same evening: until 24:00 + minutes to end.
                 mins_left = (24 * 60 - elapsed_in_min) + end
             else:
                 mins_left = end - elapsed_in_min

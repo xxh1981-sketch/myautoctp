@@ -102,7 +102,7 @@ dual_strategy:
 #   enabled: true
 #   no_new_group_before_close_sec: 600
 #   hard_stop_before_close_sec: 60
-#   include_morning_break: false   # true 时 10:15 小休也视为小节结束
+#   include_morning_break: false   # true=商品在 10:15 也触发 T-10/T-1（默认不对小休生效）
 #   night_end_overrides:           # 可选，如 i/j/jm 夜盘 23:30
 #     i: "23:30"
 
@@ -150,6 +150,8 @@ log_noise:
     - 持仓追踪器超过
     - analyze_position_imbalance 计算结果
     - 不平衡检查:
+    # 宽跨平仓锁竞争：本轮放弃下轮重试的预期背压，节流高频重复
+    - 获取平仓锁超时
   downgrade:
     - substring: 当前状态禁止此项操作
       to_level: WARNING
@@ -159,11 +161,15 @@ log_noise:
       to_level: WARNING
     - substring: 订单不在pending且查询无结果
       to_level: WARNING
+    # 宽跨平仓未抢到互斥锁→中止本轮、下轮重试，单在途串行化的预期背压，非交易级故障
+    - substring: 获取平仓锁超时
+      to_level: WARNING
 loop_interval: 10
 round_slow_warn_sec: 60
 max_strangle_scan_sec: 600
 # 单品种扫描硬超时（秒）；0=不限制。防止单品种挂死阻塞整轮主循环。
-max_symbol_scan_sec: 120
+# 已废弃：单品种总时长限制（默认 0=不限制）。发单层 A/B_timeout 负责限次。
+max_symbol_scan_sec: 0
 health_offline_log_cooldown_sec: 60
 # housekeeping 磁盘空间预检：剩余低于阈值时飞书告警（冷却见 feishu_alert_cooldown_sec）
 disk_space_check_enabled: true
@@ -236,7 +242,7 @@ max_restart_attempts: 0
 max_restart_delay: 600
 
 strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设定
-  # false=对账不一致仅记录/告警，不 set ledger.open_halted；实盘慎用
+  # false=仅忽略对账不一致对宽跨新开的暂停；保证金/journal/CSV halt 仍同步；实盘慎用
   pause_open_on_reconcile_mismatch: true
   daily_buy_limit_yuan: 300000
   ledger_path: data/ledger_strangle.json
@@ -245,4 +251,23 @@ strangle:  # 以下数值为模板示例，实盘请按资金与风控自行设�
   # 未配对腿 metadata 异常时飞书告警（不改账本）
   unmatched_leg_metadata_alert: true
   unmatched_leg_metadata_alert_cooldown_sec: 1800
-  phase2_timeout: 15  # 便宜腿单笔等待（秒）；勿与价差 B_timeout 混用顶层 B_timeout
+  phase2_timeout: 60  # 便宜腿单笔等待（秒）；无 combo 阶段墙钟；勿与价差 B_timeout 混用
+  # ===== 平价溢价率信号（宽跨建仓/平仓；价差仍用环境 VIX，有意分裂勿合并）=====
+  # rate = C_atm/F 与 coef*sqrt(t)*sigma 比较：建仓 rate<entry、平仓 rate>exit
+  pr_entry_coef: 0.32
+  pr_exit_coef: 0.40
+  # HV 基准（sigma=min(HV1y,HV3y)）：收盘价库由用户手动定期更新，程序只读最新行；
+  # 不可算时回退 tradeinfo vol_basis
+  hv_close_path: tradeinfo/futures.xlsx
+  hv_sheet: Sheet2
+  hv_win1y: 242
+  hv_win3y: 726
+  hv_trim1y: [2, 1]   # [去最高, 去最低]
+  hv_trim3y: [5, 4]
+  hv_trading_days: 242
+  hv_ann_adj: 3       # 年化 sqrt(242-3)=sqrt(239)
+  # HV 收盘价库过期/缺失飞书提醒（纯可观测性，按文件 mtime；warn_days<=0 禁用）
+  hv_stale_alert_enabled: true
+  hv_stale_warn_days: 7
+  hv_stale_check_interval_sec: 21600
+  hv_stale_alert_cooldown_sec: 86400

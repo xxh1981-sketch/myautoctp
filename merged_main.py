@@ -161,9 +161,19 @@ def main():
         print(f"启动失败: {e}")
         sys.exit(1)
 
+    # 维护守卫永远 non-fatal（有意设计，见 unattended-audit-no-change），
+    # 但失败必须可见：静默失效会让运维以为维护模式仍在拦截自动发单/撤单。
     try:
-        from maintenance_mode import install_maintenance_guard
-        install_maintenance_guard(config)
+        from maintenance_mode import (
+            get_install_error as _maintenance_install_error,
+            install_maintenance_guard,
+        )
+        if not install_maintenance_guard(config):
+            logger.warning(
+                '[启动自检] 维护模式守卫未安装: %s'
+                '（维护模式将无法拦截自动发单/撤单；连接建立后会重试一次）',
+                _maintenance_install_error() or '未知原因',
+            )
     except Exception as e:
         logger.warning('[启动自检] 维护模式守卫安装异常: %s', e)
 
@@ -258,7 +268,7 @@ def main():
         reason = _whitelist_install_error() or '未知原因'
         msg = (
             f'发单月白名单守卫未安装：{reason}。'
-            '邻月错单将仅靠 autotrade 品种级检查；'
+            '邻月错单与期货禁发将仅靠 autotrade 品种级检查；'
             '建议检查 autotrade 版本与 sys.path 后再启动。'
         )
         logger.error('[启动自检] %s', msg)
@@ -439,10 +449,9 @@ def main():
                     logger=logger,
                 )
 
-            if (
-                conn._runtime_state.get('_margin_halt_open')
-                and str_cfg.get('pause_open_on_reconcile_mismatch', True)
-            ):
+            # 无条件同步（不受 pause_open_on_reconcile_mismatch 约束）：
+            # 该 flag 只忽略对账 halt（判断在函数内部），margin halt 必须写入宽跨 open gate。
+            if conn._runtime_state.get('_margin_halt_open'):
                 from merged_main_loop import _sync_strangle_open_halt
                 _sync_strangle_open_halt(conn, ledger, str_cfg)
 

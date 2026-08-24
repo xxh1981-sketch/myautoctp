@@ -205,6 +205,17 @@ class TestBuildAndInstall(unittest.TestCase):
         self.assertIsInstance(flt, LogNoiseFilter)
         self.assertIn('提升次近月为近月', flt._subs)
 
+    def test_default_close_lock_timeout_downgraded_and_throttled(self):
+        # 默认配置：宽跨"获取平仓锁超时"ERROR 应降为 WARNING，并在窗口内节流。
+        flt = build_filter_from_config({})
+        logger, cap = _make_logger('test.noise.close_lock', flt)
+
+        for _ in range(8):
+            logger.error('[宽跨] [m] 获取平仓锁超时，中止宽跨平仓')
+
+        self.assertEqual(len(cap.records), 1)
+        self.assertEqual(cap.records[0][0], 'WARNING')
+
     def test_build_string_substring_coerced_to_list(self):
         flt = build_filter_from_config(
             {'log_noise': {'throttle_substrings': '仅一个子串'}}

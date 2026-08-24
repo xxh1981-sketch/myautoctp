@@ -309,8 +309,11 @@ def should_skip_strangle_rebalance(
             if sym:
                 symbols.add(sym)
     for sym in symbols:
-        if get_session_phase(sym, config) == 't1':
+        phase = get_session_phase(sym, config)
+        if phase == 't1':
             return True, f'{sym} 处于 T-1'
+        if phase == 'off':
+            return True, f'{sym} 非交易时段'
     return False, ''
 
 
@@ -378,6 +381,7 @@ def _install_close_executor_guard() -> None:
             base_future_price: float = None,
             price_change_threshold: float = None,
             strategy: str = 'spread',
+            **kwargs,
         ):
             if should_block_send(conn, symbol, config):
                 _maybe_log_throttled(
@@ -391,10 +395,43 @@ def _install_close_executor_guard() -> None:
                 base_future_price=base_future_price,
                 price_change_threshold=price_change_threshold,
                 strategy=strategy,
+                **kwargs,
             )
 
         guarded_send_and_wait._session_close_wrapped = True  # type: ignore[attr-defined]
         ace._send_and_wait = guarded_send_and_wait
+
+    orig_close_leg = ace._close_single_leg
+    if not getattr(orig_close_leg, '_session_close_wrapped', False):
+
+        def guarded_close_single_leg(
+            conn, contract, direction, volume, price, min_tick, config, logger, symbol,
+            timeout_multiplier: float = 1.0, leg: str = '',
+            group_retry_count: int = 1,
+            base_future_price: float = None,
+            price_change_threshold: float = None,
+            strategy: str = 'spread',
+            **kwargs,
+        ):
+            if should_block_send(conn, symbol, config):
+                _maybe_log_throttled(
+                    conn, f'off_close_leg:{symbol.lower()}', logger, 'info',
+                    f'[收盘守卫] {symbol} 非交易/T-1，跳过单腿平仓: {contract}',
+                )
+                return False, 0, 0.0
+            return orig_close_leg(
+                conn, contract, direction, volume, price, min_tick, config, logger, symbol,
+                timeout_multiplier=timeout_multiplier,
+                leg=leg,
+                group_retry_count=group_retry_count,
+                base_future_price=base_future_price,
+                price_change_threshold=price_change_threshold,
+                strategy=strategy,
+                **kwargs,
+            )
+
+        guarded_close_single_leg._session_close_wrapped = True  # type: ignore[attr-defined]
+        ace._close_single_leg = guarded_close_single_leg
 
     orig_execute = ace.execute_close_orders_with_limit
     if getattr(orig_execute, '_session_close_wrapped', False):
@@ -539,6 +576,12 @@ def _install_strangle_guards() -> None:
             _maybe_log_throttled(
                 conn, f't1_strangle:{symbol.lower()}', logger, 'info',
                 f'[{symbol}] 收盘 T-1 硬停，跳过宽跨扫描',
+            )
+            return False
+        if not is_trading_time_at(symbol, config=config):
+            _maybe_log_throttled(
+                conn, f'off_strangle:{symbol.lower()}', logger, 'info',
+                f'[{symbol}] 非交易时段，跳过宽跨扫描',
             )
             return False
         return orig_ps(

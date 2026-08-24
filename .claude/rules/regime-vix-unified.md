@@ -2,9 +2,17 @@
 description: 双策略共用品种整体 VIX（价差算法），合约流动性/DTE/选约仍按 tradeinfo 月
 ---
 
-# 品种整体 VIX（价差/宽跨共用，有意设计）
+# 品种整体 VIX（有意设计）
 
 > 与 `.cursor/rules/regime-vix-unified.mdc` 同步；修改时请一并更新。
+
+> **更新（宽跨已改平价溢价率）**：宽跨建仓/平仓信号已从环境 VIX 改为
+> **平价溢价率**（`rate = C_atm/F` 与 `coef·sqrt(t)·sigma` 比较，`sigma=min(HV1y,HV3y)`，
+> 见 `autostraggle/strangle_hv.py` + `straggle_signals.py`，HV 数据 `tradeinfo/futures.xlsx`
+> 由用户手动维护）。本规则的「价差/宽跨共用 VIX」现**仅适用于价差**；宽跨不再读环境
+> VIX（`process_strangle_symbol` 仍接收 `round_vix_engine` 但忽略，签名兼容）。两策略信号源
+> **有意分裂**：价差=VIX、宽跨=平价溢价率（HV），勿建议「合回统一 VIX」。下文 VIX 段落
+> 仅对价差有效。
 
 ## 设计意图
 

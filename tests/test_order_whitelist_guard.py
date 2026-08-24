@@ -15,6 +15,8 @@ import ctp_bootstrap  # noqa: F401
 
 import order_whitelist_guard
 from order_whitelist_guard import (
+    _canonical_send_instrument,
+    _is_option_like,
     audit_target_months_coverage,
     install_send_order_month_guard,
 )
@@ -99,13 +101,60 @@ class TestOrderWhitelistGuard(unittest.TestCase):
         ref, _ = mgr.send_order('SA2608', '0', 1, 1.0)
         self.assertIsNone(ref)
         self.assertEqual(self._delegated_calls, [])
-        self.assertTrue(any('非期权' in e for e in mgr.logger.errors))
+        self.assertTrue(any('非期权' in e or '期货' in e for e in mgr.logger.errors))
+
+    def test_rejects_cp_product_futures(self):
+        """品种代码本身是 C/P 的期货不得因启发式误放行。"""
+        cases = [
+            ('p', '2705', 'P2705'),
+            ('p', '2701', 'P2701'),
+            ('c', '2701', 'C2701'),
+            ('c', '2701', 'c2701'),
+        ]
+        for sym, month, fut in cases:
+            with self.subTest(fut=fut):
+                self._delegated_calls.clear()
+                conn = FakeConn([sym], {sym: [month]})
+                mgr = self._make_mgr(conn)
+                ref, _ = mgr.send_order(fut, '0', 1, 1.0)
+                self.assertIsNone(ref)
+                self.assertEqual(self._delegated_calls, [])
+                self.assertTrue(
+                    any('非期权' in e or '期货' in e for e in mgr.logger.errors),
+                    mgr.logger.errors,
+                )
+
+    def test_accepts_cp_product_options(self):
+        """C/P 品种的真实期权仍可发单；大商所前缀按交易所规则改小写。"""
+        conn = FakeConn(['c', 'p'], {'c': ['2701'], 'p': ['2701']})
+        mgr = self._make_mgr(conn)
+        cases = (
+            ('C2701-C-2340', 'c2701-C-2340'),
+            ('C2701-P-2140', 'c2701-P-2140'),
+            ('P2701-C-8800', 'p2701-C-8800'),
+            ('p2701-P-7800', 'p2701-P-7800'),
+        )
+        for opt, wire in cases:
+            with self.subTest(opt=opt):
+                self._delegated_calls.clear()
+                ref, _ = mgr.send_order(opt, '0', 1, 1.0)
+                self.assertEqual(ref, 999)
+                self.assertEqual(self._delegated_calls, [wire])
+
+    def test_remaps_dce_case_to_quotes_key(self):
+        """CSV 大写 C2701-C-2340 须按行情键改成大商所小写再发单。"""
+        conn = FakeConn(['c'], {'c': ['2701']})
+        conn.quotes = {'c2701-C-2340': object()}
+        mgr = self._make_mgr(conn)
+        ref, _ = mgr.send_order('C2701-C-2340', '0', 1, 27.5)
+        self.assertEqual(ref, 999)
+        self.assertEqual(self._delegated_calls, ['c2701-C-2340'])
 
     def test_rejects_unparsable_month(self):
         """合约月份无法解析（前缀后无数字段）→ 拒绝。"""
         conn = FakeConn(['abc'], {'abc': ['2608']})
         mgr = self._make_mgr(conn)
-        # 'ABC-CALL' 通过 option_like 但无 ^[a-z]+\d{3,4} 月份段。
+        # 有 -[CP]- 行权价段，但无 ^[a-z]+\d{3,4} 月份段。
         ref, _ = mgr.send_order('ABC-C-2400', '0', 1, 1.0)
         self.assertIsNone(ref)
         self.assertEqual(self._delegated_calls, [])
@@ -267,6 +316,48 @@ class TestInstallFailureSignals(unittest.TestCase):
         err = order_whitelist_guard.get_install_error()
         self.assertIsNotNone(err)
         self.assertIn('OrderManager', err)
+
+
+class TestCanonicalSendInstrument(unittest.TestCase):
+    def test_quotes_key_wins(self):
+        conn = FakeConn(['c'], {'c': ['2701']})
+        conn.quotes = {'c2701-C-2340': object()}
+        self.assertEqual(
+            _canonical_send_instrument(conn, 'C2701-C-2340'),
+            'c2701-C-2340',
+        )
+
+    def test_option_info_fallback(self):
+        conn = FakeConn(['si'], {'si': ['2611']})
+        conn.option_info = {'si': {'si2611-C-9400': {'product_class': '2'}}}
+        self.assertEqual(
+            _canonical_send_instrument(conn, 'SI2611-C-9400'),
+            'si2611-C-9400',
+        )
+
+    def test_heuristic_when_no_index(self):
+        conn = FakeConn(['c'], {'c': ['2701']})
+        self.assertEqual(
+            _canonical_send_instrument(conn, 'C2701-C-2340'),
+            'c2701-C-2340',
+        )
+
+
+class TestIsOptionLike(unittest.TestCase):
+    def test_futures_rejected(self):
+        for fut in ('SA2608', 'P2705', 'C2701', 'c2701', 'm2701', 'IF2606', 'ag2606'):
+            self.assertFalse(_is_option_like(fut), fut)
+
+    def test_options_accepted(self):
+        for opt in (
+            'SA2608C2400', 'IO2604-C-4000', 'C2701-C-2340', 'C2701-P-2140',
+            'P2705-C-8800', 'm2701-P-2900', 'c2701-MS-C-2320', 'RM509-C-9000',
+        ):
+            self.assertTrue(_is_option_like(opt), opt)
+
+    def test_empty_rejected(self):
+        self.assertFalse(_is_option_like(''))
+        self.assertFalse(_is_option_like(None))
 
 
 if __name__ == '__main__':

@@ -71,10 +71,13 @@ def _prefetch_round_data(conn, logger) -> tuple:
     runtime = getattr(conn, '_runtime_state', None) or {}
     positions_err = ''
     try:
-        positions = conn.query_positions_sync(timeout=10) or []
-        runtime['_health_last_ctp_positions_ok'] = True
+        positions = conn.query_positions_sync(timeout=10)
+        # None = 查询失败：保持 None 让 reconcile 自行重查，勿降级成空列表
+        # （空列表会被当作「CTP 无仓」，引发假不一致 halt 与错误健康状态）。
+        ok = positions is not None
+        runtime['_health_last_ctp_positions_ok'] = ok
         runtime['_health_last_ctp_positions_ts'] = time.time()
-        runtime['_health_last_ctp_positions_err'] = ''
+        runtime['_health_last_ctp_positions_err'] = '' if ok else '查询返回 None'
     except Exception as e:
         positions_err = str(e)
         runtime['_health_last_ctp_positions_ok'] = False
@@ -134,8 +137,9 @@ def _run_reconcile(
 
     runtime['_strangle_reconcile_halt'] = halt
     runtime['_strangle_reconcile_issues'] = issues
-    if str_cfg.get('pause_open_on_reconcile_mismatch', True):
-        _sync_strangle_open_halt(conn, ledger, str_cfg)
+    # 无条件同步：pause_open_on_reconcile_mismatch=false 的判断在函数内部，
+    # 它只忽略对账 halt，margin / journal / CSV halt 仍须同轮写入宽跨 open gate。
+    _sync_strangle_open_halt(conn, ledger, str_cfg)
 
     spread_halt = False
     spread_issues: list = []
@@ -176,16 +180,21 @@ def _run_reconcile(
 
 def _sync_strangle_open_halt(conn, ledger, str_cfg: dict) -> None:
     """
-    Set strangle ledger.open_halted from the union of reconcile halt and
-    margin halt, with a precedence-aware reason.
+    Set strangle ledger.open_halted from the union of reconcile / margin /
+    journal / position-CSV halt, with a precedence-aware reason.
 
-    Reason precedence: reconcile_issues > margin_reason.
+    ``pause_open_on_reconcile_mismatch=false`` only ignores *reconcile* halt;
+    margin / journal / CSV halt still sync (勿整段 return 导致其它风控失效)。
+
+    Reason precedence: reconcile_issues > journal > position_csv > margin.
     Idempotent: only writes when state actually changes.
     """
-    if not str_cfg.get('pause_open_on_reconcile_mismatch', True):
-        return
     runtime = conn._runtime_state
-    recon_halt = bool(runtime.get('_strangle_reconcile_halt', False))
+    pause_recon = str_cfg.get('pause_open_on_reconcile_mismatch', True)
+    recon_halt = (
+        bool(runtime.get('_strangle_reconcile_halt', False))
+        if pause_recon else False
+    )
     recon_issues = list(runtime.get('_strangle_reconcile_issues') or [])
     margin_halt = bool(runtime.get('_margin_halt_open', False))
     margin_reason = runtime.get('_margin_halt_reason') or '保证金超限，暂停新开'
@@ -376,6 +385,14 @@ def run_merged_main_loop(
 
     circuit_breaker = CircuitBreaker(conn, config, logger)
     conn._runtime_state['_circuit_breaker'] = circuit_breaker
+
+    def _benign_over_close_hook(sym, instrument, _msg):
+        from spread_position_sync import handle_benign_over_close_reject_dual
+        handle_benign_over_close_reject_dual(
+            conn, ledger, sym, instrument, config, logger, strangle_logger,
+        )
+
+    conn._runtime_state['_benign_over_close_hook'] = _benign_over_close_hook
     str_executor = StrangleExecutor(conn, config, strangle_logger, ledger)
     tradeinfo_by_key = {
         (it['future'].lower(), it['month']): it for it in strangle_tradeinfo
@@ -422,8 +439,6 @@ def run_merged_main_loop(
     _slow_round_alert_cooldown = float(config.get('slow_round_alert_cooldown_sec', 300) or 0)
     _last_slow_round_alert_time = 0.0
     _max_strangle_scan_sec = float(config.get('max_strangle_scan_sec', 0) or 0)
-    # 单品种扫描超时（秒）；0=不限制。与 max_strangle_scan_sec 整轮预算互补。
-    _max_symbol_scan_sec = float(config.get('max_symbol_scan_sec', 120) or 0)
     _health_offline_log_cooldown = float(
         config.get('health_offline_log_cooldown_sec', 60) or 0,
     )
@@ -474,6 +489,11 @@ def run_merged_main_loop(
                 except Exception as e:
                     logger.debug(f'[配置] drift 检查异常: {e}')
                 try:
+                    from unattended_observability import maybe_alert_hv_staleness
+                    maybe_alert_hv_staleness(conn, config, logger)
+                except Exception as e:
+                    logger.debug(f'[宽跨HV] 过期检查异常: {e}')
+                try:
                     from maintenance_mode import maybe_notify_maintenance_enabled
                     maybe_notify_maintenance_enabled(conn, config, logger)
                 except Exception as e:
@@ -491,13 +511,22 @@ def run_merged_main_loop(
                     else:
                         maybe_check_position_csv_integrity(conn, config, logger)
                 except Exception as e:
-                    logger.debug(f'[CSV完整性] 检查异常: {e}')
-                else:
-                    try:
-                        if str_cfg.get('pause_open_on_reconcile_mismatch', True):
-                            _sync_strangle_open_halt(conn, ledger, str_cfg)
-                    except Exception as e:
-                        logger.debug(f'[CSV完整性] 同步宽跨 open_halt 异常: {e}')
+                    # 与 journal 检查一致（fail-closed）：校验器本身异常 = 无法
+                    # 证明 CSV 完整，保守禁新开（平仓不受影响），勿 debug 后放行。
+                    if bool(config.get('position_csv_integrity_enabled', True)):
+                        logger.warning(f'[CSV完整性] 检查异常，保守暂停新开: {e}')
+                        conn._runtime_state['_position_csv_halt_open'] = True
+                        conn._runtime_state['_position_csv_halt_reason'] = (
+                            f'CSV完整性检查异常: {e}'
+                        )
+                    else:
+                        logger.debug(f'[CSV完整性] 检查异常（已禁用，忽略）: {e}')
+                try:
+                    # flag 判断在函数内部（只忽略对账 halt），此处无条件同步；
+                    # 检查异常分支设置的 halt 也须同轮写入宽跨 open gate。
+                    _sync_strangle_open_halt(conn, ledger, str_cfg)
+                except Exception as e:
+                    logger.debug(f'[CSV完整性] 同步宽跨 open_halt 异常: {e}')
                 sync_connection_suspend_state(conn, config, logger)
                 if check_scheduled_full_recovery(conn, config, logger):
                     time.sleep(loop_interval)
@@ -763,8 +792,9 @@ def run_merged_main_loop(
                     # journal 状态变更后立即同步宽跨 open_halt，与价差侧
                     # spread_open_ok 同轮对齐，避免等 reconcile/margin 复检才
                     # set_open_halt（最多 reconcile_interval 的窗口）。
-                    if str_cfg.get('pause_open_on_reconcile_mismatch', True):
-                        _sync_strangle_open_halt(conn, ledger, str_cfg)
+                    # 无条件调用：pause_open_on_reconcile_mismatch 只忽略对账 halt，
+                    # journal halt 必须同轮写入宽跨 open gate（判断在函数内部）。
+                    _sync_strangle_open_halt(conn, ledger, str_cfg)
                 _update_bool_metric(
                     conn._runtime_state, 'journal_halt',
                     bool(conn._runtime_state.get('_journal_halt_open', False)),
@@ -902,12 +932,12 @@ def run_merged_main_loop(
                         conn._runtime_state.get('_journal_spread_warn_reason') or '',
                     )
                     if j_reason and j_reason != last_warn_reason:
-                        # 注意文案与实际行为一致：journal halt 走 spread_open_ok=False
-                        # → remaining_limit=0 仅禁新开组；autotrade 的 stage1 再平衡
-                        # （补B/补A）不在此门闸内（补A为减风险动作，不应被阻断）。
+                        # journal halt → spread_open_ok=False → remaining_limit=0 禁新开组；
+                        # stage1：补A / 平A 仍允许（减风险收敛），补B 由 auto_processor
+                        # 按 journal/CSV/保证金 halt 禁止（账本可疑时不得增空头风险）。
                         spread_logger.warning(
                             'journal存在未完成入账，暂停价差新开'
-                            '（平仓与既有组再平衡不受影响）: '
+                            '（平仓与减风险再平衡不受影响；禁补B）: '
                             + j_reason
                         )
                         conn._runtime_state['_journal_spread_warn_reason'] = j_reason
@@ -924,7 +954,8 @@ def run_merged_main_loop(
                     )
                     if pc_reason and pc_reason != last_pc_warn:
                         spread_logger.warning(
-                            '持仓 CSV 损坏，暂停价差新开（平仓不受影响）: '
+                            '持仓 CSV 损坏，暂停价差新开'
+                            '（平仓与减风险再平衡不受影响；禁补B）: '
                             + pc_reason,
                         )
                         conn._runtime_state['_position_csv_spread_warn_reason'] = pc_reason
@@ -1004,24 +1035,16 @@ def run_merged_main_loop(
                                 if spread_open_ok else 0
                             )
                             from spread_open_preflight import process_spread_symbol
-                            from symbol_scan_timeout import run_symbol_scan_with_timeout
 
                             for item in spread_tradeinfo:
                                 sym = item.get('future', '?')
                                 try:
-                                    acted, timed_out = run_symbol_scan_with_timeout(
-                                        lambda item=item: process_spread_symbol(
-                                            conn, item, round_vix_engine, config,
-                                            s_logger,
-                                            remaining_limit=spread_rem,
-                                            spread_open_ok=spread_open_ok,
-                                        ),
-                                        _max_symbol_scan_sec,
-                                        sym,
+                                    acted = process_spread_symbol(
+                                        conn, item, round_vix_engine, config,
                                         s_logger,
+                                        remaining_limit=spread_rem,
+                                        spread_open_ok=spread_open_ok,
                                     )
-                                    if timed_out:
-                                        continue
                                     if acted:
                                         if not spread_open_ok:
                                             continue
@@ -1070,23 +1093,13 @@ def run_merged_main_loop(
                                             f'剩余 {remaining} 个品种下轮继续'
                                         )
                                     break
-                                from symbol_scan_timeout import (
-                                    run_symbol_scan_with_timeout,
-                                )
                                 sym = item.get('future', '?')
                                 try:
-                                    acted, timed_out = run_symbol_scan_with_timeout(
-                                        lambda item=item: process_strangle_symbol(
-                                            conn, item, round_vix_engine, config,
-                                            s_logger,
-                                            ledger, str_executor, circuit_breaker,
-                                        ),
-                                        _max_symbol_scan_sec,
-                                        sym,
+                                    acted = process_strangle_symbol(
+                                        conn, item, round_vix_engine, config,
                                         s_logger,
+                                        ledger, str_executor, circuit_breaker,
                                     )
-                                    if timed_out:
-                                        continue
                                     if acted:
                                         strangle_acted += 1
                                 except Exception as e:
@@ -1101,11 +1114,22 @@ def run_merged_main_loop(
                 with strategy_logging(conn, logger, 'strangle') as s_logger:
                     if unmatched:
                         s_logger.info(f"再平衡：{len(unmatched)} 条未配对腿")
-                    from session_close_guard import should_skip_strangle_rebalance
-                    skip_rebal, skip_rebal_reason = should_skip_strangle_rebalance(
-                        conn, config, ledger, strangle_tradeinfo,
-                    )
-                    if skip_rebal:
+                    # 飞书暂停 = 零自动动作：扫描中途暂停后仍可能到达此处，
+                    # 不得跑 run_rebalance / close-only 再平衡（含 close_chp）。
+                    if is_trading_paused():
+                        s_logger.info(
+                            '[飞书暂停] 跳过宽跨再平衡（零自动动作）'
+                        )
+                        skip_rebal = True
+                        skip_rebal_reason = '飞书暂停'
+                    else:
+                        from session_close_guard import should_skip_strangle_rebalance
+                        skip_rebal, skip_rebal_reason = (
+                            should_skip_strangle_rebalance(
+                                conn, config, ledger, strangle_tradeinfo,
+                            )
+                        )
+                    if skip_rebal and skip_rebal_reason != '飞书暂停':
                         s_logger.info(
                             f'收盘守卫：{skip_rebal_reason}，跳过宽跨再平衡'
                         )
@@ -1120,6 +1144,7 @@ def run_merged_main_loop(
                     #   - 日买入达限：编排层与 snapshot 语义对齐；autostraggle 侧未必
                     #     读 daily_buy_limit，此处禁开仓类再平衡、仍处理 close_chp_pending。
                     # close_chp_pending 必须继续跑，否则残留单腿 = 裸期权。
+                    # 例外：飞书暂停时上面已 skip_rebal，连 close_chp 也不跑。
                     strangle_reconcile_halt = bool(
                         conn._runtime_state.get('_strangle_reconcile_halt', False)
                     )
@@ -1142,7 +1167,7 @@ def run_merged_main_loop(
                         pass
                     else:
                         from strangle_rebalance_close_only import (
-                            CLOSE_KINDS,
+                            is_close_unmatched_item,
                             run_close_only_rebalance,
                         )
                         halt_reasons = []
@@ -1152,12 +1177,14 @@ def run_merged_main_loop(
                             halt_reasons.append('对账 halt')
                         if journal_halt_open:
                             halt_reasons.append('journal未完成入账')
+                        if position_csv_halt_open:
+                            halt_reasons.append('持仓CSV损坏')
                         if not strangle_open_ok:
                             halt_reasons.append('日买入达限')
                         halt_reason = '+'.join(halt_reasons)
                         close_pending = sum(
                             1 for it in unmatched
-                            if it.get('kind') in CLOSE_KINDS
+                            if is_close_unmatched_item(it)
                         )
                         if close_pending:
                             s_logger.info(

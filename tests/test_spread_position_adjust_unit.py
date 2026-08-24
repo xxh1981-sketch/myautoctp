@@ -53,6 +53,21 @@ class TestMergeStrangleOwnedVolumes(unittest.TestCase):
         self.assertEqual(vols['RM609C2750'], 29)
         self.assertNotIn('RM609P2025', vols)
 
+    def test_inferred_single_from_claims_not_double_counted(self):
+        """inferred_single 来自 leg_claims 推断时，不得与 CSV 重复计入。"""
+        ledger = FakeLedger(
+            claims={'MA609P1900': 42, 'MA609C3650': 35},
+            unmatched=[{
+                'kind': 'inferred_single',
+                'leg': {'inst': 'MA609P1900', 'label': 'put'},
+                'volume': 7,
+                'inferred_from_claims': True,
+            }],
+        )
+        vols = merge_strangle_owned_volumes(ledger)
+        self.assertEqual(vols['MA609P1900'], 42)
+        self.assertEqual(vols['MA609C3650'], 35)
+
     def test_none_ledger_empty(self):
         self.assertEqual(merge_strangle_owned_volumes(None), {})
 

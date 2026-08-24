@@ -25,6 +25,17 @@ def normalize_inst_map(claims: Dict[str, int]) -> Dict[str, int]:
     return out
 
 
+def normalize_trade_symbols(trade_symbols) -> Set[str]:
+    """品种过滤集统一小写（与 ``extract_symbol_prefix`` 口径一致）。"""
+    if not trade_symbols:
+        return set()
+    return {
+        str(s).strip().lower()
+        for s in trade_symbols
+        if str(s).strip()
+    }
+
+
 def get_acknowledged_external(config: dict) -> Dict[str, int]:
     if not config.get('_external_positions_acknowledged'):
         return {}

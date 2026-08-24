@@ -52,6 +52,14 @@ class TestBuildSpreadClosePositions(unittest.TestCase):
         self.assertNotIn('SA609P2400', by_inst)
         self.assertNotIn('MA609C2400', by_inst)
 
+    def test_dce_claims_rewritten_to_wire_case(self):
+        store = SpreadLegStore()
+        store.set_leg_claims({'C2701-C-2340': 1, 'C2701-P-2140': 1})
+        conn = FakeConn('c', '2701')
+        pos = build_positions_from_spread_claims(store, conn, 'c', '2701')
+        self.assertEqual(len(pos), 1)
+        self.assertEqual(pos[0]['instrument'], 'c2701-C-2340')
+
     def test_count_ab_from_store(self):
         a, b = count_spread_ab_from_store(self.store, self.conn, 'SA', '609')
         self.assertEqual(a, 2)
@@ -79,6 +87,46 @@ class TestProcessCloseFromLedger(unittest.TestCase):
             )
         self.assertFalse(result)
         mock_check.assert_not_called()
+
+    @patch('spread_close_ledger.converge_flat_spread_claims', return_value=2)
+    def test_converged_flat_returns_true_for_cooldown(self, _converge):
+        """假 flat 清认领后须 return True，让 process_symbol 写冷却。"""
+        conn = FakeConn()
+        store = SpreadLegStore()
+        store.set_leg_claims({})  # converge already cleared
+        conn._runtime_state['_spread_leg_store'] = store
+        item = {'future': 'SA', 'month': '609', 'vol_basis': 0.2, 'min_tick': 0.5}
+        logger = MagicMock()
+        with patch(
+            'auto_closer_conditions.check_close_conditions_with_urgency',
+        ) as mock_check:
+            result = process_close_from_spread_ledger(
+                conn, item, 5.0, {}, logger,
+            )
+        self.assertTrue(result)
+        mock_check.assert_not_called()
+
+    @patch('spread_close_ledger.converge_flat_spread_claims')
+    @patch('spread_close_ledger.spread_ctp_has_residual', return_value=False)
+    @patch('auto_closer_conditions.check_close_conditions_with_urgency', return_value=('normal', 'VIX low'))
+    @patch('auto_closer_plan.calculate_close_plan_VIX_case', return_value=[{'A_contract': 'A'}])
+    def test_skips_send_when_ctp_flat_after_plan(
+        self, mock_plan, mock_cond, _ctp_flat, _converge_start,
+    ):
+        conn = FakeConn()
+        store = SpreadLegStore()
+        store.set_leg_claims({'SA609C2400': 1, 'SA609C2500': -1})
+        conn._runtime_state['_spread_leg_store'] = store
+        item = {'future': 'SA', 'month': '609', 'vol_basis': 0.2, 'min_tick': 0.5}
+        logger = MagicMock()
+        with patch('auto_closer_executor.execute_close_orders_with_limit') as mock_exec:
+            result = process_close_from_spread_ledger(
+                conn, item, 3.0, {'VIX_EXIT_MULTIPLIER': 1.0}, logger,
+            )
+        # CTP 空仓跳过发单仍视同平仓完成，须触发冷却（return True）
+        self.assertTrue(result)
+        mock_exec.assert_not_called()
+        _converge_start.assert_called()
 
     @patch('auto_closer_executor.execute_close_orders_with_limit', return_value=(True, 2))
     @patch('auto_closer_plan.calculate_close_plan_VIX_case', return_value=[{'A_contract': 'A'}])

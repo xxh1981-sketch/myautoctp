@@ -164,6 +164,21 @@ class TestApplyFillToCsv(unittest.TestCase):
             self.assertNotIn('SA609C1000', claims)
             self.assertEqual(load_positions_csv(path), {})
 
+    def test_read_claim_volume_case_insensitive(self):
+        from import_strangle_positions import read_claim_volume
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'pos.csv')
+            cfg = {'dual_strategy': {'strangle_positions_csv': path}}
+            save_positions_csv(path, {'c2701-C-2340': 1})
+            self.assertEqual(load_positions_csv(path), {'C2701-C-2340': 1})
+            self.assertEqual(read_claim_volume(cfg, 'C2701-C-2340'), 1)
+            self.assertEqual(read_claim_volume(cfg, 'c2701-C-2340'), 1)
+            claims = apply_fill_to_csv(
+                cfg, 'c2701-C-2340', DIRECTION_BUY, OFFSET_OPEN, 1, None,
+            )
+            self.assertEqual(claims['C2701-C-2340'], 2)
+
     def test_zero_delta_leaves_csv_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'pos.csv')

@@ -16,9 +16,10 @@ description: 无人值守审核结论——有意设计/已知取舍，勿当缺
 
 ## 启动 guard 补丁
 
-- 原子保存 / 月白名单 / CTP 三补丁：共享 `fail_fast_on_guard_install`（不拆 per-patch 开关）。
+- 原子保存 / 月白名单 / CTP 三补丁 / **收盘守卫（session_close_guard）**：共享 `fail_fast_on_guard_install`（不拆 per-patch 开关）。
 - **周末抑制补丁**安装失败仅 warning（非致命，退回周末照常重连的噪音行为）。
-- 勿建议把周末补丁改成 fail-fast，或拆成多个 fail-fast 开关（除非用户主动要）。
+- **维护模式守卫**：永远 non-fatal，但失败须可见（调用方检查返回值 + warning，`get_install_error()` 给原因）；勿改成 fail-fast。
+- 勿建议把周末/维护补丁改成 fail-fast，或拆成多个 fail-fast 开关（除非用户主动要）。
 
 ## 数据写入取舍
 

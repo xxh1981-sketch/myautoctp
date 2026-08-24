@@ -46,6 +46,9 @@ def _make_conn():
         'margin_recheck_interval_sec': 0,
         'scheduled_full_recovery_enabled': False,
         'scheduled_session_pause_enabled': False,
+        # 隔离真实时钟：收盘守卫按当前时间判 T-1/off，会让 close-only 再平衡
+        # 断言在非交易时段跑挂（守卫行为有 test_session_close_guard.py 专测）。
+        'session_close_guard': {'enabled': False},
     }
     conn.get_filled_open_order_count = MagicMock(return_value=5)
     conn.cancel_all_pending_orders = MagicMock(return_value=0)
@@ -723,6 +726,87 @@ class TestFeishuPauseZeroAction(unittest.TestCase):
 
         mock_close_only.assert_not_called()
 
+    @patch('strangle_rebalance_close_only.run_close_only_rebalance', return_value=1)
+    @patch('straggle_processor.process_strangle_symbol', return_value=False)
+    @patch('auto_processor.process_symbol', return_value=False)
+    @patch('margin_check.check_margin_status', return_value=('ok', ''))
+    @patch('auto_feishu_command.stop_command_receiver')
+    @patch('auto_feishu_command.start_command_receiver')
+    @patch('auto_scheduled_pause.sync_connection_suspend_state')
+    @patch('auto_circuit_breaker.CircuitBreaker')
+    @patch('straggle_execution.StrangleExecutor')
+    @patch('auto_health_check.HealthChecker')
+    def test_mid_round_pause_skips_strangle_rebalance(
+        self,
+        mock_hc,
+        mock_exec,
+        mock_cb,
+        mock_sync,
+        mock_start,
+        mock_stop,
+        mock_margin,
+        mock_spread_process,
+        mock_strangle_process,
+        mock_close_only,
+    ):
+        """轮首未暂停、扫描后暂停：不得跑全量/close-only 再平衡。"""
+        conn = _make_conn()
+        conn.get_filled_open_order_count = MagicMock(return_value=0)
+        logger = FakeLogger()
+        mock_hc.return_value.check_now.return_value = {'healthy': True}
+        ledger = MagicMock()
+        ledger.get_daily_buy_amount.return_value = 0
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'sa', 'month': '2608', 'kind': 'close_chp_pending'},
+        ]
+        ledger.is_open_halted.return_value = False
+        ledger.get_open_halt_reason.return_value = ''
+        executor_inst = mock_exec.return_value
+
+        # 第 1 次：轮首 _skip_round_on_feishu_pause → False（进入本轮）
+        # 之后：策略 for / 再平衡前 → True（零动作）
+        pause_n = {'n': 0}
+
+        def _paused():
+            pause_n['n'] += 1
+            return pause_n['n'] > 1
+
+        from merged_main_loop import run_merged_main_loop
+        with patch('auto_feishu_command.is_trading_paused', side_effect=_paused), \
+             patch(
+                 'merged_main_loop._run_reconcile',
+                 return_value=(False, [], False, []),
+             ), patch(
+                 'spread_fill_sync.count_spread_filled_open_orders', return_value=0,
+             ), patch('time.sleep', side_effect=KeyboardInterrupt), \
+             patch('runtime_risk_alerts.notify_feishu_pause_exposure'):
+            run_merged_main_loop(
+                conn=conn,
+                spread_tradeinfo=[],
+                strangle_tradeinfo=[],
+                combined_tradeinfo=[],
+                vix_engine=MagicMock(),
+                config={
+                    **conn.config,
+                    'shutdown_cancel_passes': 1,
+                    'shutdown_cancel_pass_pause_sec': 0,
+                    'dual_strategy': {
+                        'reconcile_interval_sec': 0,
+                        'journal_daily_shards': False,
+                    },
+                },
+                logger=logger,
+                ledger=ledger,
+            )
+
+        executor_inst.run_rebalance.assert_not_called()
+        mock_close_only.assert_not_called()
+        pause_logs = [
+            m for _, m in logger.messages
+            if '飞书暂停' in str(m) and '再平衡' in str(m)
+        ]
+        self.assertTrue(pause_logs, f'expected pause rebalance skip log, got {logger.messages}')
+
     @patch('margin_check.check_margin_status', return_value=('unknown', '查询失败'))
     @patch('auto_processor.process_symbol', return_value=False)
     @patch('auto_feishu_command.stop_command_receiver')
@@ -844,14 +928,33 @@ class TestSyncStrangleOpenHalt(unittest.TestCase):
         ledger.set_open_halt.side_effect = _set
         return ledger, state
 
-    def test_disabled_pause_is_noop(self):
+    def test_pause_false_ignores_reconcile_only(self):
+        """pause_open_on_reconcile_mismatch=false 只忽略对账 halt，不整段 noop。"""
         from merged_main_loop import _sync_strangle_open_halt
         conn = _make_conn()
+        conn._runtime_state['_strangle_reconcile_halt'] = True
+        conn._runtime_state['_strangle_reconcile_issues'] = ['gap']
         ledger, state = self._fake_ledger()
         _sync_strangle_open_halt(
             conn, ledger, {'pause_open_on_reconcile_mismatch': False},
         )
-        ledger.set_open_halt.assert_not_called()
+        # 无 margin/journal/csv → 目标为未 halt；若本就 false 则可不写
+        self.assertFalse(state['halted'])
+
+    def test_pause_false_still_syncs_margin_halt(self):
+        from merged_main_loop import _sync_strangle_open_halt
+        conn = _make_conn()
+        conn._runtime_state['_strangle_reconcile_halt'] = True
+        conn._runtime_state['_strangle_reconcile_issues'] = ['gap']
+        conn._runtime_state['_margin_halt_open'] = True
+        conn._runtime_state['_margin_halt_reason'] = '保证金超限 (限额 1000)'
+        ledger, state = self._fake_ledger()
+        _sync_strangle_open_halt(
+            conn, ledger, {'pause_open_on_reconcile_mismatch': False},
+        )
+        self.assertTrue(state['halted'])
+        self.assertIn('保证金', state['reason'])
+        self.assertNotIn('gap', state['reason'])
 
     def test_margin_halt_sets_ledger_with_reason(self):
         from merged_main_loop import _sync_strangle_open_halt

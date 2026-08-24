@@ -66,3 +66,7 @@ description: AutoCTP 双策略 halt 语义、持仓认领与主循环设计约�
 - **同一 strike 的 Call 两边都可能持**：宽跨 long + 价差 short（B 腿）或多头手数分摊，在对账公式下可自洽（宽跨侧扣 spread 多头 Call；价差侧 signed 比对）。
 - **严格按程序运行、无人工 CSV 记账错误、无程序外改同一合约持仓时，仓位逻辑独立做得到**；对账 halt 是 CSV 与 CTP 不一致时的安全网，不是「同月双策略不可行」的证据。
 - **勿将**「同覆盖品种」banner warning **误解为必须修复的配置错误**；它仅提醒 OrderRef + CSV 纪律，不是禁止同月。
+
+## 主循环不变量与审查清单
+
+完整 halt 路由、组合原子性、Review 问句见 **`docs/INVARIANTS_REVIEW_CHECKLIST.md`**。本节保留 halt 语义详述；改主循环时用该清单逐项 review。

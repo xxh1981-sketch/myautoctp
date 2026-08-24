@@ -127,6 +127,12 @@ def _strangle_long_calls_for_spread(conn) -> Dict[str, int]:
         for item in ledger.list_unmatched_legs():
             if item.get('kind') == 'awaiting_phase2':
                 continue
+            # 与 merge_strangle_owned_volumes 对齐：推断队列腿已在 leg_claims 中，
+            # 再累加会双重计数，可能掩盖价差 CTP-ahead halt。
+            if item.get('inferred_from_claims') or item.get('kind') in (
+                'inferred_single', 'inferred_complete',
+            ):
+                continue
             inst = (
                 item.get('filled_instrument')
                 or (item.get('leg') or {}).get('inst')
@@ -282,10 +288,16 @@ def reconcile_spread_positions(
                 logger.warning(f'[spread-reconcile] CSV sync failed: {e}')
 
     if positions is None:
+        query_err = ''
         try:
-            positions = conn.query_positions_sync(timeout=10) or []
+            positions = conn.query_positions_sync(timeout=10)
         except Exception as e:
-            issues.append(f'position query failed: {e}')
+            positions = None
+            query_err = str(e)
+        if positions is None:
+            # 与宽跨侧一致：查询失败不可当作「CTP 无仓」，否则与认领比对
+            # 必然不一致并触发假性 halt。
+            issues.append(f'position query failed: {query_err or "返回 None"}')
             prev_halt, prev_issues = _previous_halt_state(conn)
             return handle_transient_reconcile_failure(
                 conn, prev_halt, issues, prev_issues, config,

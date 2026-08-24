@@ -258,11 +258,15 @@ def _run_invalidate_ack(config: dict, logger) -> list:
 def _format_stale_ack_warning(reasons: list) -> str:
     if not reasons:
         return ''
-    lines = ['⚠ 【旧确认已失配】检测到上次确认后账本被修改：']
+    lines = [
+        '⚠ 【旧确认已失配】检测到上次确认后账本持仓真相已变化：',
+        '  （程序成交/对账会自动更新 ledger_strangle.json，属正常；'
+        '若上方摘要已与 CTP 一致，点 yes 重新确认即可。）',
+    ]
     for msg in list(reasons)[:10]:
         lines.append(f'  • {msg}')
     lines.append(
-        '建议点「' + _INVALIDATE_LABEL + '」清除旧确认后重新核对，再确认启动。'
+        '也可点「' + _INVALIDATE_LABEL + '」清除旧确认后重新核对。'
     )
     return '\n'.join(lines)
 

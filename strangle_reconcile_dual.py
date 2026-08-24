@@ -84,6 +84,9 @@ def resolve_spread_long_call_volumes(
 
 
 def _build_ctp_long(trade_symbols: Set[str], positions: list) -> Dict[str, int]:
+    from account_decomposition import normalize_trade_symbols
+
+    trade_syms = normalize_trade_symbols(trade_symbols)
     ctp_long: Dict[str, int] = {}
     for pos in positions:
         if not _is_long_option_position(pos):
@@ -92,7 +95,7 @@ def _build_ctp_long(trade_symbols: Set[str], positions: list) -> Dict[str, int]:
         if not inst:
             continue
         sym = extract_symbol_prefix(inst)
-        if sym not in trade_symbols:
+        if sym not in trade_syms:
             continue
         vol = int(pos.get('volume') or pos.get('Position') or pos.get('position') or 0)
         if vol > 0:
@@ -134,10 +137,16 @@ def reconcile_strangle_positions_dual(
                 logger.warning(f'[reconcile] strangle CSV sync failed: {e}')
 
     if positions is None:
+        query_err = ''
         try:
-            positions = conn.query_positions_sync(timeout=10) or []
+            positions = conn.query_positions_sync(timeout=10)
         except Exception as e:
-            issues.append(f'position query failed: {e}')
+            positions = None
+            query_err = str(e)
+        if positions is None:
+            # 查询失败（异常或返回 None）不可降级成空持仓：那会与 CSV 认领
+            # 产生假性不一致并触发 halt。走 transient 处理沿用上轮状态。
+            issues.append(f'position query failed: {query_err or "返回 None"}')
             runtime = getattr(conn, '_runtime_state', None) or {}
             prev_halt = bool(runtime.get('_strangle_reconcile_halt', False))
             prev_issues = list(runtime.get('_strangle_reconcile_issues') or [])

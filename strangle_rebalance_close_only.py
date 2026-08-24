@@ -31,8 +31,9 @@ from strangle_close_only_holdback import (
     begin_holdback,
     end_holdback,
 )
+from strangle_leg_pairing import INFERRED_SINGLE_KIND, is_close_unmatched_item
 
-CLOSE_KINDS = {'close_chp_pending'}
+CLOSE_KINDS = {'close_chp_pending', INFERRED_SINGLE_KIND}
 
 
 def _leg_key(item: dict) -> tuple:
@@ -55,8 +56,8 @@ def run_close_only_rebalance(executor, ledger, tradeinfo_by_key) -> int:
     if not all_items:
         return 0
 
-    close_items = [it for it in all_items if it.get('kind') in CLOSE_KINDS]
-    other_items = [it for it in all_items if it.get('kind') not in CLOSE_KINDS]
+    close_items = [it for it in all_items if is_close_unmatched_item(it)]
+    other_items = [it for it in all_items if not is_close_unmatched_item(it)]
 
     if not close_items:
         return 0

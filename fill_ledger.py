@@ -157,30 +157,14 @@ def resolve_position_csv_fields(conn, trade: dict, config: dict, strategy: str) 
 
 
 def _lookup_quote(conn, instrument: str):
-    inst = (instrument or '').strip()
-    if not inst:
-        return None
-    for store_name in ('quotes', 'option_quotes'):
-        store = getattr(conn, store_name, None)
-        if not store:
-            continue
-        for key in (inst, inst.upper(), inst.lower()):
-            quote = store.get(key)
-            if quote is not None:
-                return quote
     try:
-        from auto_connection_utils import contract_case_variants
+        from auto_connection_utils import lookup_option_quote, lookup_quote
     except Exception:
         return None
-    for store_name in ('quotes', 'option_quotes'):
-        store = getattr(conn, store_name, None)
-        if not store:
-            continue
-        for key in contract_case_variants(inst):
-            quote = store.get(key)
-            if quote is not None:
-                return quote
-    return None
+    quote = lookup_quote(conn, instrument)
+    if quote is not None:
+        return quote
+    return lookup_option_quote(conn, instrument)
 
 
 def _quote_prices(conn, instrument: str) -> tuple:

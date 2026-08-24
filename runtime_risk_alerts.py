@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import List, Tuple
 
-from strangle_rebalance_close_only import CLOSE_KINDS
+from strangle_rebalance_close_only import is_close_unmatched_item
 
 DEFAULT_ALERT_COOLDOWN_SEC = 1800
 DEFAULT_MARGIN_UNKNOWN_ALERT_AFTER = 3
@@ -64,7 +64,7 @@ def _open_unmatched_items(ledger) -> List[dict]:
         items = ledger.list_unmatched_legs() or []
     except Exception:
         return []
-    return [it for it in items if it.get('kind') not in CLOSE_KINDS]
+    return [it for it in items if not is_close_unmatched_item(it)]
 
 
 def _exposure_summary(conn, ledger) -> Tuple[bool, str]:

@@ -4,6 +4,24 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
+
+# Windows 上 os.replace 偶发 PermissionError [WinError 5]：目标文件被杀软扫描或
+# 并发读短暂占用时，原子重命名被拒。这是瞬时争用，短重试即可，不必放弃原子写语义
+# （实盘曾导致 ledger_strangle.json 保存抛未捕获异常、中断当轮宽跨处理）。
+_REPLACE_RETRIES = 5
+_REPLACE_RETRY_SLEEP = 0.05
+
+
+def _replace_with_retry(tmp_path: str, path: str) -> None:
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_RETRIES:
+                raise
+            time.sleep(_REPLACE_RETRY_SLEEP * (attempt + 1))
 
 
 def atomic_write_bytes(path: str, data: bytes) -> None:
@@ -17,7 +35,7 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        _replace_with_retry(tmp_path, path)
     except Exception:
         try:
             os.unlink(tmp_path)

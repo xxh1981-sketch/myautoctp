@@ -34,6 +34,48 @@ class TestSessionCloseCalendar(unittest.TestCase):
         cfg = {'session_close_guard': {'enabled': True}}
         self.assertEqual(get_session_phase('m', cfg, now), 'normal')
 
+    def test_m_morning_break_off(self):
+        now = datetime(2026, 6, 11, 10, 20, 0)
+        cfg = {'session_close_guard': {'enabled': True}}
+        self.assertFalse(is_trading_time_at('m', now, cfg))
+        self.assertEqual(get_session_phase('m', cfg, now), 'off')
+
+    def test_m_before_morning_break_not_t10(self):
+        now = datetime(2026, 6, 11, 10, 6, 0)
+        cfg = {
+            'session_close_guard': {
+                'enabled': True,
+                'no_new_group_before_close_sec': 600,
+                'hard_stop_before_close_sec': 60,
+            },
+        }
+        self.assertTrue(is_trading_time_at('m', now, cfg))
+        self.assertEqual(get_session_phase('m', cfg, now), 'normal')
+
+    def test_io_morning_break_still_trading(self):
+        now = datetime(2026, 6, 11, 10, 20, 0)
+        cfg = {'session_close_guard': {'enabled': True}}
+        self.assertTrue(is_trading_time_at('io', now, cfg))
+        self.assertEqual(get_session_phase('io', cfg, now), 'normal')
+
+    def test_tf_morning_break_still_trading(self):
+        now = datetime(2026, 6, 11, 10, 20, 0)
+        cfg = {'session_close_guard': {'enabled': True}}
+        self.assertTrue(is_trading_time_at('tf', now, cfg))
+        self.assertEqual(get_session_phase('tf', cfg, now), 'normal')
+
+    def test_m_include_morning_break_enables_t10_at_1006(self):
+        now = datetime(2026, 6, 11, 10, 6, 0)
+        cfg = {
+            'session_close_guard': {
+                'enabled': True,
+                'include_morning_break': True,
+                'no_new_group_before_close_sec': 600,
+                'hard_stop_before_close_sec': 60,
+            },
+        }
+        self.assertEqual(get_session_phase('m', cfg, now), 't10')
+
     def test_m_night_t1(self):
         # m night ends 23:00; 22:59:30 -> ~30s left
         now = datetime(2026, 6, 11, 22, 59, 30)
@@ -119,8 +161,26 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
         }
         t1 = datetime(2026, 6, 15, 14, 59, 40)
         past = datetime(2026, 6, 15, 15, 0, 10)
+        night_past = datetime(2026, 7, 6, 23, 22, 21)
         self.assertTrue(scg.should_block_send(conn, 'm', cfg, t1))
         self.assertTrue(scg.should_block_send(conn, 'm', cfg, past))
+        self.assertTrue(scg.should_block_send(conn, 'm', cfg, night_past))
+
+    def test_should_skip_strangle_rebalance_off_hours(self):
+        conn = MagicMock()
+        ledger = MagicMock()
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'm', 'month': '2701', 'kind': 'inferred_single'},
+        ]
+        cfg = {'session_close_guard': {'enabled': True}}
+        off = datetime(2026, 7, 6, 23, 22, 21)
+        with patch('session_close_guard.get_session_phase', return_value='off'):
+            skip, reason = scg.should_skip_strangle_rebalance(
+                conn, cfg, ledger=ledger,
+                tradeinfo=[{'future': 'm', 'month': '2701'}],
+            )
+        self.assertTrue(skip)
+        self.assertIn('非交易时段', reason)
 
     def test_should_block_send_after_t1_abort_flag(self):
         conn = MagicMock()
@@ -201,6 +261,7 @@ class TestSessionCloseGuardIntegration(unittest.TestCase):
         self._ac = ac
         self._saved_installed = scg._INSTALLED
         self._orig_send = ace._send_and_wait
+        self._orig_close_leg = ace._close_single_leg
         self._orig_execute = ace.execute_close_orders_with_limit
         self._orig_om_send = aom.OrderManager.send_order
         self._orig_process_close = ac.process_close
@@ -208,6 +269,7 @@ class TestSessionCloseGuardIntegration(unittest.TestCase):
 
     def tearDown(self):
         self._ace._send_and_wait = self._orig_send
+        self._ace._close_single_leg = self._orig_close_leg
         self._ace.execute_close_orders_with_limit = self._orig_execute
         self._aom.OrderManager.send_order = self._orig_om_send
         self._ac.process_close = self._orig_process_close
@@ -225,6 +287,28 @@ class TestSessionCloseGuardIntegration(unittest.TestCase):
     def _install(self):
         self.assertTrue(scg.install_session_close_guard(self._cfg()))
         self.assertTrue(scg.is_installed())
+
+    def test_guarded_close_single_leg_blocks_off_hours(self):
+        called = []
+
+        def orig_leg(conn, contract, *a, **kw):
+            called.append(contract)
+            return True, 1, 1.0
+
+        self._ace._close_single_leg = orig_leg
+        self._install()
+
+        conn = MagicMock()
+        conn._runtime_state = {}
+        logger = MagicMock()
+        with patch('session_close_guard.is_trading_time_at', return_value=False), \
+             patch('session_close_guard.get_session_phase', return_value='off'):
+            filled, traded, px = self._ace._close_single_leg(
+                conn, 'm2701-P-2900', '0', 1, 26.0, 1.0,
+                self._cfg(), logger, 'm',
+            )
+        self.assertEqual((filled, traded, px), (False, 0, 0.0))
+        self.assertEqual(called, [])
 
     def test_guarded_send_and_wait_blocks_when_should_block(self):
         sent = []

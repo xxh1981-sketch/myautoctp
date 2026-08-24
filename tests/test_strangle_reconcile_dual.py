@@ -177,6 +177,18 @@ class TestReconcileDual(unittest.TestCase):
         self.assertFalse(halt)
         self.assertEqual(issues, [])
 
+    def test_upper_trade_symbols_still_count_ctp_long(self):
+        """trade_symbols 大写时仍计入 CTP 多头（与 extract_symbol_prefix 小写对齐）。"""
+        from strangle_reconcile_dual import _build_ctp_long
+
+        positions = [
+            {'instrument': 'c2701-C-2340', 'direction': '2', 'volume': 1},
+            {'instrument': 'C2701-P-2140', 'direction': '2', 'volume': 1},
+        ]
+        out = _build_ctp_long({'C'}, positions)
+        self.assertEqual(out.get('c2701-C-2340'), 1)
+        self.assertEqual(out.get('C2701-P-2140'), 1)
+
     def test_csv_ahead_halts(self):
         conn = _conn()
         store = SpreadLegStore()

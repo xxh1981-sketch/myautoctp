@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 from spread_contract_utils import months_match, symbol_prefix as extract_symbol_prefix
 from spread_ledger import store_from_conn
+from spread_position_sync import converge_flat_spread_claims, spread_ctp_has_residual
 
 _ORIG_PROCESS_CLOSE = None
 
@@ -26,6 +27,8 @@ def build_positions_from_spread_claims(
     month: str,
 ) -> List[dict]:
     """Convert spread leg claims to autotrade position rows for one symbol/month."""
+    from ctp_instrument import canonical_ctp_instrument
+
     sym = symbol.lower()
     normalized_month = conn._normalize_month(symbol, month)
     out: List[dict] = []
@@ -39,10 +42,11 @@ def build_positions_from_spread_claims(
             continue
         if not store._is_call_instrument(inst):
             continue
+        wire_inst = canonical_ctp_instrument(conn, inst)
         if vol > 0:
-            out.append({'instrument': inst, 'direction': '2', 'position': vol})
+            out.append({'instrument': wire_inst, 'direction': '2', 'position': vol})
         else:
-            out.append({'instrument': inst, 'direction': '3', 'position': -vol})
+            out.append({'instrument': wire_inst, 'direction': '3', 'position': -vol})
     return out
 
 
@@ -93,8 +97,16 @@ def process_close_from_spread_ledger(
         logger.warning(f'[{symbol}] 价差账本无 store，跳过账本平仓')
         return False
 
+    cleared = converge_flat_spread_claims(conn, store, symbol, month, config, logger)
+
     symbol_positions = build_positions_from_spread_claims(store, conn, symbol, month)
     if not symbol_positions:
+        if cleared > 0:
+            # 认领刚按 CTP 空仓收敛：视同已平仓，触发 process_symbol 冷却，防同轮/下轮误开。
+            logger.info(
+                f'[{symbol}] 价差认领已按 CTP 空仓收敛({cleared}条)，触发平仓冷却'
+            )
+            return True
         logger.info(f'[{symbol}] 价差账本无该品种持仓，跳过平仓检查')
         return False
 
@@ -147,6 +159,12 @@ def process_close_from_spread_ledger(
         logger.info(f'[{symbol}] 平仓计划为空，无需执行')
         return False
 
+    if not spread_ctp_has_residual(conn, symbol, month, logger):
+        converge_flat_spread_claims(conn, store, symbol, month, config, logger)
+        # 已触发平仓条件且 CTP 确认空仓：视同平仓完成，必须写冷却（勿 return False）。
+        logger.info(f'[{symbol}] CTP 已无价差仓，跳过平仓发单（仍触发冷却）')
+        return True
+
     result = execute_close_orders_with_limit(
         conn, plan, symbol, month, min_tick, config, logger, urgency=urgency,
     )
@@ -172,7 +190,7 @@ def process_close_from_spread_ledger(
                 logger.info(f'[{symbol}] 价差账本持仓已确认全部平仓')
                 return True
             if a_cur == 0 and b_cur > 0:
-                if _ctp_still_has_residual(conn, symbol, month, logger):
+                if spread_ctp_has_residual(conn, symbol, month, logger):
                     logger.warning(
                         f'[{symbol}] 价差账本 A 已平完但 B 仍有 {b_cur} 手残留，需人工检查'
                     )
@@ -186,7 +204,7 @@ def process_close_from_spread_ledger(
                 )
                 continue
             if a_cur > 0 and b_cur == 0:
-                if _ctp_still_has_residual(conn, symbol, month, logger):
+                if spread_ctp_has_residual(conn, symbol, month, logger):
                     logger.warning(
                         f'[{symbol}] 价差账本 A 仍有 {a_cur} 手但 B 已清零，需关注'
                     )
@@ -207,51 +225,8 @@ def process_close_from_spread_ledger(
 
 
 def _ctp_still_has_residual(conn, symbol: str, month: str, logger) -> bool:
-    """Cross-check CTP positions; True iff CTP still shows any spread leg.
-
-    Strangle-owned long calls on the same symbol+month are subtracted first so a
-    strangle holding is not counted as spread residual (false 需人工检查 alarm).
-    """
-    try:
-        positions = conn.query_positions_sync(timeout=5) or []
-    except Exception as e:
-        logger.debug(f'[{symbol}] CTP 持仓复查失败: {e}，按账本残留判断')
-        return True
-
-    try:
-        from spread_position_adjust import (
-            _ledger_from_conn,
-            exclude_strangle_from_positions,
-            merge_strangle_owned_volumes,
-        )
-        vols = merge_strangle_owned_volumes(_ledger_from_conn(conn))
-        if vols:
-            positions = exclude_strangle_from_positions(positions, vols, None, symbol)
-    except Exception:
-        pass
-
-    sym = symbol.lower()
-    try:
-        normalized_month = conn._normalize_month(symbol, month)
-    except Exception:
-        normalized_month = month
-
-    for pos in positions:
-        inst = (pos.get('instrument') or pos.get('InstrumentID') or '').strip()
-        if not inst:
-            continue
-        if extract_symbol_prefix(inst) != sym:
-            continue
-        if not months_match(inst, month, normalized_month):
-            continue
-        vol = int(pos.get('volume') or pos.get('Position') or pos.get('position') or 0)
-        if vol <= 0:
-            continue
-        from spread_ledger import SpreadLegStore
-        if not SpreadLegStore._is_call_instrument(inst):
-            continue
-        return True
-    return False
+    """Backward-compatible alias for spread_ctp_has_residual."""
+    return spread_ctp_has_residual(conn, symbol, month, logger)
 
 
 def _notify_spread_close_residual(conn, config, logger, symbol, a_cur, b_cur) -> None:
