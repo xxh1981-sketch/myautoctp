@@ -21,6 +21,9 @@ def trade_dedupe_key(trade: dict) -> str:
     trade_id = (trade.get('trade_id') or '').strip()
     if trade_id:
         inst = (trade.get('instrument') or '').upper()
+        td = str(trade.get('trade_date') or '').strip().replace('-', '')
+        if td:
+            return f'{td}:{inst}:{trade_id}'
         return f'{inst}:{trade_id}'
     return '|'.join([
         str(trade.get('order_ref', '')),
@@ -32,6 +35,39 @@ def trade_dedupe_key(trade: dict) -> str:
         str(trade.get('trade_date', '')),
         str(trade.get('trade_time', '')),
     ])
+
+
+def iter_trade_dedupe_keys(trade: dict):
+    """Current key plus legacy ``INSTRUMENT:trade_id`` for already-applied lookup."""
+    key = trade_dedupe_key(trade)
+    yield key
+    trade_id = (trade.get('trade_id') or '').strip()
+    if not trade_id:
+        return
+    inst = (trade.get('instrument') or '').upper()
+    legacy = f'{inst}:{trade_id}'
+    if legacy != key:
+        yield legacy
+
+
+def trade_in_applied_keys(applied, trade: dict) -> bool:
+    if not applied:
+        return False
+    if any(k in applied for k in iter_trade_dedupe_keys(trade)):
+        return True
+    # Incoming undated fill vs journal keys that already include YYYYMMDD.
+    trade_id = (trade.get('trade_id') or '').strip()
+    td = str(trade.get('trade_date') or '').strip().replace('-', '')
+    if not trade_id or td:
+        return False
+    inst = (trade.get('instrument') or '').upper()
+    suffix = f':{inst}:{trade_id}'
+    return any(str(a).endswith(suffix) for a in applied)
+
+
+def offset_is_close(offset) -> bool:
+    """True for CTP close / close-today / close-yesterday flags."""
+    return str(offset or '').strip() in {'1', '3', '4'}
 
 
 def is_plausible_ctp_trade_id(trade_id: str) -> bool:

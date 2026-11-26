@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -81,6 +82,38 @@ class TestSessionCloseCalendar(unittest.TestCase):
         now = datetime(2026, 6, 11, 22, 59, 30)
         cfg = {'session_close_guard': {'enabled': True}}
         self.assertEqual(get_session_phase('m', cfg, now), 't1')
+
+    def test_cu_night_ends_0100_not_0230(self):
+        cfg = {'session_close_guard': {'enabled': True}}
+        t1 = datetime(2026, 6, 12, 0, 59, 30)
+        after = datetime(2026, 6, 12, 1, 5, 0)
+        self.assertEqual(get_session_phase('cu', cfg, t1), 't1')
+        self.assertEqual(get_session_phase('cu', cfg, after), 'off')
+        self.assertFalse(is_trading_time_at('cu', after, cfg))
+        self.assertEqual(get_session_phase('au', cfg, after), 'normal')
+        self.assertTrue(is_trading_time_at('au', after, cfg))
+
+    def test_ss_and_bc_night_end_0100(self):
+        cfg = {'session_close_guard': {'enabled': True}}
+        after = datetime(2026, 6, 12, 1, 5, 0)
+        self.assertEqual(get_session_phase('ss', cfg, after), 'off')
+        self.assertEqual(get_session_phase('bc', cfg, after), 'off')
+        self.assertEqual(get_session_phase('sc', cfg, after), 'normal')
+
+    def test_day_only_products_are_off_at_night(self):
+        cfg = {'session_close_guard': {'enabled': True}}
+        day_now = datetime(2026, 6, 11, 14, 0, 0)
+        night_now = datetime(2026, 6, 11, 21, 30, 0)
+        for sym in ('lg', 'si', 'lc', 'ur'):
+            self.assertTrue(is_trading_time_at(sym, day_now, cfg), sym)
+            self.assertEqual(get_session_phase(sym, cfg, day_now), 'normal', sym)
+            self.assertFalse(is_trading_time_at(sym, night_now, cfg), sym)
+            self.assertEqual(get_session_phase(sym, cfg, night_now), 'off', sym)
+        # night_end_overrides 支持置空禁夜盘，或显式覆盖开启夜盘
+        ov_off = {'session_close_guard': {'enabled': True, 'night_end_overrides': {'m': ''}}}
+        self.assertEqual(get_session_phase('m', ov_off, night_now), 'off')
+        ov_on = {'session_close_guard': {'enabled': True, 'night_end_overrides': {'ur': '23:00'}}}
+        self.assertEqual(get_session_phase('ur', ov_on, night_now), 'normal')
 
     def test_off_after_close(self):
         now = datetime(2026, 6, 11, 23, 24, 0)
@@ -181,6 +214,86 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
         self.assertTrue(skip)
         self.assertIn('非交易时段', reason)
 
+    def test_should_not_skip_strangle_rebalance_mixed_unmatched(self):
+        conn = MagicMock()
+        ledger = MagicMock()
+        ledger.list_unmatched_legs.return_value = [
+            {'symbol': 'm', 'month': '2701', 'kind': 'inferred_single'},
+            {'symbol': 'cu', 'month': '2509', 'kind': 'inferred_single'},
+        ]
+        cfg = {'session_close_guard': {'enabled': True}}
+
+        def _phase(sym, config=None):
+            return 'off' if str(sym).lower() == 'm' else 'normal'
+
+        with patch('session_close_guard.get_session_phase', side_effect=_phase):
+            skip, reason = scg.should_skip_strangle_rebalance(
+                conn, cfg, ledger=ledger,
+                tradeinfo=[{'future': 'm'}, {'future': 'cu'}],
+            )
+        self.assertFalse(skip)
+        self.assertEqual(reason, '')
+
+    def test_should_not_skip_strangle_rebalance_when_no_unmatched(self):
+        conn = MagicMock()
+        ledger = MagicMock()
+        ledger.list_unmatched_legs.return_value = []
+        cfg = {'session_close_guard': {'enabled': True}}
+        with patch('session_close_guard.get_session_phase', return_value='off'):
+            skip, reason = scg.should_skip_strangle_rebalance(
+                conn, cfg, ledger=ledger,
+                tradeinfo=[{'future': 'm'}],
+            )
+        self.assertFalse(skip)
+        self.assertEqual(reason, '')
+
+    def test_prioritize_in_session_unmatched_moves_off_hours_behind(self):
+        cfg = {'session_close_guard': {'enabled': True}}
+
+        class FakeLedger:
+            def __init__(self):
+                self._data = {
+                    'unmatched_legs': [
+                        {'symbol': 'm', 'instrument': 'm2701-C-3000'},
+                        {'symbol': 'cu', 'instrument': 'cu2509-C-70000'},
+                    ],
+                }
+                self._lock = threading.Lock()
+                self.saved = 0
+
+            def list_unmatched_legs(self):
+                return list(self._data['unmatched_legs'])
+
+            def _save(self):
+                self.saved += 1
+
+        ledger = FakeLedger()
+
+        def _phase(sym, config=None):
+            return 'off' if str(sym).lower() == 'm' else 'normal'
+
+        with patch('session_close_guard.get_session_phase', side_effect=_phase):
+            moved = scg.prioritize_in_session_unmatched(ledger, cfg)
+            # 顺序已排好时再次调用不得重复落盘或返回非零
+            moved_again = scg.prioritize_in_session_unmatched(ledger, cfg)
+        self.assertEqual(moved, 1)
+        self.assertEqual(moved_again, 0)
+        self.assertEqual(ledger.saved, 1)
+        symbols = [x['symbol'] for x in ledger.list_unmatched_legs()]
+        self.assertEqual(symbols, ['cu', 'm'])
+
+    def test_pending_refs_for_symbol_acquires_conn_lock(self):
+        conn = MagicMock()
+        conn.lock = MagicMock()
+        conn.lock.__enter__ = MagicMock(return_value=None)
+        conn.lock.__exit__ = MagicMock(return_value=False)
+        order = MagicMock(instrument_id='m2609-C-3400', order_ref=500344)
+        conn.pending_orders = {500344: order}
+        refs = scg._pending_refs_for_symbol(conn, 'm')
+        self.assertEqual(refs, [500344])
+        conn.lock.__enter__.assert_called_once()
+        conn.lock.__exit__.assert_called_once()
+
     def test_should_block_send_after_t1_abort_flag(self):
         conn = MagicMock()
         conn._runtime_state = {'_session_t1_abort_at:m:20260615-1500': 1.0}
@@ -205,6 +318,33 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertEqual(conn.pending_orders, {})
 
+    def test_prune_skips_when_query_fails(self):
+        conn = MagicMock()
+        conn.lock = MagicMock()
+        conn.lock.__enter__ = MagicMock(return_value=None)
+        conn.lock.__exit__ = MagicMock(return_value=False)
+        order = MagicMock(instrument_id='m2609-C-3400')
+        order.order_ref = 500344
+        conn.pending_orders = {500344: order}
+        conn.order_traded = {500344: False}
+        conn.query_orders_sync.side_effect = RuntimeError('timeout')
+        removed = scg.prune_stale_pending_orders(conn, 'm', logger=None)
+        self.assertEqual(removed, 0)
+        self.assertIn(500344, conn.pending_orders)
+
+    def test_prune_skips_when_query_returns_none(self):
+        conn = MagicMock()
+        conn.lock = MagicMock()
+        conn.lock.__enter__ = MagicMock(return_value=None)
+        conn.lock.__exit__ = MagicMock(return_value=False)
+        order = MagicMock(instrument_id='m2609-C-3400')
+        order.order_ref = 500344
+        conn.pending_orders = {500344: order}
+        conn.query_orders_sync.return_value = None
+        removed = scg.prune_stale_pending_orders(conn, 'm', logger=None)
+        self.assertEqual(removed, 0)
+        self.assertIn(500344, conn.pending_orders)
+
     def test_t1_sweep_dedupes(self):
         conn = MagicMock()
         conn.td_logined = True
@@ -219,7 +359,10 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
         conn.query_orders_sync.return_value = [
             {'order_ref': 500344, 'status': '3'},
         ]
-        conn.cancel_all_pending_orders.return_value = 1
+        conn.cancel_order.return_value = True
+        other = MagicMock(instrument_id='cu2509-C-70000')
+        other.order_ref = 100
+        conn.pending_orders = {500344: order, 100: other}
         logger = MagicMock()
         cfg = {
             'session_close_guard': {
@@ -234,7 +377,8 @@ class TestSessionCloseGuardHelpers(unittest.TestCase):
              patch('session_close_guard.segment_end_id', return_value='20260611-2300'):
             scg.maybe_run_pre_close_cancel_sweep(conn, tradeinfo, cfg, logger)
             scg.maybe_run_pre_close_cancel_sweep(conn, tradeinfo, cfg, logger)
-        conn.cancel_all_pending_orders.assert_called_once()
+        conn.cancel_order.assert_called_once_with(500344)
+        conn.cancel_all_pending_orders.assert_not_called()
         self.assertIn('_session_t1_abort_at:m:20260611-2300', conn._runtime_state)
 
 

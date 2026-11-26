@@ -140,11 +140,14 @@ def _persist_spread_claims(
     symbol: str,
     reason: str,
 ) -> None:
-    store.set_leg_claims(claims)
     from import_spread_positions import save_spread_positions_csv, spread_positions_csv_path
+    from spread_fill_sync import _journal_path
+    from trade_journal_lock import journal_lock
 
     path = spread_positions_csv_path(config)
-    save_spread_positions_csv(path, claims)
+    with journal_lock(_journal_path(config)):
+        store.set_leg_claims(claims)
+        save_spread_positions_csv(path, claims)
     if logger:
         logger.info(f'[{symbol}] 价差认领已收敛 ({reason})')
 
@@ -159,17 +162,21 @@ def zero_symbol_month_spread_claims(
     reason: str = 'CTP已无价差仓',
 ) -> int:
     """Remove spread claims for symbol+month from store and CSV."""
-    to_remove = spread_claims_for_symbol_month(store, conn, symbol, month)
-    if not to_remove:
-        return 0
-    remove_keys = set(to_remove)
-    new_claims = {
-        inst: vol
-        for inst, vol in store.list_leg_claims().items()
-        if inst not in remove_keys
-    }
-    _persist_spread_claims(store, config, new_claims, logger, symbol, reason)
-    return len(to_remove)
+    from spread_fill_sync import _journal_path
+    from trade_journal_lock import journal_lock
+
+    with journal_lock(_journal_path(config)):
+        to_remove = spread_claims_for_symbol_month(store, conn, symbol, month)
+        if not to_remove:
+            return 0
+        remove_keys = set(to_remove)
+        new_claims = {
+            inst: vol
+            for inst, vol in store.list_leg_claims().items()
+            if inst not in remove_keys
+        }
+        _persist_spread_claims(store, config, new_claims, logger, symbol, reason)
+        return len(to_remove)
 
 
 def converge_flat_spread_claims(
@@ -247,15 +254,19 @@ def handle_benign_over_close_spread_reject(
     if inst:
         ctp_vol = ctp_instrument_physical_volume(conn, inst, logger)
         if ctp_vol == 0:
-            claims = dict(store.list_leg_claims())
-            keys_to_remove = [k for k in claims if k.strip().upper() == inst]
-            if keys_to_remove:
-                for k in keys_to_remove:
-                    claims.pop(k)
-                _persist_spread_claims(
-                    store, config, claims, logger, sym, f'拒平收敛 {inst}',
-                )
-                n += len(keys_to_remove)
+            from spread_fill_sync import _journal_path
+            from trade_journal_lock import journal_lock
+
+            with journal_lock(_journal_path(config)):
+                claims = dict(store.list_leg_claims())
+                keys_to_remove = [k for k in claims if k.strip().upper() == inst]
+                if keys_to_remove:
+                    for k in keys_to_remove:
+                        claims.pop(k)
+                    _persist_spread_claims(
+                        store, config, claims, logger, sym, f'拒平收敛 {inst}',
+                    )
+                    n += len(keys_to_remove)
 
     for month in _months_for_symbol_claims(store, conn, sym, inst):
         n += converge_flat_spread_claims(

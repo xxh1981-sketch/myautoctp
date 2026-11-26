@@ -188,15 +188,15 @@ def install_send_feishu_throttle(config: Optional[dict] = None) -> bool:
     if notifier_cls is not None and hasattr(notifier_cls, 'send_message'):
         _orig_notifier_send = notifier_cls.send_message
 
-        def _patched_notifier_send(self, msg, msg_type='text'):
+        def _patched_notifier_send(self, msg, msg_type='text', **kwargs):
             key = throttle_key_for_message(str(msg))
             if key is None:
-                return _orig_notifier_send(self, msg, msg_type=msg_type)
+                return _orig_notifier_send(self, msg, msg_type=msg_type, **kwargs)
             cfg = getattr(self, 'config', None) or {}
             conn = cfg.get('_spread_fill_conn')
             if not should_send(key, conn=conn, config=cfg):
                 return False
-            return _orig_notifier_send(self, msg, msg_type=msg_type)
+            return _orig_notifier_send(self, msg, msg_type=msg_type, **kwargs)
 
         notifier_cls.send_message = _patched_notifier_send
 

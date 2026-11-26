@@ -360,6 +360,15 @@ def main():
 
             get_notifier(config)
             install_feishu_noise_patch(config)
+            from feishu_event_patch import (
+                get_install_error as _feishu_event_install_error,
+                install_feishu_event_receiver,
+            )
+            if not install_feishu_event_receiver(config):
+                logger.warning(
+                    '[启动自检] 飞书长连接补丁未安装: %s（将使用轮询）',
+                    _feishu_event_install_error() or '未知原因',
+                )
             install_spread_ledger_execution(config)
 
             conn = _init_conn(config, logger, combined)
@@ -529,6 +538,8 @@ def main():
                     conn.release()
                 except Exception as release_err:
                     logger.warning('连接释放异常: %s', release_err, exc_info=True)
+            if _user_shutdown or _shutdown_requested:
+                _cancel_shutdown_timer()
 
 
 if __name__ == '__main__':

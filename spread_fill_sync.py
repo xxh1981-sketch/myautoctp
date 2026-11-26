@@ -17,7 +17,9 @@ from trade_journal import (
     append_journal,
     load_applied_keys,
     map_direction_offset,
+    offset_is_close,
     trade_dedupe_key,
+    trade_in_applied_keys,
 )
 from trade_journal_lock import journal_lock
 
@@ -65,15 +67,18 @@ def _skip_spread_fill_on_strangle_owned_only(
     conn,
     store,
     instrument: str,
+    offset: str = '',
 ) -> tuple:
     """
     价差段成交但合约仅由宽跨认领、价差认领为 0 → 勿写入 spread CSV。
 
-    用于拦截宽跨平仓误用 spread OrderRef 时的入账（RB 类事故）。
-    若价差 store 对该合约已有非零认领（含空头 B 腿），仍允许入账。
+    只拦截平仓（RB 类：宽跨平仓误用 spread OrderRef）。开仓允许同 strike 重叠。
     """
     dual = config.get('dual_strategy') or {}
     if not dual.get('spread_fill_skip_strangle_owned_instruments', True):
+        return False, ''
+
+    if not offset_is_close(offset):
         return False, ''
 
     if conn is None:
@@ -133,7 +138,7 @@ def apply_spread_trade_record(
 
     with journal_lock(journal_file):
         applied = load_applied_keys(journal_file, config, include_pending=True)
-        if dedupe_key in applied:
+        if trade_in_applied_keys(applied, trade):
             return False
 
         instrument = (trade.get('instrument') or '').strip()
@@ -180,7 +185,7 @@ def apply_spread_trade_record(
                 return False
 
         skip_owned, skip_reason = _skip_spread_fill_on_strangle_owned_only(
-            config, conn, store, instrument,
+            config, conn, store, instrument, offset=trade.get('offset'),
         )
         if skip_owned:
             key = instrument.upper()
@@ -372,7 +377,7 @@ def sync_csv_from_spread_trades(
         if not is_spread_order_ref(trade.get('order_ref'), config):
             continue
         key = trade_dedupe_key(trade)
-        if key in applied:
+        if trade_in_applied_keys(applied, trade):
             continue
         if apply_spread_trade_record(config, store, trade, logger, journal_file):
             applied.add(key)

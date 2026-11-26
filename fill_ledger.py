@@ -15,6 +15,7 @@ from trade_journal import (
     load_applied_keys,
     map_direction_offset,
     trade_dedupe_key,
+    trade_in_applied_keys,
 )
 from trade_journal_lock import journal_lock
 
@@ -330,9 +331,9 @@ def apply_fill_record(
     journal_file = journal_file or fill_ledger_journal_path(config)
     dedupe_key = trade_dedupe_key(trade)
 
-    if dedupe_key in load_applied_keys(
+    if trade_in_applied_keys(load_applied_keys(
         journal_file, config, include_pending=True,
-    ):
+    ), trade):
         return False
 
     row = build_fill_row(conn, trade, config, logger=logger)
@@ -346,9 +347,9 @@ def apply_fill_record(
     row['skip_reason'] = skip_reason
 
     with journal_lock(journal_file):
-        if dedupe_key in load_applied_keys(
+        if trade_in_applied_keys(load_applied_keys(
             journal_file, config, include_pending=True,
-        ):
+        ), trade):
             return False
         append_journal(journal_file, {
             'dedupe_key': dedupe_key,
@@ -589,7 +590,7 @@ def sync_fill_ledger_from_trades(
     applied = load_applied_keys(journal_file, config, include_pending=True)
     pending_trades = [
         trade for trade in (trades or [])
-        if trade_dedupe_key(trade) not in applied
+        if not trade_in_applied_keys(applied, trade)
     ]
     _warn_bilateral_orderref_suspicious(
         detect_bilateral_orderref_suspicious(

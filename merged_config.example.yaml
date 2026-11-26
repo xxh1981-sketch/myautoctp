@@ -103,8 +103,14 @@ dual_strategy:
 #   no_new_group_before_close_sec: 600
 #   hard_stop_before_close_sec: 60
 #   include_morning_break: false   # true=商品在 10:15 也触发 T-10/T-1（默认不对小休生效）
-#   night_end_overrides:           # 可选，如 i/j/jm 夜盘 23:30
-#     i: "23:30"
+#   night_end_overrides:           # 可选，覆盖默认夜盘结束时刻；填 "" / null 表示无夜盘
+#     i: "23:30"                   # 默认：au/ag/sc=02:30；cu/al/zn/pb/ni/sn/ss/ao/ad/bc=01:00；
+#                                  # 无夜盘：si/lc/ps/lg/lh/jd/fb/bb/rr/ur/ap/cj/pk/sm/sf/wh/pm/ri/lr/jr/rs/wr/ec；其余 23:00
+
+# 飞书指令接收（可选；默认从 auto_config.yaml 继承）：
+# notifications:
+#   feishu_command:
+#     mode: poll                   # poll=轮询（默认）；ws=长连接事件订阅（需安装 lark-oapi）
 
 # 隔离期安全降级（默认关闭）：
 # - false：保持当前语义，隔离期全停（含平仓）
@@ -165,7 +171,7 @@ log_noise:
     - substring: 获取平仓锁超时
       to_level: WARNING
 loop_interval: 10
-round_slow_warn_sec: 60
+round_slow_warn_sec: 100
 max_strangle_scan_sec: 600
 # 单品种扫描硬超时（秒）；0=不限制。防止单品种挂死阻塞整轮主循环。
 # 已废弃：单品种总时长限制（默认 0=不限制）。发单层 A/B_timeout 负责限次。

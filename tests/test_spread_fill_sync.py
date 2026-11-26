@@ -132,6 +132,28 @@ class TestSpreadFillSync(unittest.TestCase):
                 body = f.read()
             self.assertIn('strangle_owned_only', body)
 
+    def test_allow_spread_open_when_only_strangle_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['spread_tradeinfo'] = [{'future': 'rb', 'month': '2610'}]
+            store = SpreadLegStore()
+            ledger = MagicMock()
+            ledger.list_leg_claims.return_value = {'rb2610C3450': 1}
+            ledger.list_unmatched_legs.return_value = []
+            conn = MagicMock()
+            conn._runtime_state = {'_strangle_ledger': ledger}
+            cfg['_spread_fill_conn'] = conn
+            trade = {
+                'order_ref': 891,
+                'instrument': 'rb2610C3450',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'RB_OPEN',
+            }
+            self.assertTrue(apply_spread_trade_record(cfg, store, trade))
+            self.assertEqual(store.list_leg_claims().get('RB2610C3450'), 1)
+
     def test_stash_fill_csv_status_on_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)

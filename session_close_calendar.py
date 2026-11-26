@@ -16,8 +16,22 @@ from typing import Dict, List, Optional, Tuple
 
 _CFFEX_INDEX = frozenset({'if', 'ih', 'ic', 'im', 'io', 'ho', 'mo'})
 _CFFEX_TREASURY = frozenset({'t', 'tf', 'ts', 'tl'})
-_SHFE_LONG_NIGHT = frozenset({'au', 'ag', 'cu', 'al', 'zn', 'pb', 'ni', 'sn'})
-_INE_LONG_NIGHT = frozenset({'sc', 'bc'})
+# SHFE/INE 夜盘结束时刻（上期所官网）：金银原油 02:30；有色/不锈钢/氧化铝/国际铜 01:00；其余商品 23:00。
+_NIGHT_END_0230 = frozenset({'au', 'ag', 'sc'})
+_NIGHT_END_0100 = frozenset({
+    'cu', 'al', 'zn', 'pb', 'ni', 'sn', 'ss', 'ao', 'ad', 'bc',
+})
+# 无夜盘的纯日盘商品品种（广期所/大商所/郑商所/上期所/能源中心）：
+# 夜盘时段 21:00-23:00 不开市，须判为 off，避免主循环扫描或补腿撞拒单。
+_NO_NIGHT_PRODUCTS = frozenset({
+    'si', 'lc', 'ps',                      # GFEX: 工业硅、碳酸锂、多晶硅
+    'lg', 'lh', 'jd', 'fb', 'bb', 'rr',    # DCE: 原木、生猪、鸡蛋、纤板、胶板、粳米
+    'ur', 'ap', 'cj', 'pk', 'sm', 'sf',    # CZCE: 尿素、苹果、红枣、花生、锰硅、硅铁
+    'wh', 'pm', 'ri', 'lr', 'jr', 'rs',    # CZCE: 麦/稻/菜籽
+    'wr', 'ec',                            # SHFE/INE: 线材、集运欧线
+})
+_SHFE_KNOWN = frozenset({'au', 'ag', 'cu', 'al', 'zn', 'pb', 'ni', 'sn', 'ss', 'ao', 'ad', 'wr'})
+_INE_KNOWN = frozenset({'sc', 'bc', 'ec'})
 
 _MORNING_BREAK_END_MIN = 10 * 60 + 30  # 10:30
 _MORNING_BREAK_START_MIN = 10 * 60 + 15  # 10:15
@@ -34,9 +48,9 @@ def _fallback_exchange(symbol: str) -> str:
     product = _extract_product(symbol)
     if product in _CFFEX_INDEX or product in _CFFEX_TREASURY:
         return 'CFFEX'
-    if product in _SHFE_LONG_NIGHT:
+    if product in _SHFE_KNOWN:
         return 'SHFE'
-    if product in _INE_LONG_NIGHT:
+    if product in _INE_KNOWN:
         return 'INE'
     return 'DCE'
 
@@ -49,19 +63,28 @@ def _exchange_for(symbol: str) -> str:
         return _fallback_exchange(symbol)
 
 
-def _night_end_minutes(product: str, exchange: str, overrides: Dict[str, str]) -> Tuple[int, bool]:
-    """Return (end_minutes, cross_day). cross_day=True => ends 02:30 next calendar day."""
-    ov = (overrides or {}).get(product) or (overrides or {}).get(product.upper())
-    if ov:
+def _night_end_minutes(
+    product: str,
+    _exchange: str,
+    overrides: Dict[str, str],
+) -> Optional[Tuple[int, bool]]:
+    """Return (end_minutes, cross_day) or None when the product has no night session."""
+    ov_map = overrides or {}
+    if product in ov_map or product.upper() in ov_map:
+        ov = ov_map[product] if product in ov_map else ov_map[product.upper()]
+        if ov is None or str(ov).strip().lower() in ('', 'none', 'off', 'false'):
+            return None
         parts = str(ov).strip().split(':')
         h, mi = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
         end = h * 60 + mi
         return (end, end <= 2 * 60 + 30)
 
-    if (exchange == 'SHFE' and product in _SHFE_LONG_NIGHT) or (
-        exchange == 'INE' and product in _INE_LONG_NIGHT
-    ):
+    if product in _NO_NIGHT_PRODUCTS:
+        return None
+    if product in _NIGHT_END_0230:
         return (2 * 60 + 30, True)
+    if product in _NIGHT_END_0100:
+        return (1 * 60, True)
     return (23 * 60, False)
 
 
@@ -130,7 +153,10 @@ def _trading_segments_for_symbol(
         return [(a, b, False) for a, b in _cffex_day_trading_segments(product)]
 
     day_segs = _commodity_day_trading_segments()
-    night_end, cross = _night_end_minutes(product, exchange, overrides)
+    night = _night_end_minutes(product, exchange, overrides)
+    if night is None:
+        return [(a, b, False) for a, b in day_segs]
+    night_end, cross = night
     night_start = 21 * 60
     if cross:
         return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, True)]
@@ -153,7 +179,10 @@ def _close_guard_segments_for_symbol(
         return [(a, b, False) for a, b in _cffex_day_close_guard_segments(product)]
 
     day_segs = _commodity_day_close_guard_segments(include_break)
-    night_end, cross = _night_end_minutes(product, exchange, overrides)
+    night = _night_end_minutes(product, exchange, overrides)
+    if night is None:
+        return [(a, b, False) for a, b in day_segs]
+    night_end, cross = night
     night_start = 21 * 60
     if cross:
         return [(a, b, False) for a, b in day_segs] + [(night_start, night_end, True)]

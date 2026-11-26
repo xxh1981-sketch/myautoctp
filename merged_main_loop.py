@@ -435,7 +435,7 @@ def run_merged_main_loop(
     _last_housekeeping_time = time.time()
     # 单轮看门狗：一轮耗时超阈值（CTP 查询变慢/半挂会令对账+保证金串行查询拖长）
     # 时升级为 WARNING + 冷却飞书，给无人值守可观测性（不打断本轮，仅告警）。
-    _round_slow_warn_sec = float(config.get('round_slow_warn_sec', 60) or 0)
+    _round_slow_warn_sec = float(config.get('round_slow_warn_sec', 100) or 0)
     _slow_round_alert_cooldown = float(config.get('slow_round_alert_cooldown_sec', 300) or 0)
     _last_slow_round_alert_time = 0.0
     _max_strangle_scan_sec = float(config.get('max_strangle_scan_sec', 0) or 0)
@@ -1062,6 +1062,15 @@ def run_merged_main_loop(
                                                 spread_rem = max(
                                                     0, spread_daily_limit - spread_filled,
                                                 )
+                                            else:
+                                                # 与轮初 fc=None 及下方异常分支一致：计数不可信时禁新开，
+                                                # 避免保留旧余量让同轮后续品种继续开仓。
+                                                s_logger.warning(
+                                                    '价差日笔数刷新返回 None，本轮余量置 0 '
+                                                    '保守禁新开'
+                                                )
+                                                spread_rem = 0
+                                                spread_open_ok = False
                                         except Exception as e:
                                             # 与轮初 fc=None 一致：计数不可信时禁新开，
                                             # 不用 +1 估计（避免与真实笔数漂移）。
@@ -1123,12 +1132,21 @@ def run_merged_main_loop(
                         skip_rebal = True
                         skip_rebal_reason = '飞书暂停'
                     else:
-                        from session_close_guard import should_skip_strangle_rebalance
+                        from session_close_guard import (
+                            prioritize_in_session_unmatched,
+                            should_skip_strangle_rebalance,
+                        )
                         skip_rebal, skip_rebal_reason = (
                             should_skip_strangle_rebalance(
                                 conn, config, ledger, strangle_tradeinfo,
                             )
                         )
+                        if not skip_rebal:
+                            moved = prioritize_in_session_unmatched(ledger, config)
+                            if moved:
+                                s_logger.info(
+                                    f'收盘守卫：{moved} 条非本时段未配对腿延后处理'
+                                )
                     if skip_rebal and skip_rebal_reason != '飞书暂停':
                         s_logger.info(
                             f'收盘守卫：{skip_rebal_reason}，跳过宽跨再平衡'
@@ -1327,6 +1345,20 @@ def run_merged_main_loop(
                 time.sleep(loop_interval)
     except KeyboardInterrupt:
         logger.info("用户中断")
+        try:
+            from unattended_heartbeat import write_restart_reason, write_stopped_heartbeat
+
+            reason = 'USER_INTERRUPT'
+            try:
+                import merged_main as _merged_main
+                if getattr(_merged_main, '_shutdown_requested', False):
+                    reason = 'SIGTERM'
+            except Exception:
+                pass
+            write_restart_reason(config, reason, logger=logger)
+            write_stopped_heartbeat(config, reason=reason, logger=logger)
+        except Exception as hb_err:
+            logger.debug(f'[退出] STOPPED 心跳写入失败: {hb_err}')
     finally:
         try:
             from shutdown_cancel import cancel_pending_on_shutdown

@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
-from trade_journal import is_plausible_ctp_trade, trade_dedupe_key
+from trade_journal import is_plausible_ctp_trade, iter_trade_dedupe_keys
 
 
 def _cache_path(config: dict) -> str:
@@ -134,9 +134,11 @@ def record_trades_to_cache(
                         continue
                     if not is_plausible_ctp_trade(row):
                         continue
-                    key = row.get('dedupe_key')
-                    if key:
-                        existing.add(str(key))
+                    for k in iter_trade_dedupe_keys(row):
+                        existing.add(k)
+                    cached_key = row.get('dedupe_key')
+                    if cached_key:
+                        existing.add(str(cached_key))
         except OSError as e:
             if logger:
                 logger.debug(f'[trade_replay] 读缓存失败: {e}')
@@ -159,14 +161,14 @@ def record_trades_to_cache(
                 td = _trade_date_yyyymmdd(trade)
                 if td < cutoff:
                     continue
-                key = trade_dedupe_key(trade)
-                if key in existing:
+                keys = list(iter_trade_dedupe_keys(trade))
+                if any(k in existing for k in keys):
                     continue
                 row = dict(trade)
-                row['dedupe_key'] = key
+                row['dedupe_key'] = keys[0]
                 row['trade_date'] = td
                 f.write(json.dumps(row, ensure_ascii=False) + '\n')
-                existing.add(key)
+                existing.update(keys)
                 new_count += 1
             f.flush()
             os.fsync(f.fileno())
@@ -217,25 +219,43 @@ def merge_trades_for_replay(
     *,
     logger=None,
 ) -> Optional[List[dict]]:
-    """Merge CTP query result with on-disk replay cache; dedupe by trade key."""
+    """Merge CTP query result with on-disk replay cache; dedupe by trade key.
+
+    ``live is None`` means the CTP query failed. Empty list means a successful
+    query with no trades. Callers that must not rebuild ledgers from a failed
+    query should treat ``None`` as skip.
+    """
     lookback = trade_replay_lookback_days(config)
-    live = list(live or [])
+    query_failed = live is None
+    live_list = list(live or [])
     if lookback > 0:
         purge_invalid_cache_entries(config, logger=logger)
-        record_trades_to_cache(live, config, logger=logger)
+        if not query_failed:
+            record_trades_to_cache(live_list, config, logger=logger)
     if lookback <= 0:
-        return live if live is not None else None
+        return None if query_failed else live_list
 
-    merged: Dict[str, dict] = {}
-    for trade in live:
-        merged[trade_dedupe_key(trade)] = trade
+    seen: Set[str] = set()
+    out: List[dict] = []
+
+    def _add(trade: dict) -> None:
+        keys = list(iter_trade_dedupe_keys(trade))
+        cached_key = trade.get('dedupe_key')
+        if cached_key:
+            keys.append(str(cached_key))
+        if any(k in seen for k in keys):
+            return
+        for k in keys:
+            seen.add(k)
+        out.append(trade)
+
+    for trade in live_list:
+        _add(trade)
     for trade in load_cached_trades(config, lookback_days=lookback):
-        key = trade.get('dedupe_key') or trade_dedupe_key(trade)
-        if key not in merged:
-            merged[str(key)] = trade
-    if not merged and live is None:
+        _add(trade)
+    if not out and query_failed:
         return None
-    return list(merged.values())
+    return out
 
 
 def query_trades_for_replay(conn, config: dict, *, logger=None) -> Optional[List[dict]]:

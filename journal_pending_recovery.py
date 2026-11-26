@@ -72,7 +72,7 @@ def _heal_net_csv_journal(
 
         by_inst: dict = {}
         for row in rows:
-            inst = str(row.get('instrument') or '').strip()
+            inst = str(row.get('instrument') or '').strip().upper()
             by_inst.setdefault(inst, []).append(row)
 
         try:

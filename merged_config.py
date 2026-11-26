@@ -1,5 +1,6 @@
 """配置：autotrade 统一配置 + autoctp 本地 merged_config.yaml。"""
 
+import copy
 import os
 from typing import Any, Dict, Tuple
 
@@ -171,8 +172,8 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     # 之后才算周末，避开周五夜盘跨零点到周六凌晨。
     'weekend_pause_enabled': True,
     'weekend_pause_saturday_from_hour': 5,
-    # 单轮看门狗：一轮耗时超阈值告警（与 merged_config.yaml 默认 60 对齐）。
-    'round_slow_warn_sec': 60,
+    # 单轮看门狗：一轮耗时超阈值告警（与 merged_config.yaml 默认 100 对齐）。
+    'round_slow_warn_sec': 100,
     # 宽跨每轮扫描时间预算（秒）；0=不限制。仅 defer 后续品种，不中断当前品种。
     'max_strangle_scan_sec': 600,
     'health_offline_log_cooldown_sec': 60,
@@ -250,12 +251,14 @@ MERGED_TOP_LEVEL_DEFAULTS = {
             '持仓追踪器超过',
             'analyze_position_imbalance 计算结果',
             '不平衡检查:',
+            '获取平仓锁超时',
         ],
         'downgrade': [
             {'substring': '当前状态禁止此项操作', 'to_level': 'WARNING'},
             {'substring': '配对失败', 'to_level': 'WARNING'},
             {'substring': '不允许重复报单', 'to_level': 'WARNING'},
             {'substring': '订单不在pending且查询无结果', 'to_level': 'WARNING'},
+            {'substring': '获取平仓锁超时', 'to_level': 'WARNING'},
         ],
     },
 }
@@ -346,6 +349,14 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
         if not ok:
             errors.append('strangle.unmatched_leg_metadata_alert_cooldown_sec 必须为数字')
 
+    feishu_cmd = ((config.get('notifications') or {}).get('feishu_command') or {})
+    if isinstance(feishu_cmd, dict) and 'mode' in feishu_cmd:
+        mode = feishu_cmd.get('mode')
+        if not isinstance(mode, str) or mode not in ('poll', 'ws'):
+            errors.append(
+                f"notifications.feishu_command.mode 必须为 'poll' 或 'ws'，当前: {mode!r}"
+            )
+
     if 'global_margin_limit' not in config:
         return errors, warnings
     margin_limit = float(config.get('global_margin_limit') or 0)
@@ -362,6 +373,25 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
             )
 
     return errors, warnings
+
+
+def apply_strangle_section(config: Dict[str, Any]) -> None:
+    """Merge ``STRANGLE_DEFAULTS`` into ``config['strangle']`` and resolve paths.
+
+    Does **not** copy ``min_days_to_expiry`` / ``close_days_to_expiry`` onto
+    top-level config. autotrade spread open/close read those keys (defaults
+    10 / 2). Strangle reads ``config['strangle']`` only.
+    """
+    strangle_cfg = _merge_dict(STRANGLE_DEFAULTS, config.get('strangle') or {})
+    ledger = strangle_cfg.get('ledger_path', 'data/ledger_strangle.json')
+    if not os.path.isabs(ledger):
+        ledger = os.path.join(_project_dir(), ledger)
+    strangle_cfg['ledger_path'] = ledger
+    hv_close = strangle_cfg.get('hv_close_path', 'tradeinfo/futures.xlsx')
+    if not os.path.isabs(hv_close):
+        hv_close = os.path.join(_project_dir(), hv_close)
+    strangle_cfg['hv_close_path'] = hv_close
+    config['strangle'] = strangle_cfg
 
 
 def load_merged_config(local_path: str = None) -> Dict[str, Any]:
@@ -383,30 +413,19 @@ def load_merged_config(local_path: str = None) -> Dict[str, Any]:
         config = _merge_dict(config, pre_cfg)
 
     for key, default_val in MERGED_TOP_LEVEL_DEFAULTS.items():
-        if key not in pre_cfg:
-            config[key] = default_val
+        if isinstance(default_val, dict):
+            existing_val = config.get(key)
+            config[key] = _merge_dict(
+                copy.deepcopy(default_val),
+                existing_val if isinstance(existing_val, dict) else {},
+            )
+        elif key not in pre_cfg:
+            config[key] = copy.deepcopy(default_val)
 
     dual_cfg = _merge_dict(DUAL_STRATEGY_DEFAULTS, config.get('dual_strategy') or {})
     config['dual_strategy'] = dual_cfg
 
-    strangle_cfg = _merge_dict(STRANGLE_DEFAULTS, config.get('strangle') or {})
-    config['strangle'] = strangle_cfg
-    config['min_days_to_expiry'] = strangle_cfg.get(
-        'min_days_to_expiry', config.get('min_days_to_expiry', 60))
-    config['close_days_to_expiry'] = strangle_cfg.get(
-        'close_days_to_expiry', config.get('close_days_to_expiry', 30))
-
-    ledger = strangle_cfg.get('ledger_path', 'data/ledger_strangle.json')
-    if not os.path.isabs(ledger):
-        ledger = os.path.join(_project_dir(), ledger)
-    strangle_cfg['ledger_path'] = ledger
-    config['strangle']['ledger_path'] = ledger
-
-    hv_close = strangle_cfg.get('hv_close_path', 'tradeinfo/futures.xlsx')
-    if not os.path.isabs(hv_close):
-        hv_close = os.path.join(_project_dir(), hv_close)
-    strangle_cfg['hv_close_path'] = hv_close
-    config['strangle']['hv_close_path'] = hv_close
+    apply_strangle_section(config)
 
     ack = config.get('dual_strategy', {}).get('startup_ack_file', 'data/position_startup_ack.txt')
     if not os.path.isabs(ack):

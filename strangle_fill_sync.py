@@ -19,7 +19,9 @@ from trade_journal import (
     append_journal,
     load_applied_keys,
     map_direction_offset,
+    offset_is_close,
     trade_dedupe_key,
+    trade_in_applied_keys,
 )
 from trade_journal_lock import journal_lock
 
@@ -29,11 +31,12 @@ def _skip_strangle_fill_on_spread_owned_only(
     conn,
     instrument: str,
     logger=None,
+    offset: str = '',
 ) -> tuple:
     """
     宽跨段成交但合约仅由价差认领、宽跨认领为 0 → 勿写入 strangle CSV。
 
-    对称 spread_fill_sync._skip_spread_fill_on_strangle_owned_only。
+    只拦截平仓（价差成交误用宽跨 OrderRef）。开仓允许同 strike 重叠。
     """
     dual = config.get('dual_strategy') or {}
     if not dual.get('strangle_fill_skip_spread_owned_instruments', True):
@@ -60,6 +63,10 @@ def _skip_strangle_fill_on_spread_owned_only(
                 'strangle_store_unavailable_fallback=allow。'
                 '请确认启动顺序和 wire_spread_trade_runtime 已安装。'
             )
+        return False, '', ''
+
+    # 账本可用后：开仓允许同 strike 重叠；仅平仓拦截「价差独有」误平。
+    if not offset_is_close(offset):
         return False, '', ''
 
     key = (instrument or '').strip().upper()
@@ -121,7 +128,7 @@ def apply_strangle_trade_record(
 
     with journal_lock(journal_file):
         applied = load_applied_keys(journal_file, config, include_pending=True)
-        if dedupe_key in applied:
+        if trade_in_applied_keys(applied, trade):
             return False
 
         instrument = (trade.get('instrument') or '').strip()
@@ -165,7 +172,7 @@ def apply_strangle_trade_record(
                 return False
 
         skip_owned, skip_reason_key, skip_reason = _skip_strangle_fill_on_spread_owned_only(
-            config, conn, instrument, logger=logger,
+            config, conn, instrument, logger=logger, offset=trade.get('offset'),
         )
         if skip_owned:
             if logger:
@@ -409,7 +416,7 @@ def sync_csv_from_strangle_trades(
         if not is_strangle_order_ref(trade.get('order_ref'), config):
             continue
         key = trade_dedupe_key(trade)
-        if key in applied:
+        if trade_in_applied_keys(applied, trade):
             continue
         if apply_strangle_trade_record(config, ledger, trade, logger, journal_file, conn=conn):
             applied.add(key)

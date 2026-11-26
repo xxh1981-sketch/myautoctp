@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
-from pairtrade.constants import DIRECTION_BUY, OFFSET_OPEN
+from pairtrade.constants import DIRECTION_BUY, OFFSET_CLOSE, OFFSET_OPEN
 from spread_ledger import SpreadLegStore
 from strangle_fill_sync import (
     apply_strangle_trade_record,
@@ -232,7 +232,7 @@ class TestStrangleFillSync(unittest.TestCase):
                 'order_ref': 500001,
                 'instrument': 'SA609C1000',
                 'direction': DIRECTION_BUY,
-                'offset': OFFSET_OPEN,
+                'offset': OFFSET_CLOSE,
                 'volume': 1,
                 'trade_id': 'T7',
             }
@@ -246,6 +246,28 @@ class TestStrangleFillSync(unittest.TestCase):
             self.assertFalse(applied)
             self.assertEqual(reason, 'spread_owned_only')
 
+    def test_spread_owned_open_overlap_is_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            ledger = MagicMock()
+            spread_store = SpreadLegStore()
+            spread_store.set_leg_claims({'SA609C1000': 1})
+            conn = MagicMock()
+            conn._runtime_state = {'_spread_leg_store': spread_store}
+            trade = {
+                'order_ref': 500001,
+                'instrument': 'SA609C1000',
+                'direction': DIRECTION_BUY,
+                'offset': OFFSET_OPEN,
+                'volume': 1,
+                'trade_id': 'T7_OPEN',
+            }
+            self.assertTrue(apply_strangle_trade_record(cfg, ledger, trade, conn=conn))
+            ledger.set_leg_claims.assert_called_once()
+            journal = cfg['dual_strategy']['strangle_trade_journal']
+            body = open(journal, encoding='utf-8').read()
+            self.assertNotIn('spread_owned_only', body)
+
     def test_spread_owned_bad_claim_volume_treated_as_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)
@@ -258,7 +280,7 @@ class TestStrangleFillSync(unittest.TestCase):
                 'order_ref': 500001,
                 'instrument': 'SA609C1000',
                 'direction': DIRECTION_BUY,
-                'offset': OFFSET_OPEN,
+                'offset': OFFSET_CLOSE,
                 'volume': 1,
                 'trade_id': 'T8',
             }
