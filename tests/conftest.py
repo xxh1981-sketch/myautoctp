@@ -41,11 +41,45 @@ def _ensure_pairtrade_constants_stub() -> None:
     _pt_const.OFFSET_CLOSE_YESTERDAY = '4'
     _pt_config = types.ModuleType('pairtrade.config')
     _pt_config.adjust_price = lambda price, tick: float(price)
+    # ctp_instrument / session_close_calendar 依赖 get_exchange_type 判交易所
+    # 大小写与交易时段；stub 缺失会让 DCE 前缀重写与 CFFEX 时段全部失效。
+    _pt_exchange = types.ModuleType('pairtrade.exchange')
+    _czce = frozenset({
+        'sr', 'cf', 'cy', 'ap', 'cj', 'fg', 'sa', 'ur', 'ma', 'ta', 'pf',
+        'rm', 'oi', 'zc', 'sf', 'sm', 'sh', 'pk', 'px',
+    })
+    _cffex = frozenset({'if', 'ih', 'ic', 'im', 'io', 'ho', 'mo', 't', 'tf', 'ts', 'tl'})
+    _shfe = frozenset({
+        'au', 'ag', 'cu', 'al', 'zn', 'pb', 'ni', 'sn', 'rb', 'hc', 'fu',
+        'bu', 'ru', 'sp', 'ss', 'br', 'ao',
+    })
+    _ine = frozenset({'sc', 'bc', 'lu', 'nr', 'ec'})
+    _gfex = frozenset({'si', 'lc', 'ps'})
+
+    def _get_exchange_type(symbol):
+        import re
+        m = re.match(r'([a-zA-Z]+)', str(symbol or ''))
+        product = m.group(1).lower() if m else ''
+        if product in _czce:
+            return 'CZCE'
+        if product in _cffex:
+            return 'CFFEX'
+        if product in _shfe:
+            return 'SHFE'
+        if product in _ine:
+            return 'INE'
+        if product in _gfex:
+            return 'GFEX'
+        return 'DCE'
+
+    _pt_exchange.get_exchange_type = _get_exchange_type
     _pt.constants = _pt_const
     _pt.config = _pt_config
+    _pt.exchange = _pt_exchange
     sys.modules['pairtrade'] = _pt
     sys.modules['pairtrade.constants'] = _pt_const
     sys.modules['pairtrade.config'] = _pt_config
+    sys.modules['pairtrade.exchange'] = _pt_exchange
 
 
 import autotrade_stubs

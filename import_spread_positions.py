@@ -61,19 +61,29 @@ def load_spread_positions_csv(path: str) -> Dict[str, int]:
                 raise ValueError(f"{path} line {line_no}: expected 2 columns (instrument, volume)")
             if line_no == 1 and _looks_like_header(row):
                 continue
-            inst = str(row[0]).strip()
+            inst = str(row[0]).strip().upper()
             vol = int(str(row[1]).strip())
             if not inst:
                 raise ValueError(f"{path} line {line_no}: instrument is empty")
             if vol == 0:
                 raise ValueError(f"{path} line {line_no}: volume must be non-zero")
             claims[inst] = claims.get(inst, 0) + vol
-    return claims
+    # 合并大小写变体后可能轧成 0
+    return {k: v for k, v in claims.items() if int(v) != 0}
 
 
 def save_spread_positions_csv(path: str, claims: Dict[str, int]) -> None:
     rows = sorted(
-        ((inst, int(vol)) for inst, vol in (claims or {}).items() if int(vol) != 0),
+        ((str(inst).strip().upper(), int(vol))
+         for inst, vol in (claims or {}).items() if int(vol) != 0),
+        key=lambda x: x[0],
+    )
+    # 合并同键
+    merged: Dict[str, int] = {}
+    for inst, vol in rows:
+        merged[inst] = merged.get(inst, 0) + vol
+    rows = sorted(
+        ((inst, vol) for inst, vol in merged.items() if vol != 0),
         key=lambda x: x[0],
     )
     buf = io.StringIO()
@@ -107,7 +117,7 @@ def read_spread_claim_volume(config: dict, instrument: str) -> int:
     读取失败时抛出（与 :func:`apply_fill_to_spread_csv` 一致，绝不静默当 0），
     供成交入账记录 pre_volume，以及自愈器比对 on-disk CSV。
     """
-    inst = str(instrument or '').strip()
+    inst = str(instrument or '').strip().upper()
     if not inst:
         return 0
     path = spread_positions_csv_path(config)
@@ -143,7 +153,7 @@ def apply_fill_to_spread_csv(
                     f"[价差持仓] 读取 CSV 失败，拒绝重建以保护既有认领: {e} ({path})"
                 )
             raise
-    inst = str(instrument).strip()
+    inst = str(instrument).strip().upper()
     new_vol = int(claims.get(inst, 0)) + delta
     if new_vol == 0:
         claims.pop(inst, None)

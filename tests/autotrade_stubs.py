@@ -149,10 +149,15 @@ def _install_auto_closer_executor(mod):
         base_future_price=None,
         price_change_threshold=None,
         strategy='spread',
+        **kwargs,
     ):
         return False, 0, 0.0
 
+    def _close_single_leg(*_a, **_kw):
+        return False, 0, 0.0
+
     mod._send_and_wait = _send_and_wait
+    mod._close_single_leg = _close_single_leg
     mod.execute_close_orders_with_limit = lambda *a, **kw: (False, 0)
 
 
@@ -296,20 +301,69 @@ def _install_straggle_reconcile(mod):
     mod.reconcile_strangle_positions = lambda *a, **kw: (False, [])
 
 
+def _resolve_mapping_key(mapping, instrument):
+    """精确匹配后大小写回退（简化版 resolve_quotes_key，与 autotrade 语义一致）。"""
+    if not mapping or not instrument:
+        return None
+    if instrument in mapping:
+        return instrument
+    target = str(instrument).upper()
+    for key in list(mapping.keys()):
+        if str(key).upper() == target:
+            return key
+    return None
+
+
+def _install_auto_connection_utils(mod):
+    def resolve_quotes_key(conn, instrument):
+        return _resolve_mapping_key(getattr(conn, 'quotes', None), instrument)
+
+    def lookup_quote(conn, instrument):
+        quotes = getattr(conn, 'quotes', None)
+        key = _resolve_mapping_key(quotes, instrument)
+        return quotes.get(key) if key is not None else None
+
+    def resolve_option_quotes_key(conn, instrument):
+        return _resolve_mapping_key(getattr(conn, 'option_quotes', None), instrument)
+
+    def lookup_option_quote(conn, instrument):
+        oq = getattr(conn, 'option_quotes', None)
+        key = _resolve_mapping_key(oq, instrument)
+        return oq.get(key) if key is not None else None
+
+    def lookup_contract_info(contract_index, instrument):
+        key = _resolve_mapping_key(contract_index, instrument)
+        if key is None:
+            return None, None
+        return key, contract_index.get(key)
+
+    mod.months_match = _months_match
+    mod.contract_case_variants = _contract_case_variants
+    mod.extract_month_from_contract = _extract_month_from_contract
+    mod.extract_symbol_prefix = _extract_symbol_prefix
+    mod.resolve_quotes_key = resolve_quotes_key
+    mod.lookup_quote = lookup_quote
+    mod.resolve_option_quotes_key = resolve_option_quotes_key
+    mod.lookup_option_quote = lookup_option_quote
+    mod.lookup_contract_info = lookup_contract_info
+
+
+def _install_auto_position(mod):
+    mod.extract_strike_from_instrument = _extract_strike_from_instrument
+    # spread_ledger_execution.install_spread_analyze_from_ledger 需要这两个
+    # 原函数存在才能保存/替换；stub 提供 no-op 供 patch 链路走通。
+    mod.analyze_position_imbalance = lambda *a, **kw: None
+    mod.check_position_limits = lambda *a, **kw: (True, '')
+
+
 _STUB_BUILDERS = {
     'auto_connection': lambda mod: (
         setattr(mod, 'extract_symbol_prefix', _extract_symbol_prefix),
         setattr(mod, 'months_match', _months_match),
     ),
-    'auto_connection_utils': lambda mod: (
-        setattr(mod, 'months_match', _months_match),
-        setattr(mod, 'contract_case_variants', _contract_case_variants),
-        setattr(mod, 'extract_month_from_contract', _extract_month_from_contract),
-    ),
+    'auto_connection_utils': _install_auto_connection_utils,
     'auto_order_manager': _install_auto_order_manager,
-    'auto_position': lambda mod: setattr(
-        mod, 'extract_strike_from_instrument', _extract_strike_from_instrument,
-    ),
+    'auto_position': _install_auto_position,
     'auto_risk': lambda mod: setattr(
         mod, 'sum_positions_margin_for_limit', _sum_positions_margin_for_limit,
     ),

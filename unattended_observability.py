@@ -12,6 +12,9 @@ from typing import List
 
 DEFAULT_CONFIG_DRIFT_CHECK_INTERVAL_SEC = 600.0
 DEFAULT_HALT_RECOVERY_COOLDOWN_SEC = 300.0
+DEFAULT_HV_STALE_WARN_DAYS = 7.0
+DEFAULT_HV_STALE_CHECK_INTERVAL_SEC = 21600.0
+DEFAULT_HV_STALE_ALERT_COOLDOWN_SEC = 86400.0
 
 _HALT_TRACKERS = (
     ('margin', '_margin_halt_open', '保证金 halt'),
@@ -123,6 +126,93 @@ def maybe_alert_config_drift(conn, config: dict, logger=None) -> bool:
 
     if logger:
         logger.warning('[配置] merged_config.yaml drift 飞书发送未成功')
+    return False
+
+
+def maybe_alert_hv_staleness(conn, config: dict, logger=None) -> bool:
+    """宽跨 HV 收盘价库（tradeinfo/futures.xlsx）过期 / 缺失飞书提醒。
+
+    该库由用户手工维护；漏更新时宽跨平价溢价率会继续用旧 HV（缺失时静默
+    回退 tradeinfo vol_basis）正常交易，没有任何 halt——这是唯一的提醒通道。
+    以文件 mtime 为新鲜度代理（手工更新即刷新 mtime，免去 xlsx 解析依赖）。
+    纯可观测性：只告警，不改变信号或交易语义。Returns True when alert sent.
+    """
+    str_cfg = config.get('strangle') or {}
+    if not bool(str_cfg.get('hv_stale_alert_enabled', True)):
+        return False
+    warn_days = float(
+        str_cfg.get('hv_stale_warn_days', DEFAULT_HV_STALE_WARN_DAYS) or 0,
+    )
+    if warn_days <= 0:
+        return False
+
+    runtime = _runtime(conn)
+    now = time.time()
+    interval = float(
+        str_cfg.get(
+            'hv_stale_check_interval_sec', DEFAULT_HV_STALE_CHECK_INTERVAL_SEC,
+        ) or 0,
+    )
+    last_check = float(runtime.get('_hv_stale_last_check_at', 0.0) or 0.0)
+    if interval > 0 and now - last_check < interval:
+        return False
+    runtime['_hv_stale_last_check_at'] = now
+
+    path = str(str_cfg.get('hv_close_path') or '').strip()
+    if not path:
+        return False
+
+    if not os.path.isfile(path):
+        detail = f'HV 收盘价库不存在: `{path}`\n宽跨 sigma 将静默回退 tradeinfo vol_basis。'
+        age_days = None
+    else:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError as e:
+            if logger:
+                logger.debug(f'[宽跨HV] 过期检查 mtime 失败: {e}')
+            return False
+        age_days = (now - mtime) / 86400.0
+        if age_days < warn_days:
+            runtime['_hv_stale_last_alert_ts'] = 0.0
+            return False
+        updated_at = datetime.fromtimestamp(mtime).isoformat(timespec='seconds')
+        detail = (
+            f'文件: `{path}`\n'
+            f'最后更新: {updated_at}（约 {age_days:.1f} 天前，阈值 {warn_days:.0f} 天）\n'
+            '宽跨平价溢价率仍在用旧 HV 计算建仓/平仓信号。'
+        )
+
+    cooldown = float(
+        str_cfg.get(
+            'hv_stale_alert_cooldown_sec', DEFAULT_HV_STALE_ALERT_COOLDOWN_SEC,
+        ) or 0,
+    )
+    last_alert = float(runtime.get('_hv_stale_last_alert_ts', 0.0) or 0.0)
+    if cooldown > 0 and now - last_alert < cooldown:
+        return False
+
+    body = (
+        '⚠️ **宽跨 HV 收盘价库需要更新**\n\n'
+        f'{detail}\n\n'
+        '请更新 tradeinfo 收盘价库（无需重启，下次信号计算即读到新数据）。'
+    )
+    if logger:
+        logger.warning(
+            '[宽跨HV] 收盘价库%s（%s）',
+            '缺失' if age_days is None else f'已 {age_days:.1f} 天未更新',
+            path,
+        )
+    try:
+        from auto_feishu import send_feishu_message
+        ok = bool(send_feishu_message(body, config=config))
+    except Exception as e:
+        if logger:
+            logger.warning(f'[宽跨HV] 过期飞书告警失败: {e}')
+        return False
+    if ok:
+        runtime['_hv_stale_last_alert_ts'] = now
+        return True
     return False
 
 

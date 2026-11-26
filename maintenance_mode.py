@@ -10,8 +10,15 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 _GUARD_INSTALLED = False
+_INSTALL_ERROR: Optional[str] = None
+
+
+def get_install_error() -> Optional[str]:
+    """返回最近一次安装失败原因（成功为 None），与其它守卫模块约定一致。"""
+    return _INSTALL_ERROR
 
 
 def _project_dir() -> str:
@@ -49,12 +56,15 @@ def should_block_trading(conn, config: dict = None) -> bool:
 
 def install_maintenance_guard(config: dict = None) -> bool:
     """Patch send_order / close send / cancel paths once per process."""
-    global _GUARD_INSTALLED
+    global _GUARD_INSTALLED, _INSTALL_ERROR
     if _GUARD_INSTALLED:
+        _INSTALL_ERROR = None
         return True
     try:
         import auto_order_manager as aom
-    except ImportError:
+    except ImportError as e:
+        # 调用方须检查返回值并告警（永远 non-fatal，见 unattended-audit-no-change）。
+        _INSTALL_ERROR = f'auto_order_manager 不可用: {e}'
         return False
 
     original = aom.OrderManager.send_order
@@ -84,6 +94,7 @@ def install_maintenance_guard(config: dict = None) -> bool:
                 base_future_price: float = None,
                 price_change_threshold: float = None,
                 strategy: str = 'spread',
+                **kwargs,
             ):
                 if should_block_trading(conn, config):
                     logger.info(
@@ -96,6 +107,7 @@ def install_maintenance_guard(config: dict = None) -> bool:
                     base_future_price=base_future_price,
                     price_change_threshold=price_change_threshold,
                     strategy=strategy,
+                    **kwargs,
                 )
 
             guarded_send_and_wait._maintenance_wrapped = True  # type: ignore[attr-defined]
@@ -104,6 +116,7 @@ def install_maintenance_guard(config: dict = None) -> bool:
         pass
 
     _GUARD_INSTALLED = True
+    _INSTALL_ERROR = None
     return True
 
 

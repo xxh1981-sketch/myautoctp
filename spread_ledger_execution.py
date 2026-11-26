@@ -7,7 +7,11 @@ Halt paths (by design):
 
 from __future__ import annotations
 
+import logging
+import sys
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 from spread_close_ledger import (
     build_positions_from_spread_claims,
@@ -81,6 +85,9 @@ def install_spread_analyze_from_ledger(config: dict) -> None:
     def _resolve_positions(conn, positions, symbol, month, config, logger):
         store = store_from_conn(conn)
         if store is not None:
+            from spread_position_sync import converge_flat_spread_claims
+
+            converge_flat_spread_claims(conn, store, symbol, month, config, logger)
             ledger_pos = build_positions_from_spread_claims(store, conn, symbol, month)
             if logger:
                 if ledger_pos:
@@ -217,6 +224,22 @@ def install_spread_process_symbol_halt(config: dict) -> None:
         runtime = getattr(conn, '_runtime_state', None) or {}
         if runtime.get('_spread_open_halted'):
             return _spread_close_only(conn, item, vix_engine, config, logger)
+        # 防御：直调 process_symbol 时也拦「空账本 + CTP 残仓」误开
+        try:
+            from spread_open_preflight import (
+                should_block_spread_open_empty_book_ctp_residual,
+            )
+
+            if should_block_spread_open_empty_book_ctp_residual(
+                conn, item, logger, spread_open_ok=True,
+            ):
+                sym = str(item.get('future') or '').lower()
+                logger.warning(
+                    f'[{sym}] 账本无价差认领但 CTP 仍有 Call 残仓，禁止当空仓开仓'
+                )
+                return False
+        except Exception:
+            pass
         return _ORIG_PROCESS_SYMBOL(
             conn, item, vix_engine, config, logger, remaining_limit=remaining_limit,
         )
@@ -370,6 +393,57 @@ def install_spread_rebalance_close_a_exclusion(config: dict) -> None:
     _REBALANCE_CLOSE_A_PATCHED = True
 
 
+def _surface_leg_pairing_install_failure(config: dict) -> None:
+    from strangle_leg_pairing import get_install_error
+
+    reason = get_install_error() or '未知原因'
+    msg = (
+        f'宽跨 leg_claims 配对补丁未安装：{reason}。'
+        'surplus leg_claims 不会推断配对/单腿平仓或补腿，裸腿风险防护隐性失效；'
+        '建议检查 autostraggle 版本与 sys.path 后再启动。'
+    )
+    _log.error('[启动自检] %s', msg)
+    try:
+        from auto_feishu import send_feishu_message
+
+        send_feishu_message(
+            f'⚠️ **AutoCTP 启动自检告警**\n\n{msg}',
+            config=config,
+        )
+    except Exception as notify_err:
+        _log.warning(
+            '宽跨配对补丁未安装飞书通知失败: %s', notify_err, exc_info=True,
+        )
+    if config.get('fail_fast_on_guard_install', False):
+        _log.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
+        sys.exit(4)
+
+
+def _surface_session_close_guard_install_failure(config: dict, reason: str) -> None:
+    """收盘守卫是 T-10 禁新组 / T-1 硬停撤单的盘中硬边界，安装失败须与
+    原子保存 / 月白名单 / CTP 三补丁同级：error + 飞书 + honor fail_fast。"""
+    msg = (
+        f'小节收盘守卫未安装：{reason or "未知原因"}。'
+        'T-10 禁新组开/平与 T-1 硬停撤单将失效（收盘前可能发出无法成交/'
+        '无法撤销的挂单）；建议检查 autotrade 版本与 sys.path 后再启动。'
+    )
+    _log.error('[启动自检] %s', msg)
+    try:
+        from auto_feishu import send_feishu_message
+
+        send_feishu_message(
+            f'⚠️ **AutoCTP 启动自检告警**\n\n{msg}',
+            config=config,
+        )
+    except Exception as notify_err:
+        _log.warning(
+            '收盘守卫未安装飞书通知失败: %s', notify_err, exc_info=True,
+        )
+    if config.get('fail_fast_on_guard_install', False):
+        _log.error('[启动自检] fail_fast_on_guard_install=true，拒绝启动')
+        sys.exit(4)
+
+
 def install_spread_ledger_execution(config: dict) -> None:
     """Install all spread ledger-driven execution patches (idempotent)."""
     global _INSTALLED
@@ -382,10 +456,23 @@ def install_spread_ledger_execution(config: dict) -> None:
     install_spread_risk_check_exclusion(config)
     install_spread_rebalance_close_a_exclusion(config)
     try:
-        from session_close_guard import install_session_close_guard
-        install_session_close_guard(config)
-    except Exception:
-        pass
+        from session_close_guard import (
+            get_install_error as _scg_install_error,
+            install_session_close_guard,
+        )
+        if not install_session_close_guard(config):
+            _surface_session_close_guard_install_failure(
+                config, _scg_install_error() or '未知原因',
+            )
+    except SystemExit:
+        raise
+    except Exception as e:
+        _surface_session_close_guard_install_failure(config, repr(e))
+    from strangle_leg_pairing import install_strangle_leg_pairing_patch
+
+    if not install_strangle_leg_pairing_patch():
+        _surface_leg_pairing_install_failure(config)
+        return
     _INSTALLED = True
 
 

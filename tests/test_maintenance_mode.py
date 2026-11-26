@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from maintenance_mode import (
+    get_install_error,
+    install_maintenance_guard,
     is_maintenance_mode,
     should_block_trading,
     wrap_connection_cancel_guard,
@@ -86,6 +88,31 @@ class TestMaintenanceMode(unittest.TestCase):
         self.assertEqual(conn2.cancel_all_pending_orders(), 0)
         self.assertTrue(getattr(conn1, '_maintenance_cancel_wrapped', None) is True)
         self.assertTrue(getattr(conn2, '_maintenance_cancel_wrapped', None) is True)
+
+
+class TestInstallErrorSurfaced(unittest.TestCase):
+    """守卫安装失败必须可查询原因（调用方据此打 warning，勿静默）。"""
+
+    def test_import_failure_records_reason(self):
+        import builtins
+        import maintenance_mode as mm
+
+        orig_installed = mm._GUARD_INSTALLED
+        orig_import = builtins.__import__
+
+        def _blocking_import(name, *args, **kwargs):
+            if name == 'auto_order_manager':
+                raise ImportError('模拟不可用')
+            return orig_import(name, *args, **kwargs)
+
+        mm._GUARD_INSTALLED = False
+        builtins.__import__ = _blocking_import
+        try:
+            self.assertFalse(install_maintenance_guard({}))
+            self.assertIn('auto_order_manager', get_install_error() or '')
+        finally:
+            builtins.__import__ = orig_import
+            mm._GUARD_INSTALLED = orig_installed
 
 
 if __name__ == '__main__':

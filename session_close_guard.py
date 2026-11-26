@@ -150,15 +150,16 @@ def _extract_symbol_from_instrument(instrument: str) -> str:
         return m.group(1).lower() if m else ''
 
 
-def _exchange_pending_refs(conn, logger=None) -> Set[int]:
+def _exchange_pending_refs(conn, logger=None) -> Optional[Set[int]]:
+    """Pending exchange order_refs, or None when the query did not succeed."""
     try:
         orders = conn.query_orders_sync(timeout=5, use_cache=False)
     except Exception as e:
         if logger:
             logger.debug(f'[收盘守卫] 订单查询异常: {e}')
-        return set()
-    if not orders:
-        return set()
+        return None
+    if orders is None:
+        return None
     out: Set[int] = set()
     for o in orders:
         if str(o.get('status', '') or '') not in _PENDING_STATUS:
@@ -175,8 +176,16 @@ def _exchange_pending_refs(conn, logger=None) -> Set[int]:
 def _pending_refs_for_symbol(conn, symbol: str) -> List[int]:
     sym = symbol.lower()
     refs: List[int] = []
-    pending = getattr(conn, 'pending_orders', None) or {}
-    for ref_key, order in pending.items():
+    lock = getattr(conn, 'lock', None)
+    if lock is not None:
+        ctx = lock
+    else:
+        from contextlib import nullcontext
+        ctx = nullcontext()
+    with ctx:
+        pending = getattr(conn, 'pending_orders', None) or {}
+        items = list(pending.items()) if isinstance(pending, dict) else []
+    for ref_key, order in items:
         inst = str(getattr(order, 'instrument_id', '') or '')
         if _extract_symbol_from_instrument(inst) != sym:
             continue
@@ -191,6 +200,10 @@ def _pending_refs_for_symbol(conn, symbol: str) -> List[int]:
 
 def prune_stale_pending_orders(conn, symbol: str, logger=None) -> int:
     live = _exchange_pending_refs(conn, logger)
+    if live is None:
+        if logger:
+            logger.debug(f'[收盘守卫] {symbol} 订单查询失败，跳过本地幽灵 prune')
+        return 0
     sym = symbol.lower()
     removed = 0
     lock = getattr(conn, 'lock', None)
@@ -230,16 +243,21 @@ def _cancel_symbol_pending(conn, symbol: str, logger, config: dict) -> int:
     if not refs:
         prune_stale_pending_orders(conn, symbol, logger)
         return 0
-    try:
-        count = conn.cancel_all_pending_orders(
-            timeout=float(config.get('CANCEL_ALL_TIMEOUT', 5) or 5),
-        )
-    except Exception as e:
+    cancel_count = 0
+    cancel_one = getattr(conn, 'cancel_order', None)
+    if not callable(cancel_one):
         if logger:
-            logger.warning(f'[收盘守卫] {symbol} T-1 撤单失败: {e}')
+            logger.warning(f'[收盘守卫] {symbol} 无 cancel_order，跳过 T-1 撤单')
         return 0
+    for ref in refs:
+        try:
+            if cancel_one(ref):
+                cancel_count += 1
+        except Exception as e:
+            if logger:
+                logger.warning(f'[收盘守卫] {symbol} 撤单 Ref={ref} 失败: {e}')
     prune_stale_pending_orders(conn, symbol, logger)
-    return int(count or 0)
+    return cancel_count
 
 
 def maybe_run_pre_close_cancel_sweep(
@@ -296,22 +314,74 @@ def should_skip_strangle_rebalance(
     ledger=None,
     tradeinfo=None,
 ) -> Tuple[bool, str]:
+    """Skip the whole rebalance only when every *unmatched* symbol is t1/off.
+
+    Tradeinfo symbols that are off-session but have no unmatched legs must not
+    block night-session close_chp / 补腿. Mixed unmatched queues are reordered
+    by :func:`prioritize_in_session_unmatched` so in-session legs run first.
+    """
+    del conn
+    del tradeinfo
     if not guard_enabled(config):
         return False, ''
     symbols: Set[str] = set()
-    for item in tradeinfo or []:
-        sym = (item.get('future') or '').lower()
-        if sym:
-            symbols.add(sym)
     if ledger is not None:
         for item in ledger.list_unmatched_legs() or []:
             sym = (item.get('symbol') or '').lower()
             if sym:
                 symbols.add(sym)
+    if not symbols:
+        return False, ''
+    blocked = []
     for sym in symbols:
-        if get_session_phase(sym, config) == 't1':
-            return True, f'{sym} 处于 T-1'
-    return False, ''
+        phase = get_session_phase(sym, config)
+        if phase == 't1':
+            blocked.append((sym, 't1'))
+        elif phase == 'off':
+            blocked.append((sym, 'off'))
+    if len(blocked) != len(symbols):
+        return False, ''
+    sym, phase = blocked[0]
+    if phase == 't1':
+        return True, f'{sym} 处于 T-1'
+    return True, f'{sym} 非交易时段'
+
+
+def prioritize_in_session_unmatched(ledger, config: dict) -> int:
+    """Move t1/off unmatched legs behind in-session ones. Returns moved count."""
+    if ledger is None:
+        return 0
+    data = getattr(ledger, '_data', None)
+    if not isinstance(data, dict):
+        return 0
+    lock = getattr(ledger, '_lock', None)
+    if lock is not None:
+        lock.acquire()
+    try:
+        items = list(data.get('unmatched_legs') or [])
+        if len(items) < 2:
+            return 0
+        runnable: List[dict] = []
+        blocked: List[dict] = []
+        for item in items:
+            phase = get_session_phase(item.get('symbol') or '', config)
+            if phase in ('t1', 'off'):
+                blocked.append(item)
+            else:
+                runnable.append(item)
+        if not runnable or not blocked:
+            return 0
+        new_order = runnable + blocked
+        if new_order == items:
+            return 0
+        data['unmatched_legs'] = new_order
+        save = getattr(ledger, '_save', None)
+        if callable(save):
+            save()
+        return len(blocked)
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def install_session_close_guard(config: dict = None) -> bool:
@@ -378,6 +448,7 @@ def _install_close_executor_guard() -> None:
             base_future_price: float = None,
             price_change_threshold: float = None,
             strategy: str = 'spread',
+            **kwargs,
         ):
             if should_block_send(conn, symbol, config):
                 _maybe_log_throttled(
@@ -391,10 +462,43 @@ def _install_close_executor_guard() -> None:
                 base_future_price=base_future_price,
                 price_change_threshold=price_change_threshold,
                 strategy=strategy,
+                **kwargs,
             )
 
         guarded_send_and_wait._session_close_wrapped = True  # type: ignore[attr-defined]
         ace._send_and_wait = guarded_send_and_wait
+
+    orig_close_leg = ace._close_single_leg
+    if not getattr(orig_close_leg, '_session_close_wrapped', False):
+
+        def guarded_close_single_leg(
+            conn, contract, direction, volume, price, min_tick, config, logger, symbol,
+            timeout_multiplier: float = 1.0, leg: str = '',
+            group_retry_count: int = 1,
+            base_future_price: float = None,
+            price_change_threshold: float = None,
+            strategy: str = 'spread',
+            **kwargs,
+        ):
+            if should_block_send(conn, symbol, config):
+                _maybe_log_throttled(
+                    conn, f'off_close_leg:{symbol.lower()}', logger, 'info',
+                    f'[收盘守卫] {symbol} 非交易/T-1，跳过单腿平仓: {contract}',
+                )
+                return False, 0, 0.0
+            return orig_close_leg(
+                conn, contract, direction, volume, price, min_tick, config, logger, symbol,
+                timeout_multiplier=timeout_multiplier,
+                leg=leg,
+                group_retry_count=group_retry_count,
+                base_future_price=base_future_price,
+                price_change_threshold=price_change_threshold,
+                strategy=strategy,
+                **kwargs,
+            )
+
+        guarded_close_single_leg._session_close_wrapped = True  # type: ignore[attr-defined]
+        ace._close_single_leg = guarded_close_single_leg
 
     orig_execute = ace.execute_close_orders_with_limit
     if getattr(orig_execute, '_session_close_wrapped', False):
@@ -539,6 +643,12 @@ def _install_strangle_guards() -> None:
             _maybe_log_throttled(
                 conn, f't1_strangle:{symbol.lower()}', logger, 'info',
                 f'[{symbol}] 收盘 T-1 硬停，跳过宽跨扫描',
+            )
+            return False
+        if not is_trading_time_at(symbol, config=config):
+            _maybe_log_throttled(
+                conn, f'off_strangle:{symbol.lower()}', logger, 'info',
+                f'[{symbol}] 非交易时段，跳过宽跨扫描',
             )
             return False
         return orig_ps(

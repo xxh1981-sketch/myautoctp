@@ -54,16 +54,20 @@ def _conf(conn, key, default):
     return default if v is None else v
 
 
-def _exchange_pending_refs(conn, logger) -> set:
-    """Return order_refs still pending at the exchange (best effort)."""
+def _exchange_pending_refs(conn, logger) -> Optional[set]:
+    """Pending exchange order_refs, or None when the query did not succeed.
+
+    ``None`` must not be treated as "exchange is empty" — that would prune
+    live in-flight records while the order may still be working.
+    """
     try:
         orders = conn.query_orders_sync(timeout=5, use_cache=False)
     except Exception as e:
         if logger:
             logger.debug(f'[健康检查] 僵尸订单核对查询异常: {e}')
-        return set()
+        return None
     if orders is None:
-        return set()
+        return None
     out = set()
     for o in orders:
         status = str(o.get('status', '') or '')
@@ -174,6 +178,11 @@ def install_health_check_patch() -> bool:
         # Confirm with the exchange that the candidate refs are STILL pending
         # before issuing any cancel.
         live_refs = _exchange_pending_refs(conn, self.logger)
+        if live_refs is None:
+            self.logger.warning(
+                '[健康检查] 交易所订单查询失败，跳过僵尸撤单与本地 prune'
+            )
+            return report
         confirmed = [r for r in candidate_refs if r in live_refs]
         if not confirmed:
             self.logger.info(

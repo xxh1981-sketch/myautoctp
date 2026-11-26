@@ -38,6 +38,12 @@ class TestAccountDecomposition(unittest.TestCase):
         m = normalize_inst_map({'lc2609-C-1': 1, 'LC2609-C-1': 2})
         self.assertEqual(m['LC2609-C-1'], 3)
 
+    def test_normalize_trade_symbols_lower(self):
+        from account_decomposition import normalize_trade_symbols
+        self.assertEqual(normalize_trade_symbols({'C', 'sa', ' M '}), {'c', 'sa', 'm'})
+        self.assertEqual(normalize_trade_symbols(None), set())
+        self.assertEqual(normalize_trade_symbols([]), set())
+
     def test_balanced_spread_only(self):
         conn = MagicMock()
         conn.query_positions_sync.return_value = [
@@ -121,6 +127,35 @@ class TestAccountDecomposition(unittest.TestCase):
         store = FakeStore({})
         result = compute_account_decomposition(
             conn, ledger, store, self._config(), None,
+        )
+        self.assertTrue(result['balanced'])
+        self.assertEqual(result['external'], {})
+
+    def test_inferred_single_from_claims_does_not_inflate_strangle_claim(self):
+        conn = MagicMock()
+        conn.query_positions_sync.return_value = [
+            {'instrument': 'MA609P1900', 'direction': '2', 'position': 42},
+            {'instrument': 'MA609C3650', 'direction': '2', 'position': 35},
+        ]
+        conn._normalize_month = lambda sym, month: month
+        cfg = {
+            'spread_tradeinfo': [],
+            'strangle_tradeinfo': [{'future': 'ma', 'month': '2609'}],
+        }
+        ledger = MagicMock()
+        ledger.list_leg_claims.return_value = {
+            'MA609P1900': 42,
+            'MA609C3650': 35,
+        }
+        ledger.list_unmatched_legs.return_value = [{
+            'kind': 'inferred_single',
+            'leg': {'inst': 'MA609P1900', 'label': 'put'},
+            'volume': 7,
+            'inferred_from_claims': True,
+        }]
+        store = FakeStore({})
+        result = compute_account_decomposition(
+            conn, ledger, store, cfg, None,
         )
         self.assertTrue(result['balanced'])
         self.assertEqual(result['external'], {})

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -352,6 +353,84 @@ class TestMainLoopConsecutiveErrors(unittest.TestCase):
             any('触发进程级重启' in m for m in error_logs),
             error_logs,
         )
+
+    @patch('auto_reconnect_recovery.check_quarantine_watchdog')
+    @patch('auto_scheduled_pause.is_connection_suspended', return_value=False)
+    def test_keyboard_interrupt_writes_stopped_heartbeat(
+        self, mock_suspended, mock_watchdog,
+    ):
+        conn = _make_conn()
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as tmp:
+            hb = os.path.join(tmp, 'heartbeat.txt')
+            rr = os.path.join(tmp, 'restart_reason.txt')
+            conn.config['heartbeat_file'] = hb
+            conn.config['restart_reason_file'] = rr
+            conn.config['shutdown_scan_drain_sec'] = 0
+            conn.config['shutdown_cancel_passes'] = 1
+            conn.config['shutdown_cancel_pass_pause_sec'] = 0
+            with patch('auto_feishu_command.stop_command_receiver'), \
+                 patch('auto_feishu_command.start_command_receiver'), \
+                 patch('auto_scheduled_pause.sync_connection_suspend_state'), \
+                 patch('auto_circuit_breaker.CircuitBreaker'), \
+                 patch('straggle_execution.StrangleExecutor'), \
+                 patch('auto_health_check.HealthChecker') as mock_hc, \
+                 patch('shutdown_cancel.cancel_pending_on_shutdown', return_value=0):
+                mock_hc.return_value.check_now.return_value = {'healthy': True}
+                from merged_main_loop import run_merged_main_loop
+                with patch('time.sleep', side_effect=KeyboardInterrupt):
+                    run_merged_main_loop(**_minimal_args(conn, logger))
+            self.assertTrue(os.path.isfile(hb))
+            body = open(hb, encoding='utf-8').read()
+            self.assertIn('status=STOPPED', body)
+            self.assertIn('reason=USER_INTERRUPT', body)
+
+    @patch('auto_reconnect_recovery.check_quarantine_watchdog')
+    @patch('auto_scheduled_pause.is_connection_suspended', return_value=False)
+    def test_spread_daily_limit_refresh_none_fails_closed_for_next_symbol(
+        self, mock_suspended, mock_watchdog,
+    ):
+        """轮内刷新日笔数返回 None（无异常）时，须将后续品种 remaining_limit 置 0。"""
+        conn = _make_conn()
+        conn.config['dual_strategy'] = {'strategy_order': ['spread']}
+        conn.config['daily_trade_limit'] = 10
+        conn.td_logined = True
+        conn.md_logined = True
+        conn.get_filled_open_order_count = MagicMock(return_value=None)
+        logger = FakeLogger()
+        args = _minimal_args(conn, logger)
+        args['ledger'].get_daily_buy_amount.return_value = 0.0
+        args['ledger'].list_unmatched_legs.return_value = []
+        args['spread_tradeinfo'] = [
+            {'future': 'ag', 'month': '2610'},
+            {'future': 'au', 'month': '2610'},
+        ]
+        args['combined_tradeinfo'] = list(args['spread_tradeinfo'])
+        calls = []
+
+        def _fake_process(c, item, vix, cfg, lg, remaining_limit=None, spread_open_ok=None):
+            calls.append((item['future'], remaining_limit, spread_open_ok))
+            return True
+
+        with patch('auto_feishu_command.stop_command_receiver'), \
+             patch('auto_feishu_command.start_command_receiver'), \
+             patch('auto_feishu_command.is_trading_paused', return_value=False), \
+             patch('auto_scheduled_pause.sync_connection_suspend_state'), \
+             patch('auto_scheduled_reconnect.check_scheduled_full_recovery', return_value=False), \
+             patch('auto_circuit_breaker.CircuitBreaker'), \
+             patch('straggle_execution.StrangleExecutor'), \
+             patch('auto_health_check.HealthChecker') as mock_hc, \
+             patch('merged_main_loop._run_reconcile', return_value=(False, [], False, [])), \
+             patch('merged_main_loop.manage_future_price_readiness'), \
+             patch('spread_fill_sync.count_spread_filled_open_orders', side_effect=[3, None]), \
+             patch('spread_open_preflight.process_spread_symbol', side_effect=_fake_process), \
+             patch('shutdown_cancel.cancel_pending_on_shutdown', return_value=0), \
+             patch('time.sleep', side_effect=KeyboardInterrupt):
+            mock_hc.return_value.check_now.return_value = {'healthy': True}
+            from merged_main_loop import run_merged_main_loop
+            run_merged_main_loop(**args)
+
+        self.assertEqual(calls, [('ag', 7, True), ('au', 0, False)])
 
 
 if __name__ == '__main__':

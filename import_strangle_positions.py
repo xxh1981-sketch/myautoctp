@@ -59,7 +59,7 @@ def load_positions_csv(path: str) -> Dict[str, int]:
                 raise ValueError(f"{path} line {line_no}: expected 2 columns (instrument, volume)")
             if line_no == 1 and _looks_like_header(row):
                 continue
-            inst = str(row[0]).strip()
+            inst = str(row[0]).strip().upper()
             vol = int(str(row[1]).strip())
             if not inst:
                 raise ValueError(f"{path} line {line_no}: instrument is empty")
@@ -70,8 +70,14 @@ def load_positions_csv(path: str) -> Dict[str, int]:
 
 
 def save_positions_csv(path: str, claims: Dict[str, int]) -> None:
+    merged: Dict[str, int] = {}
+    for inst, vol in (claims or {}).items():
+        key = str(inst).strip().upper()
+        if not key:
+            continue
+        merged[key] = merged.get(key, 0) + int(vol)
     rows = sorted(
-        ((inst, int(vol)) for inst, vol in (claims or {}).items() if int(vol) > 0),
+        ((inst, vol) for inst, vol in merged.items() if vol > 0),
         key=lambda x: x[0],
     )
     buf = io.StringIO()
@@ -101,7 +107,7 @@ def read_claim_volume(config: dict, instrument: str) -> int:
     读取失败时抛出（与 :func:`apply_fill_to_csv` 一致，绝不静默当 0），供成交
     入账记录 pre_volume，以及自愈器比对 on-disk CSV。
     """
-    inst = str(instrument or '').strip()
+    inst = str(instrument or '').strip().upper()
     if not inst:
         return 0
     path = positions_csv_path(config)
@@ -200,12 +206,14 @@ def collect_tracked_instruments(ledger, csv_claims: Dict[str, int], conn=None, c
 
 def _ctp_strangle_long_volumes(conn, trade_symbols: Set[str]) -> Dict[str, int]:
     from auto_connection import extract_symbol_prefix
+    from account_decomposition import normalize_trade_symbols
 
     out: Dict[str, int] = {}
     try:
         positions = conn.query_positions_sync(timeout=10) or []
     except Exception:
         return out
+    trade_syms = normalize_trade_symbols(trade_symbols)
     for pos in positions:
         direction = pos.get('direction') or pos.get('PosiDirection', '')
         if direction not in ('2', 2, 'LONG'):
@@ -214,7 +222,7 @@ def _ctp_strangle_long_volumes(conn, trade_symbols: Set[str]) -> Dict[str, int]:
         if not inst:
             continue
         sym = extract_symbol_prefix(inst)
-        if sym not in trade_symbols:
+        if sym not in trade_syms:
             continue
         vol = int(pos.get('volume') or pos.get('Position') or pos.get('position') or 0)
         if vol > 0:

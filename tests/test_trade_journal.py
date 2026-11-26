@@ -27,13 +27,16 @@ from trade_journal import (
     append_journal,
     is_plausible_ctp_trade,
     is_plausible_ctp_trade_id,
+    iter_trade_dedupe_keys,
     journal_path_for_day,
     journal_retain_days,
     load_applied_keys,
     map_direction_offset,
+    offset_is_close,
     scan_journal_truncated_tails,
     scan_unresolved_pending,
     trade_dedupe_key,
+    trade_in_applied_keys,
 )
 
 
@@ -42,6 +45,49 @@ class TestTradeJournal(unittest.TestCase):
     def test_dedupe_key_prefers_trade_id(self):
         key = trade_dedupe_key({'trade_id': 'ABC', 'instrument': 'SA609C1000'})
         self.assertEqual(key, 'SA609C1000:ABC')
+
+    def test_dedupe_key_includes_trade_date(self):
+        key = trade_dedupe_key({
+            'trade_id': 'ABC',
+            'instrument': 'SA609C1000',
+            'trade_date': '2026-05-21',
+        })
+        self.assertEqual(key, '20260521:SA609C1000:ABC')
+        same_id_next_day = trade_dedupe_key({
+            'trade_id': 'ABC',
+            'instrument': 'SA609C1000',
+            'trade_date': '20260522',
+        })
+        self.assertEqual(same_id_next_day, '20260522:SA609C1000:ABC')
+        self.assertNotEqual(key, same_id_next_day)
+
+    def test_iter_dedupe_keys_includes_legacy(self):
+        keys = list(iter_trade_dedupe_keys({
+            'trade_id': 'ABC',
+            'instrument': 'SA609C1000',
+            'trade_date': '20260521',
+        }))
+        self.assertEqual(keys[0], '20260521:SA609C1000:ABC')
+        self.assertIn('SA609C1000:ABC', keys)
+
+    def test_applied_keys_match_legacy_and_dated(self):
+        trade = {
+            'trade_id': 'ABC',
+            'instrument': 'SA609C1000',
+            'trade_date': '20260521',
+        }
+        self.assertTrue(trade_in_applied_keys({'SA609C1000:ABC'}, trade))
+        self.assertTrue(trade_in_applied_keys({'20260521:SA609C1000:ABC'}, trade))
+        undated = {'trade_id': 'ABC', 'instrument': 'SA609C1000'}
+        self.assertTrue(trade_in_applied_keys({'20260521:SA609C1000:ABC'}, undated))
+        self.assertFalse(trade_in_applied_keys({'20260522:SA609C1000:XYZ'}, trade))
+
+    def test_offset_is_close_flags(self):
+        self.assertTrue(offset_is_close('1'))
+        self.assertTrue(offset_is_close('3'))
+        self.assertTrue(offset_is_close('4'))
+        self.assertFalse(offset_is_close('0'))
+        self.assertFalse(offset_is_close(''))
 
     def test_plausible_ctp_trade_id(self):
         self.assertTrue(is_plausible_ctp_trade_id('103877'))

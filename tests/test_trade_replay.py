@@ -103,6 +103,61 @@ class TestTradeReplay(unittest.TestCase):
             self.assertEqual(record_trades_to_cache([t], cfg), 0)
             self.assertEqual(load_cached_trades(cfg), [])
 
+    def test_merge_none_means_query_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            self.assertIsNone(merge_trades_for_replay(None, cfg))
+            old = {
+                'order_ref': 2,
+                'instrument': 'SA609C2500',
+                'direction': '0',
+                'offset': '0',
+                'volume': 2,
+                'price': 50.0,
+                'trade_id': '900002',
+                'trade_date': _yesterday(),
+            }
+            record_trades_to_cache([old], cfg)
+            merged = merge_trades_for_replay(None, cfg)
+            self.assertIsNotNone(merged)
+            self.assertEqual({t['trade_id'] for t in merged}, {'900002'})
+
+    def test_lookback_zero_preserves_none_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            cfg['dual_strategy']['trade_replay_lookback_days'] = 0
+            self.assertIsNone(merge_trades_for_replay(None, cfg))
+            self.assertEqual(merge_trades_for_replay([], cfg), [])
+
+    def test_dated_and_legacy_keys_dedupe_across_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            path = cfg['dual_strategy']['trade_replay_cache']
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(json.dumps({
+                    'order_ref': 1,
+                    'instrument': 'SA609C2400',
+                    'direction': '0',
+                    'offset': '0',
+                    'volume': 1,
+                    'price': 100.0,
+                    'trade_id': '900001',
+                    'trade_date': _yesterday(),
+                    'dedupe_key': 'SA609C2400:900001',
+                }) + '\n')
+            live = [{
+                'order_ref': 1,
+                'instrument': 'SA609C2400',
+                'direction': '0',
+                'offset': '0',
+                'volume': 1,
+                'price': 100.0,
+                'trade_id': '900001',
+                'trade_date': _yesterday(),
+            }]
+            merged = merge_trades_for_replay(live, cfg)
+            self.assertEqual(len(merged), 1)
+
     def test_rejects_mock_trade_id_for_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp)

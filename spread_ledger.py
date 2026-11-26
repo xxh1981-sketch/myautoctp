@@ -24,11 +24,13 @@ class SpreadLegStore:
 
     def set_leg_claims(self, claims: Dict[str, int]) -> None:
         with self._lock:
-            self._claims = {
-                str(inst).strip(): int(vol)
-                for inst, vol in (claims or {}).items()
-                if str(inst).strip() and int(vol) != 0
-            }
+            merged: Dict[str, int] = {}
+            for inst, vol in (claims or {}).items():
+                key = str(inst).strip().upper()
+                if not key:
+                    continue
+                merged[key] = merged.get(key, 0) + int(vol)
+            self._claims = {k: v for k, v in merged.items() if v != 0}
 
     def list_leg_claims(self) -> Dict[str, int]:
         with self._lock:
@@ -37,7 +39,7 @@ class SpreadLegStore:
     def apply_delta(self, instrument: str, delta: int) -> None:
         if not instrument or delta == 0:
             return
-        inst = str(instrument).strip()
+        inst = str(instrument).strip().upper()
         with self._lock:
             new_vol = int(self._claims.get(inst, 0)) + int(delta)
             if new_vol == 0:
@@ -49,6 +51,14 @@ class SpreadLegStore:
     def _is_call_instrument(instrument: str) -> bool:
         inst = (instrument or '').strip().upper()
         if not inst:
+            return False
+        # DCE 等「品种字母=C」+ 月 + -P-/-C- 行权价（如 c2701-P-2120）：必须先认 P，否则
+        # 开头的 C2701 会被误判为期权 Call。
+        if re.search(r'\d[-]P[-]\d', inst):
+            return False
+        if re.search(r'\d[-]C[-]\d', inst):
+            return True
+        if re.search(r'[-]?P[-]?\d', inst):
             return False
         if re.search(r'[-]?C[-]?\d', inst):
             return True

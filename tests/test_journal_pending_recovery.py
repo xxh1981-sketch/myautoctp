@@ -207,6 +207,25 @@ class TestRecoverSpreadPending(unittest.TestCase):
             self.assertEqual(rec['healed'], 1)
             self.assertEqual(load_spread_positions_csv(path), {})
 
+    def test_apply_close_when_journal_instrument_lowercase(self):
+        """CTP DCE 合约常为小写；CSV 键为大写。未规范化时会误判 already、不清仓。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _spread_cfg(tmp)
+            path = cfg['dual_strategy']['spread_positions_csv']
+            save_spread_positions_csv(path, {'M2509-C-3300': 2})
+            _pending(
+                self._journal(cfg), cfg,
+                dedupe_key='k1', instrument='m2509-C-3300',
+                pre_volume=2, post_volume=0,
+            )
+            rec = recover_spread_pending(cfg, logger=MagicMock())
+            self.assertEqual(rec['healed'], 1)
+            self.assertEqual(rec['ambiguous'], 0)
+            self.assertEqual(load_spread_positions_csv(path), {})
+            self.assertEqual(
+                scan_unresolved_pending(self._journal(cfg), cfg)['unresolved_pending'], 0,
+            )
+
 
 class TestRecoverStranglePending(unittest.TestCase):
 

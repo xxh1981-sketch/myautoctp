@@ -1,5 +1,6 @@
 """配置：autotrade 统一配置 + autoctp 本地 merged_config.yaml。"""
 
+import copy
 import os
 from typing import Any, Dict, Tuple
 
@@ -13,7 +14,7 @@ STRANGLE_DEFAULTS = {
     'benchmark_multiplier': 0.8,
     'post_close_cooldown_sec': 300,
     'phase1_timeout': 180,
-    'phase2_timeout': 15,
+    'phase2_timeout': 60,
     'phase2_max_retries': 5,
     'phase1_spread_pct': 0.25,
     'ledger_path': 'data/ledger_strangle.json',
@@ -22,6 +23,25 @@ STRANGLE_DEFAULTS = {
     'rebalance_max_per_round': 12,
     'unmatched_leg_metadata_alert': True,
     'unmatched_leg_metadata_alert_cooldown_sec': 1800,
+    # ===== 平价溢价率信号（替代旧 VIX 进出判断；价差仍用 VIX）=====
+    # rate = C_atm/F 与 coef*sqrt(t)*sigma 比较：建仓 rate<entry、平仓 rate>exit。
+    'pr_entry_coef': 0.32,
+    'pr_exit_coef': 0.40,
+    # HV 基准（sigma=min(HV1y,HV3y)）：收盘价库由用户手动定期更新，程序只读最新。
+    'hv_close_path': 'tradeinfo/futures.xlsx',
+    'hv_sheet': 'Sheet2',
+    'hv_win1y': 242,
+    'hv_win3y': 726,
+    'hv_trim1y': [2, 1],   # [去最高, 去最低]
+    'hv_trim3y': [5, 4],
+    'hv_trading_days': 242,
+    'hv_ann_adj': 3,       # 年化 sqrt(242-3)=sqrt(239)
+    'hv_symbol_column_map': {},  # 自动映射失败时手工指定 {'sym': '列名'}
+    # HV 收盘价库过期/缺失飞书提醒（纯可观测性，按文件 mtime；warn_days<=0 禁用）
+    'hv_stale_alert_enabled': True,
+    'hv_stale_warn_days': 7,
+    'hv_stale_check_interval_sec': 21600,
+    'hv_stale_alert_cooldown_sec': 86400,
 }
 
 
@@ -145,16 +165,16 @@ MERGED_TOP_LEVEL_DEFAULTS = {
     # 磁盘空间预检：housekeeping 周期检查剩余空间，低于阈值飞书告警。
     'disk_space_check_enabled': True,
     'disk_space_warn_mb': 500,
-    # 单品种扫描超时（秒）；0=不限制。防止单品种 CTP/IO 挂死阻塞整轮。
-    'max_symbol_scan_sec': 120,
+    # 单品种扫描总时长限制已移除（发单层 A/B_timeout 与重试次数已限次；
+    # 品种级总限时易在宽跨 Phase1+Phase2 未完成时切断并引发跨品种撤单）。
+    'max_symbol_scan_sec': 0,
     # 周末非交易抑制（仅双休日；法定节假日不处理，当交易日）。周六仅在此时刻
     # 之后才算周末，避开周五夜盘跨零点到周六凌晨。
     'weekend_pause_enabled': True,
     'weekend_pause_saturday_from_hour': 5,
-    # 单轮看门狗：一轮耗时超阈值告警（与 merged_config.yaml 默认 60 对齐）。
-    'round_slow_warn_sec': 60,
+    # 单轮看门狗：一轮耗时超阈值告警（与 merged_config.yaml 默认 100 对齐）。
+    'round_slow_warn_sec': 100,
     # 宽跨每轮扫描时间预算（秒）；0=不限制。仅 defer 后续品种，不中断当前品种。
-    # 单品种硬超时见 max_symbol_scan_sec（默认 120s）。
     'max_strangle_scan_sec': 600,
     'health_offline_log_cooldown_sec': 60,
     'slow_round_alert_cooldown_sec': 300,
@@ -231,12 +251,14 @@ MERGED_TOP_LEVEL_DEFAULTS = {
             '持仓追踪器超过',
             'analyze_position_imbalance 计算结果',
             '不平衡检查:',
+            '获取平仓锁超时',
         ],
         'downgrade': [
             {'substring': '当前状态禁止此项操作', 'to_level': 'WARNING'},
             {'substring': '配对失败', 'to_level': 'WARNING'},
             {'substring': '不允许重复报单', 'to_level': 'WARNING'},
             {'substring': '订单不在pending且查询无结果', 'to_level': 'WARNING'},
+            {'substring': '获取平仓锁超时', 'to_level': 'WARNING'},
         ],
     },
 }
@@ -276,8 +298,8 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
     if str_cfg.get('pause_open_on_reconcile_mismatch') is False:
         warnings.append(
             'strangle.pause_open_on_reconcile_mismatch=false：'
-            '宽跨对账不一致时不 set ledger.open_halted，新开照常；'
-            '仅审计告警模式，实盘慎用'
+            '仅忽略对账不一致对宽跨新开的暂停；'
+            '保证金/journal/持仓CSV halt 仍会同步到账本（实盘慎用）'
         )
 
     for key in (
@@ -327,6 +349,14 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
         if not ok:
             errors.append('strangle.unmatched_leg_metadata_alert_cooldown_sec 必须为数字')
 
+    feishu_cmd = ((config.get('notifications') or {}).get('feishu_command') or {})
+    if isinstance(feishu_cmd, dict) and 'mode' in feishu_cmd:
+        mode = feishu_cmd.get('mode')
+        if not isinstance(mode, str) or mode not in ('poll', 'ws'):
+            errors.append(
+                f"notifications.feishu_command.mode 必须为 'poll' 或 'ws'，当前: {mode!r}"
+            )
+
     if 'global_margin_limit' not in config:
         return errors, warnings
     margin_limit = float(config.get('global_margin_limit') or 0)
@@ -343,6 +373,25 @@ def _validate_merged_config(config: dict) -> Tuple[list, list]:
             )
 
     return errors, warnings
+
+
+def apply_strangle_section(config: Dict[str, Any]) -> None:
+    """Merge ``STRANGLE_DEFAULTS`` into ``config['strangle']`` and resolve paths.
+
+    Does **not** copy ``min_days_to_expiry`` / ``close_days_to_expiry`` onto
+    top-level config. autotrade spread open/close read those keys (defaults
+    10 / 2). Strangle reads ``config['strangle']`` only.
+    """
+    strangle_cfg = _merge_dict(STRANGLE_DEFAULTS, config.get('strangle') or {})
+    ledger = strangle_cfg.get('ledger_path', 'data/ledger_strangle.json')
+    if not os.path.isabs(ledger):
+        ledger = os.path.join(_project_dir(), ledger)
+    strangle_cfg['ledger_path'] = ledger
+    hv_close = strangle_cfg.get('hv_close_path', 'tradeinfo/futures.xlsx')
+    if not os.path.isabs(hv_close):
+        hv_close = os.path.join(_project_dir(), hv_close)
+    strangle_cfg['hv_close_path'] = hv_close
+    config['strangle'] = strangle_cfg
 
 
 def load_merged_config(local_path: str = None) -> Dict[str, Any]:
@@ -364,24 +413,19 @@ def load_merged_config(local_path: str = None) -> Dict[str, Any]:
         config = _merge_dict(config, pre_cfg)
 
     for key, default_val in MERGED_TOP_LEVEL_DEFAULTS.items():
-        if key not in pre_cfg:
-            config[key] = default_val
+        if isinstance(default_val, dict):
+            existing_val = config.get(key)
+            config[key] = _merge_dict(
+                copy.deepcopy(default_val),
+                existing_val if isinstance(existing_val, dict) else {},
+            )
+        elif key not in pre_cfg:
+            config[key] = copy.deepcopy(default_val)
 
     dual_cfg = _merge_dict(DUAL_STRATEGY_DEFAULTS, config.get('dual_strategy') or {})
     config['dual_strategy'] = dual_cfg
 
-    strangle_cfg = _merge_dict(STRANGLE_DEFAULTS, config.get('strangle') or {})
-    config['strangle'] = strangle_cfg
-    config['min_days_to_expiry'] = strangle_cfg.get(
-        'min_days_to_expiry', config.get('min_days_to_expiry', 60))
-    config['close_days_to_expiry'] = strangle_cfg.get(
-        'close_days_to_expiry', config.get('close_days_to_expiry', 30))
-
-    ledger = strangle_cfg.get('ledger_path', 'data/ledger_strangle.json')
-    if not os.path.isabs(ledger):
-        ledger = os.path.join(_project_dir(), ledger)
-    strangle_cfg['ledger_path'] = ledger
-    config['strangle']['ledger_path'] = ledger
+    apply_strangle_section(config)
 
     ack = config.get('dual_strategy', {}).get('startup_ack_file', 'data/position_startup_ack.txt')
     if not os.path.isabs(ack):
@@ -467,15 +511,24 @@ def setup_merged_logger(config: Dict[str, Any]):
 
 
 def prepare_merged_connection(conn, config: Dict[str, Any]) -> None:
+    import logging
+
     from auto_strategy_order_ref import init_order_ref_sequences
     init_order_ref_sequences(conn, config)
     config['_spread_fill_conn'] = conn
+    # 维护守卫永远 non-fatal，但失败须可见（勿静默吞掉，见 unattended-audit-no-change）。
+    log = getattr(conn, 'logger', None) or logging.getLogger('AutoCTP')
     try:
         from maintenance_mode import (
+            get_install_error as _maintenance_install_error,
             install_maintenance_guard,
             wrap_connection_cancel_guard,
         )
-        install_maintenance_guard(config)
+        if not install_maintenance_guard(config):
+            log.warning(
+                '[维护模式] 守卫未安装: %s（维护模式将无法拦截自动发单/撤单）',
+                _maintenance_install_error() or '未知原因',
+            )
         wrap_connection_cancel_guard(conn, config)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning('[维护模式] 守卫安装异常: %s', e)

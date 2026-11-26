@@ -6,7 +6,7 @@ description: 无人值守可观测性增强（配置 drift / 报平安 enriched 
 
 > 与 `.cursor/rules/unattended-observability.mdc` 及 `docs/AI_PROJECT_MEMORY.md` §5 同步。
 
-以下三项为**纯可观测性**：不改变 halt / 交易 / 飞书暂停语义；失败仅日志。
+以下各项为**纯可观测性**：不改变 halt / 交易 / 飞书暂停语义；失败仅日志。
 
 ## 1. merged_config.yaml drift 告警
 
@@ -26,7 +26,13 @@ description: 无人值守可观测性增强（配置 drift / 报平安 enriched 
 - 同轮批量发送 `💚 AutoCTP halt 已解除`；`halt_recovery_alert_cooldown_sec`（默认 300s）节流。
 - **仅通知**，不自动改 halt 或恢复交易；飞书暂停期间若 halt 变化，恢复后下轮完整路径仍会通知。
 
+## 4. 宽跨 HV 收盘价库过期告警
+
+- `maybe_alert_hv_staleness`：按 `strangle.hv_close_path` 文件 **mtime** 判断新鲜度（手工更新即刷新 mtime，免 xlsx 解析依赖）；超 `hv_stale_warn_days`（默认 7 天）或文件缺失 → 飞书提醒。
+- 缺失/过期时宽跨会继续用旧 HV（缺失回退 `vol_basis`）**正常交易**，此告警是唯一提醒通道；只告警，不 halt、不改信号。
+- `hv_stale_alert_enabled: false` 或 `hv_stale_warn_days: 0` 禁用；`hv_stale_alert_cooldown_sec`（默认 86400）节流，文件变新后冷却复位。
+
 ## 修改时
 
 - 保持与 `runtime_risk_alerts` 一致：告警不改变交易语义。
-- 勿在 drift / halt 恢复路径引入 `cancel_all_pending_orders` 或自动开仓/平仓。
+- 勿在 drift / halt 恢复 / HV 过期路径引入 `cancel_all_pending_orders` 或自动开仓/平仓。

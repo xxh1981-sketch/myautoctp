@@ -222,6 +222,20 @@ class TestStrangleLongCallsForSpread(unittest.TestCase):
         self.assertEqual(out['SA609C2400'], 1)
         self.assertEqual(out['MA609C3650'], 20)
 
+    def test_skips_inferred_unmatched_to_avoid_double_count(self):
+        conn = FakeConn()
+        conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(
+            claims={'SA609C2400': 1},
+            unmatched=[{
+                'kind': 'inferred_complete',
+                'inferred_from_claims': True,
+                'filled_instrument': 'SA609C2400',
+                'volume': 1,
+            }],
+        )
+        out = _strangle_long_calls_for_spread(conn)
+        self.assertEqual(out['SA609C2400'], 1)
+
     def test_awaiting_phase2_not_double_counted(self):
         conn = FakeConn()
         conn._runtime_state['_strangle_ledger'] = FakeStrangleLedger(

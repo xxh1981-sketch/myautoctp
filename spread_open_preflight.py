@@ -127,6 +127,29 @@ def should_skip_spread_open_only_scan(
     return a_current + planned > a_limit
 
 
+def should_block_spread_open_empty_book_ctp_residual(
+    conn,
+    item: dict,
+    logger=None,
+    *,
+    spread_open_ok: bool = True,
+) -> bool:
+    """
+    账本无价差认领，但 CTP（扣宽跨多头后）仍有 Call → 禁止当空仓开仓。
+
+    覆盖「假 flat 误清认领」后同轮/下轮误开；对账 halt / close-only 时不拦截。
+    """
+    if not spread_open_ok:
+        return False
+    symbol = item['future']
+    month = item['month']
+    if _spread_has_ledger_claims(conn, symbol, month):
+        return False
+    from spread_position_sync import spread_ctp_has_residual
+
+    return spread_ctp_has_residual(conn, symbol, month, logger)
+
+
 _PREFLIGHT_LOG_COOLDOWN = 300.0
 
 
@@ -157,6 +180,14 @@ def process_spread_symbol(
                 f'A类 当前={a_current} 计划+{planned} > 限额{a_limit} '
                 f'(多为宽跨占用，下轮仍检查)'
             )
+        return False
+    if should_block_spread_open_empty_book_ctp_residual(
+        conn, item, logger, spread_open_ok=spread_open_ok,
+    ):
+        sym = item['future'].lower()
+        logger.warning(
+            f'[{sym}] 账本无价差认领但 CTP 仍有 Call 残仓，禁止当空仓开仓'
+        )
         return False
     return auto_processor.process_symbol(
         conn, item, vix_engine, config, logger, remaining_limit=remaining_limit,

@@ -23,10 +23,22 @@ class TestHealthCheckPatchHelpers(unittest.TestCase):
         refs = hcp._exchange_pending_refs(conn, logger=None)
         self.assertEqual(refs, {100})
 
-    def test_exchange_pending_refs_query_failure_returns_empty(self):
+    def test_exchange_pending_refs_query_failure_returns_none(self):
         conn = MagicMock()
         conn.query_orders_sync.side_effect = RuntimeError('timeout')
         refs = hcp._exchange_pending_refs(conn, logger=MagicMock())
+        self.assertIsNone(refs)
+
+    def test_exchange_pending_refs_none_result_returns_none(self):
+        conn = MagicMock()
+        conn.query_orders_sync.return_value = None
+        refs = hcp._exchange_pending_refs(conn, logger=MagicMock())
+        self.assertIsNone(refs)
+
+    def test_exchange_pending_refs_empty_list_is_empty_set(self):
+        conn = MagicMock()
+        conn.query_orders_sync.return_value = []
+        refs = hcp._exchange_pending_refs(conn, logger=None)
         self.assertEqual(refs, set())
 
     def test_conf_reads_from_conn_config(self):

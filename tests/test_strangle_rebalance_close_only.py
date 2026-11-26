@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ctp_bootstrap  # noqa: F401
 
 from straggle_ledger import StrangleLedger
+from strangle_leg_pairing import INFERRED_SINGLE_KIND
 from strangle_rebalance_close_only import (
     CLOSE_KINDS,
     run_close_only_rebalance,
@@ -118,6 +119,20 @@ class TestRunCloseOnlyRebalance(unittest.TestCase):
                 leg.get('kind') for leg in led.list_unmatched_legs()
             )
             self.assertEqual(kinds, ['awaiting_phase2', 'close_chp_pending'])
+
+    def test_inferred_single_close_in_close_only_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            led = self._make_ledger(tmp, [
+                {'symbol': 'sa', 'month': '2608', 'kind': 'awaiting_phase2'},
+                {
+                    'symbol': 'rm', 'month': '2609', 'kind': INFERRED_SINGLE_KIND,
+                    'stage': 'close', 'leg': {'inst': 'RM609C2600'},
+                },
+            ])
+            ex = FakeExecutor(consume_count=0)
+            ex.ledger = led
+            run_close_only_rebalance(ex, led, {})
+            self.assertEqual(ex.seen_kinds, [[INFERRED_SINGLE_KIND]])
 
     def test_close_kinds_constant(self):
         self.assertIn('close_chp_pending', CLOSE_KINDS)

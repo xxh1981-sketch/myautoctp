@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from merged_config import (
     DUAL_STRATEGY_DEFAULTS,
     MERGED_TOP_LEVEL_DEFAULTS,
+    STRANGLE_DEFAULTS,
+    apply_strangle_section,
     _validate_merged_config,
 )
 
@@ -165,6 +167,45 @@ class TestMergedConfigValidation(unittest.TestCase):
         }
         errors, _warnings = _validate_merged_config(cfg)
         self.assertTrue(any('strangle_store_unavailable_fallback' in e for e in errors))
+
+    def test_strangle_section_does_not_clobber_spread_dte(self):
+        cfg = {
+            'min_days_to_expiry': 10,
+            'close_days_to_expiry': 2,
+            'strangle': {},
+        }
+        apply_strangle_section(cfg)
+        self.assertEqual(cfg['min_days_to_expiry'], 10)
+        self.assertEqual(cfg['close_days_to_expiry'], 2)
+        self.assertEqual(cfg['strangle']['min_days_to_expiry'], STRANGLE_DEFAULTS['min_days_to_expiry'])
+        self.assertEqual(cfg['strangle']['close_days_to_expiry'], STRANGLE_DEFAULTS['close_days_to_expiry'])
+        self.assertEqual(cfg['strangle']['min_days_to_expiry'], 60)
+        self.assertEqual(cfg['strangle']['close_days_to_expiry'], 30)
+
+    def test_feishu_command_mode_validation(self):
+        for ok_mode in ('poll', 'ws'):
+            cfg = {
+                'dual_strategy': {'strategy_order': ['spread']},
+                'strangle': {'order_ref_min': 500000},
+                'notifications': {'feishu_command': {'mode': ok_mode}},
+            }
+            errors, _warnings = _validate_merged_config(cfg)
+            self.assertEqual(errors, [])
+
+        bad_cfg = {
+            'dual_strategy': {'strategy_order': ['spread']},
+            'strangle': {'order_ref_min': 500000},
+            'notifications': {'feishu_command': {'mode': 'websocket'}},
+        }
+        errors, _warnings = _validate_merged_config(bad_cfg)
+        self.assertTrue(any('feishu_command.mode' in e for e in errors))
+
+    def test_log_noise_defaults_include_close_lock_timeout(self):
+        ln = MERGED_TOP_LEVEL_DEFAULTS['log_noise']
+        self.assertIn('获取平仓锁超时', ln['throttle_substrings'])
+        self.assertTrue(
+            any(d.get('substring') == '获取平仓锁超时' for d in ln['downgrade'])
+        )
 
 
 if __name__ == '__main__':

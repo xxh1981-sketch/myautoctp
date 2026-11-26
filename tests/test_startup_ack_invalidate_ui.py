@@ -1,5 +1,6 @@
 """启动确认窗「清除旧确认并刷新」与 _detect_stale_ack 单测。"""
 
+import json
 import os
 import sys
 import tempfile
@@ -98,6 +99,55 @@ class TestDetectStaleAck(unittest.TestCase):
                 f.write('x\n')
             stale, _ = _detect_stale_ack(cfg)
             self.assertFalse(stale)
+
+    def test_json_ledger_runtime_rewrite_not_stale(self):
+        """运行期非持仓写入（cooldown/日限/halt 标志、内容不变的重写）
+        改变了 mtime 但持仓真相不变，不应判为失配。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _ledger_cfg(tmp)
+            ledger = cfg['strangle']['ledger_path']
+            base = {
+                'positions': [],
+                'leg_claims': {},
+                'unmatched_legs': [],
+                'cooldowns': [],
+                'daily_groups': {},
+                'daily_buy_amount': {},
+                'open_halted': False,
+                'open_halt_reason': '',
+            }
+            with open(ledger, 'w', encoding='utf-8') as f:
+                json.dump(base, f, ensure_ascii=False, indent=2)
+            save_startup_ack_fingerprint(cfg)
+            # 模拟运行期改动：仅动运行期字段 + 触发重写（mtime 变），持仓真相不变
+            time.sleep(0.05)
+            churned = dict(base)
+            churned['cooldowns'] = [{'symbol': 'ag', 'month': '2608', 'until': 123.0}]
+            churned['daily_buy_amount'] = {'2026-07-02': 5000.0}
+            churned['open_halted'] = True
+            churned['open_halt_reason'] = '保证金超限'
+            with open(ledger, 'w', encoding='utf-8') as f:
+                json.dump(churned, f, ensure_ascii=False, indent=2)
+            stale, reasons = _detect_stale_ack(cfg)
+            self.assertFalse(stale, reasons)
+
+    def test_json_ledger_position_change_is_stale(self):
+        """真实持仓真相变化（新增 leg_claim）应判为失配。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _ledger_cfg(tmp)
+            ledger = cfg['strangle']['ledger_path']
+            with open(ledger, 'w', encoding='utf-8') as f:
+                json.dump({'positions': [], 'leg_claims': {}, 'unmatched_legs': []}, f)
+            save_startup_ack_fingerprint(cfg)
+            time.sleep(0.05)
+            with open(ledger, 'w', encoding='utf-8') as f:
+                json.dump(
+                    {'positions': [], 'leg_claims': {'ag2608C': 2}, 'unmatched_legs': []},
+                    f,
+                )
+            stale, reasons = _detect_stale_ack(cfg)
+            self.assertTrue(stale)
+            self.assertTrue(any('ledger_strangle' in r for r in reasons))
 
 
 class TestStaleAckHelpers(unittest.TestCase):
